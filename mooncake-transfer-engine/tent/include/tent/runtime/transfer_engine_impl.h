@@ -310,6 +310,8 @@ class TransferEngineImpl {
                           const std::vector<Request>& request_list,
                           const Notification& notifi);
 
+    Status copySameHost(const std::vector<Request>& request_list);
+
     Status cancelTransfer(BatchID batch_id, size_t task_id);
 
     // Tries every loaded notification transport in slot order. A transport

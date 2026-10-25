@@ -14,9 +14,13 @@
 
 #include "tent/runtime/platform.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <unordered_set>
 #include <vector>
+
+#include "tent/platform/cpu.h"
 
 #ifdef USE_CUDA
 #include "tent/platform/cuda.h"
@@ -33,8 +37,6 @@
 #include "tent/platform/mlu.h"
 #elif defined(USE_XPU)
 #include "tent/platform/xpu.h"
-#else
-#include "tent/platform/cpu.h"
 #endif
 
 namespace mooncake {
@@ -44,6 +46,15 @@ Platform& Platform::getLoader(std::shared_ptr<Config> conf) {
     static std::shared_ptr<Platform> g_instance;
     static std::once_flag flag;
     std::call_once(flag, [&]() {
+        // MC_TENT_PLATFORM=cpu (or "platform": "cpu") keeps a process that
+        // never touches device memory, such as a store, off the device
+        // runtime: the CUDA platform creates a context on first use.
+        const char* env = getenv("MC_TENT_PLATFORM");
+        if ((env && strcmp(env, "cpu") == 0) ||
+            (conf && conf->get("platform", "") == "cpu")) {
+            g_instance = std::make_shared<CpuPlatform>(conf);
+            return;
+        }
 #ifdef USE_CUDA
         g_instance = std::make_shared<CudaPlatform>(conf);
 #elif defined(USE_HIP)
@@ -77,6 +88,26 @@ Status Platform::exportDmabuf(void* addr, size_t length, DmabufExport& out) {
     out = DmabufExport{};
     return Status::NotImplemented(
         "dma-buf export is not supported by this platform" LOC_MARK);
+}
+
+Status Platform::copyBatch(const std::vector<CopyOp>& ops) {
+    for (const auto& op : ops) CHECK_STATUS(copy(op.dst, op.src, op.length));
+    return Status::OK();
+}
+
+Status Platform::registerHostMemory(void* addr, size_t length,
+                                    void* device_hint, int& device_out) {
+    (void)addr;
+    (void)length;
+    (void)device_hint;
+    device_out = -1;
+    return Status::OK();
+}
+
+Status Platform::unregisterHostMemory(void* addr, int device) {
+    (void)addr;
+    (void)device;
+    return Status::OK();
 }
 
 std::vector<int> Platform::topologyDeviceIndices(const Topology* topology,

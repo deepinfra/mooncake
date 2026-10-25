@@ -72,6 +72,17 @@ void* allocate_buffer_mmap_memory(size_t total_size, size_t alignment,
 
 void free_buffer_mmap_memory(void* ptr, size_t total_size);
 
+// HugeTLB segment backed by a new file in `dir` (a hugetlbfs mount) and mapped
+// MAP_SHARED, so same-host processes can map it and copy without a NIC (TENT
+// SHM transport). Pages are populated before returning. Leftover files of an
+// earlier process are removed on first use: one store owns `dir`. Returns
+// nullptr on failure; `mapped_size` and `path` describe the mapping.
+void* allocate_buffer_shm_file(const std::string& dir, size_t total_size,
+                               size_t* mapped_size, std::string* path);
+
+void free_buffer_shm_file(void* ptr, size_t mapped_size,
+                          const std::string& path);
+
 void* allocate_buffer_numa_segments(size_t total_size,
                                     const std::vector<int>& numa_nodes,
                                     size_t page_size = 0);

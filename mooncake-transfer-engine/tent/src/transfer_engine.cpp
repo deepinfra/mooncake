@@ -157,6 +157,10 @@ Status TransferEngine::submitTransfer(BatchID batch_id,
     return impl_->submitTransfer(batch_id, request_list, notifi);
 }
 
+Status TransferEngine::copySameHost(const std::vector<Request>& request_list) {
+    return impl_->copySameHost(request_list);
+}
+
 Status TransferEngine::cancelTransfer(BatchID batch_id, size_t task_id) {
     return impl_->cancelTransfer(batch_id, task_id);
 }

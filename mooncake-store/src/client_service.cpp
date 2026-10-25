@@ -1670,6 +1670,26 @@ struct BatchGetOperation {
     std::vector<TransferFuture> futures;
 };
 
+bool Client::UseBatchedMemoryGet(
+    const std::vector<QueryResult>& query_results) {
+    // MC_STORE_BATCHED_GET: one transfer per segment instead of one per key.
+    // With many small keys (KV blocks) the per-submission cost dominates;
+    // that path serves memory replicas only, so every key must have one.
+    static const bool enabled = [] {
+        const char* env = getenv("MC_STORE_BATCHED_GET");
+        return env && *env && std::string(env) != "0";
+    }();
+    if (!enabled || query_results.size() < 2) return false;
+    for (const auto& query_result : query_results) {
+        Replica::Descriptor replica;
+        if (FindFirstCompleteReplica(query_result.replicas, replica) !=
+                ErrorCode::OK ||
+            !replica.is_memory_replica())
+            return false;
+    }
+    return true;
+}
+
 std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
     const std::vector<std::string>& object_keys,
     const std::vector<QueryResult>& query_results,
@@ -1838,7 +1858,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         }
         return results;
     }
-    if (prefer_alloc_in_same_node) {
+    if (prefer_alloc_in_same_node || UseBatchedMemoryGet(query_results)) {
         return BatchGetWhenPreferSameNode(object_keys, query_results, slices);
     }
 

@@ -28,6 +28,7 @@
 #include <unordered_set>
 
 #include "tent/common/config.h"
+#include "tent/common/cumem_host_pool.h"
 #include "tent/common/status.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/segment.h"
@@ -35,6 +36,7 @@
 #include "tent/runtime/progress_worker.h"
 #include "tent/runtime/proxy_manager.h"
 #include "tent/runtime/transport.h"
+#include "tent/transport/shm/shm_transport.h"
 #include "tent/runtime/topology.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/slab.h"
@@ -339,6 +341,16 @@ static std::string readIdentityFile(const char* path) {
 std::string getMachineID() {
     const std::string boot_id =
         readIdentityFile("/proc/sys/kernel/random/boot_id");
+    // Containers on one host share boot_id but usually ship their own
+    // /etc/machine-id, so peers in different images look like different
+    // machines and SHM/NVLink are never selected. MC_TENT_MACHINE_ID=boot_id
+    // keys locality on the kernel boot alone; any other value is used as is.
+    const char* override_id = getenv("MC_TENT_MACHINE_ID");
+    if (override_id && *override_id) {
+        if (std::string(override_id) != "boot_id") return override_id;
+        if (!boot_id.empty()) return boot_id;
+        LOG(WARNING) << "MC_TENT_MACHINE_ID=boot_id but boot_id is unreadable";
+    }
     const std::string machine_id = readIdentityFile("/etc/machine-id");
 
     if (!boot_id.empty() && !machine_id.empty()) {
@@ -981,9 +993,17 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
             }
         }
 
-        // NUMA probe: skip prefault if warm-up already pinned pages
-        auto entries = Platform::getLoader().getLocation(
-            addr_list[i], size_list[i], pages_pinned);
+        // NUMA probe: skip prefault if warm-up already pinned pages. A
+        // CumemHostPool knows its pieces' nodes; probing it would fault in
+        // and query each of its 4 KiB pages.
+        std::vector<RangeLocation> entries;
+        for (const auto& range :
+             CumemHostPool::NumaRangesFor(desc.addr, desc.length))
+            entries.push_back({range.start, range.length,
+                               "cpu:" + std::to_string(range.node)});
+        if (entries.empty())
+            entries = Platform::getLoader().getLocation(
+                addr_list[i], size_list[i], pages_pinned);
         if (entries.empty())
             return Status::InvalidArgument(
                 "Unable to locate registered memory range" LOC_MARK);
@@ -1540,6 +1560,13 @@ Status TransferEngineImpl::validateTransportHint(const Request& req,
             std::to_string(request_index) + "])" LOC_MARK);
     }
     return Status::OK();
+}
+
+Status TransferEngineImpl::copySameHost(
+    const std::vector<Request>& request_list) {
+    auto* shm = dynamic_cast<ShmTransport*>(transport_list_[SHM].get());
+    if (!shm) return Status::NotImplemented("SHM transport not loaded" LOC_MARK);
+    return shm->copyDirect(request_list);
 }
 
 SelectionResult TransferEngineImpl::getTransportType(const Request& request,

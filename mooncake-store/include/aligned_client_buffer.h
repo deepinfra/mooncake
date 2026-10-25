@@ -57,6 +57,8 @@ class AlignedClientBufferAllocator : public ClientBufferAllocator {
     bool owns_memory_;
     size_t allocated_size_;  // Store the actual allocated size for cleanup
     std::string protocol_;
+    // Set when the buffer is a shared file in MC_STORE_SHM_SEGMENT_DIR.
+    std::string shm_path_;
 };
 
 }  // namespace mooncake

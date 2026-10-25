@@ -129,6 +129,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     client_buffer.cpp
     aligned_client_buffer.cpp
     real_client.cpp
+    cumem_store_segment.cpp
     config/registered_pinned_memory_config.cpp
     registered_pinned_memory.cpp
     dummy_client.cpp

@@ -15,12 +15,16 @@
 #include "tent/platform/cuda.h"
 #include "tent/platform/cuda_utils.h"
 #include "tent/common/status.h"
+#ifdef TENT_BATCHED_COPY_KERNEL
+#include "batched_copy.h"
+#endif
 
 #include <bits/stdint-uintn.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <glog/logging.h>
 #include <mutex>
+#include <unordered_map>
 #include <numa.h>
 #include <vector>
 #include <cstring>
@@ -52,6 +56,84 @@ bool cudaHasCurrentContext() {
     CUcontext ctx = nullptr;
     return cuCtxGetCurrent(&ctx) == CUDA_SUCCESS && ctx != nullptr;
 }
+
+// Pins `device` on the calling thread for one scope, then restores the
+// caller's exact context (see CudaPlatform::copy for why a device ordinal
+// alone cannot do that).
+// Device ranges seen by one copyBatch() call, so each allocation is looked up
+// once instead of once per copy. lookup() returns the owning device, or -1.
+class DeviceRangeCache {
+   public:
+    int lookup(const void* ptr) {
+        const auto addr = reinterpret_cast<uint64_t>(ptr);
+        for (const auto& range : ranges_)
+            if (addr >= range.start && addr < range.end) return range.device;
+        if (!ensureCudaDriverInit()) return -1;
+        unsigned int mem_type = 0;
+        int ordinal = -1;
+        CUdeviceptr start = 0;
+        size_t size = 0;
+        CUpointer_attribute attrs[] = {CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+                                       CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
+                                       CU_POINTER_ATTRIBUTE_RANGE_START_ADDR,
+                                       CU_POINTER_ATTRIBUTE_RANGE_SIZE};
+        void* data[] = {&mem_type, &ordinal, &start, &size};
+        if (cuPointerGetAttributes(4, attrs, data,
+                                   static_cast<CUdeviceptr>(addr)) !=
+                CUDA_SUCCESS ||
+            mem_type != CU_MEMORYTYPE_DEVICE)
+            return -1;
+        if (size > 0) ranges_.push_back({start, start + size, ordinal});
+        return ordinal;
+    }
+
+   private:
+    struct Range {
+        uint64_t start;
+        uint64_t end;
+        int device;
+    };
+    std::vector<Range> ranges_;
+};
+
+class ScopedCudaDevice {
+   public:
+    explicit ScopedCudaDevice(int device) : device_(device) {
+        if (ensureCudaDriverInit() &&
+            cuCtxGetCurrent(&caller_ctx_) != CUDA_SUCCESS) {
+            status_ = Status::InternalError(
+                std::string("cuCtxGetCurrent failed") + LOC_MARK);
+            return;
+        }
+        if (caller_ctx_ != nullptr &&
+            cudaGetDevice(&caller_device_) != cudaSuccess) {
+            caller_device_ = -1;
+            (void)cudaGetLastError();
+        }
+        active_ = true;
+        cudaError_t err = cudaSetDevice(device);
+        if (err != cudaSuccess) {
+            status_ = Status::InternalError(std::string("cudaSetDevice: ") +
+                                            cudaGetErrorString(err) + LOC_MARK);
+        }
+    }
+
+    ~ScopedCudaDevice() {
+        if (!active_) return;
+        if (caller_device_ != -1 && caller_device_ != device_)
+            (void)cudaSetDevice(caller_device_);
+        (void)cuCtxSetCurrent(caller_ctx_);
+    }
+
+    const Status& status() const { return status_; }
+
+   private:
+    int device_;
+    CUcontext caller_ctx_ = nullptr;
+    int caller_device_ = -1;
+    bool active_ = false;
+    Status status_ = Status::OK();
+};
 
 }  // namespace
 
@@ -229,6 +311,265 @@ Status CudaPlatform::synchronizeDevices(const Topology* topology) {
                 << saved << ") failed: " << cudaGetErrorString(err);
             (void)cudaGetLastError();
         }
+    }
+    return Status::OK();
+}
+
+Status CudaPlatform::copyBatch(const std::vector<CopyOp>& ops) {
+    // Group by the device owning either side; host-to-host copies stay memcpy.
+    // Copies whose host side is mapped for their device can run as one
+    // kernel (kernel_groups); the rest use the copy engines.
+    std::unordered_map<int, std::vector<const CopyOp*>> by_device;
+    std::unordered_map<int, std::vector<const CopyOp*>> kernel_groups;
+    DeviceRangeCache ranges;
+    for (const auto& op : ops) {
+        if (op.host_mapped_only) {
+            void* device_side = op.host_is_src ? op.dst : op.src;
+            if (op.mapped_device < 0 ||
+                ranges.lookup(device_side) != op.mapped_device ||
+                !kernelCopySupported(op.mapped_device))
+                return Status::InvalidArgument(
+                    "peer memory is not mapped for this device" LOC_MARK);
+        }
+        if (op.mapped_device >= 0) {
+            void* device_side = op.host_is_src ? op.dst : op.src;
+            if (ranges.lookup(device_side) == op.mapped_device &&
+                kernelCopySupported(op.mapped_device)) {
+                kernel_groups[op.mapped_device].push_back(&op);
+                continue;
+            }
+        } else if (op.host_pageable) {
+            void* device_side = op.host_is_src ? op.dst : op.src;
+            const int device = ranges.lookup(device_side);
+            if (device >= 0 && pageableKernelCopySupported(device)) {
+                kernel_groups[device].push_back(&op);
+                continue;
+            }
+        }
+        int device = getPointerDeviceId(op.dst);
+        if (device == CUDAStreamPool::kCurrentDevice)
+            device = getPointerDeviceId(op.src);
+        if (device == CUDAStreamPool::kCurrentDevice) {
+            ::memcpy(op.dst, op.src, op.length);
+            continue;
+        }
+        by_device[device].push_back(&op);
+    }
+    // A handful of copies is not worth a launch.
+    for (auto it = kernel_groups.begin(); it != kernel_groups.end();) {
+        if (it->second.size() >= kMinKernelCopies) {
+            ++it;
+            continue;
+        }
+        auto& rest = by_device[it->first];
+        rest.insert(rest.end(), it->second.begin(), it->second.end());
+        it = kernel_groups.erase(it);
+    }
+
+    for (const auto& [device, group] : kernel_groups) {
+        ScopedCudaDevice scope(device);
+        CHECK_STATUS(scope.status());
+        CUDAStreamHandle stream;
+        CHECK_STATUS(getStreamFromPool(stream, device));
+        CHECK_STATUS(kernelCopy(group, stream.get()));
+    }
+
+    for (const auto& [device, group] : by_device) {
+        ScopedCudaDevice scope(device);
+        CHECK_STATUS(scope.status());
+        CUDAStreamHandle stream;
+        CHECK_STATUS(getStreamFromPool(stream, device));
+
+        cudaError_t err = cudaErrorNotSupported;
+#if CUDART_VERSION >= 12080
+        // One submission for the whole group: per-copy cudaMemcpyAsync costs
+        // a few microseconds each, which dominates KV-sized (tens of KB)
+        // slices.
+        std::vector<void*> dsts, srcs;
+        std::vector<size_t> sizes;
+        dsts.reserve(group.size());
+        srcs.reserve(group.size());
+        sizes.reserve(group.size());
+        for (const auto* op : group) {
+            dsts.push_back(op->dst);
+            srcs.push_back(op->src);
+            sizes.push_back(op->length);
+        }
+        cudaMemcpyAttributes attr{};
+        attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+        size_t attr_index = 0;
+#if CUDART_VERSION >= 13000
+        err = cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(),
+                                   group.size(), &attr, &attr_index, 1,
+                                   stream.get());
+#else
+        size_t fail_index = 0;
+        err = cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(),
+                                   group.size(), &attr, &attr_index, 1,
+                                   &fail_index, stream.get());
+#endif
+        if (err != cudaSuccess) {
+            LOG_FIRST_N(WARNING, 3)
+                << "cudaMemcpyBatchAsync failed (" << cudaGetErrorString(err)
+                << "), falling back to per-copy cudaMemcpyAsync";
+            (void)cudaGetLastError();
+        }
+#endif
+        // Re-running copies the batch may have finished is harmless: each
+        // writes the same bytes to the same destination.
+        if (err != cudaSuccess) {
+            for (const auto* op : group) {
+                err = cudaMemcpyAsync(op->dst, op->src, op->length,
+                                      cudaMemcpyDefault, stream.get());
+                if (err != cudaSuccess) break;
+            }
+        }
+        if (err == cudaSuccess) err = cudaStreamSynchronize(stream.get());
+        if (err != cudaSuccess) {
+            (void)cudaGetLastError();
+            return Status::InternalError(
+                std::string("CudaPlatform::copyBatch: ") +
+                cudaGetErrorString(err) + LOC_MARK);
+        }
+    }
+    return Status::OK();
+}
+
+bool CudaPlatform::kernelCopySupported(int device) {
+#ifdef TENT_BATCHED_COPY_KERNEL
+    std::lock_guard<std::mutex> lock(kernel_copy_mutex_);
+    auto it = kernel_copy_supported_.find(device);
+    if (it != kernel_copy_supported_.end()) return it->second;
+    // Kernels may use a registered host pointer as is only with this.
+    int usable = 0;
+    if (cudaDeviceGetAttribute(&usable,
+                               cudaDevAttrCanUseHostPointerForRegisteredMem,
+                               device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        usable = 0;
+    }
+    kernel_copy_supported_[device] = usable != 0;
+    LOG(INFO) << "CudaPlatform: batched copy kernel "
+              << (usable ? "enabled" : "disabled") << " on device " << device;
+    return usable != 0;
+#else
+    (void)device;
+    return false;
+#endif
+}
+
+bool CudaPlatform::pageableKernelCopySupported(int device) {
+#ifdef TENT_BATCHED_COPY_KERNEL
+    std::lock_guard<std::mutex> lock(kernel_copy_mutex_);
+    auto it = pageable_copy_supported_.find(device);
+    if (it != pageable_copy_supported_.end()) return it->second;
+    // Kernels may dereference any host mapping (HMM) only with this.
+    int usable = 0;
+    if (cudaDeviceGetAttribute(&usable, cudaDevAttrPageableMemoryAccess,
+                               device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        usable = 0;
+    }
+    pageable_copy_supported_[device] = usable != 0;
+    LOG(INFO) << "CudaPlatform: batched copy kernel on unregistered host "
+                 "memory "
+              << (usable ? "enabled" : "disabled") << " on device " << device;
+    return usable != 0;
+#else
+    (void)device;
+    return false;
+#endif
+}
+
+Status CudaPlatform::kernelCopy(const std::vector<const CopyOp*>& group,
+                                cudaStream_t stream) {
+#ifdef TENT_BATCHED_COPY_KERNEL
+    // Descriptors live in mapped pinned memory the kernel reads directly,
+    // one buffer per calling thread, reused after each synchronous batch.
+    // Large copies are split so that they spread over blocks.
+    constexpr uint64_t kPiece = 256 * 1024;
+    size_t count = 0;
+    for (const auto* op : group) count += (op->length + kPiece - 1) / kPiece;
+    thread_local BatchedCopyDesc* descs = nullptr;
+    thread_local size_t capacity = 0;
+    if (count > capacity) {
+        if (descs) cudaFreeHost(descs);
+        descs = nullptr;
+        capacity = 0;
+        size_t want = std::max<size_t>(count, 4096);
+        cudaError_t err =
+            cudaHostAlloc(reinterpret_cast<void**>(&descs),
+                          want * sizeof(BatchedCopyDesc),
+                          cudaHostAllocMapped | cudaHostAllocPortable);
+        if (err != cudaSuccess) {
+            (void)cudaGetLastError();
+            descs = nullptr;
+            return Status::InternalError(std::string("cudaHostAlloc: ") +
+                                         cudaGetErrorString(err) + LOC_MARK);
+        }
+        capacity = want;
+    }
+    size_t n = 0;
+    for (const auto* op : group) {
+        for (uint64_t off = 0; off < op->length; off += kPiece) {
+            descs[n++] = BatchedCopyDesc{
+                static_cast<const char*>(op->src) + off,
+                static_cast<char*>(op->dst) + off,
+                std::min<uint64_t>(kPiece, op->length - off)};
+        }
+    }
+    cudaError_t err = launchBatchedCopy(descs, static_cast<int>(n), stream);
+    if (err == cudaSuccess) err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return Status::InternalError(std::string("batched copy kernel: ") +
+                                     cudaGetErrorString(err) + LOC_MARK);
+    }
+    return Status::OK();
+#else
+    (void)group;
+    (void)stream;
+    return Status::NotImplemented("batched copy kernel not built" LOC_MARK);
+#endif
+}
+
+Status CudaPlatform::registerHostMemory(void* addr, size_t length,
+                                        void* device_hint, int& device_out) {
+    device_out = -1;
+    const int device = getPointerDeviceId(device_hint);
+    // Without a device on the other side there is nothing to make DMA-able,
+    // and touching the runtime here would create a context on GPU 0.
+    if (device == CUDAStreamPool::kCurrentDevice)
+        return Status::InvalidArgument(
+            "device_hint is not device memory" LOC_MARK);
+    ScopedCudaDevice scope(device);
+    CHECK_STATUS(scope.status());
+    // Only this device's context: Portable maps the range into every context
+    // of the process, multiplying the device page-table cost.
+    cudaError_t err = cudaHostRegister(addr, length, cudaHostRegisterDefault);
+    if (err == cudaErrorHostMemoryAlreadyRegistered) {
+        (void)cudaGetLastError();
+        return Status::OK();  // owned by someone else; leave device_out -1
+    }
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return Status::InternalError(std::string("cudaHostRegister: ") +
+                                     cudaGetErrorString(err) + LOC_MARK);
+    }
+    device_out = device;
+    return Status::OK();
+}
+
+Status CudaPlatform::unregisterHostMemory(void* addr, int device) {
+    if (device < 0) return Status::OK();
+    ScopedCudaDevice scope(device);
+    CHECK_STATUS(scope.status());
+    cudaError_t err = cudaHostUnregister(addr);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (err != cudaErrorHostMemoryNotRegistered)
+            return Status::InternalError(std::string("cudaHostUnregister: ") +
+                                         cudaGetErrorString(err) + LOC_MARK);
     }
     return Status::OK();
 }

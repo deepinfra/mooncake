@@ -21,6 +21,9 @@
 
 #include <cuda_runtime.h>
 
+#include <mutex>
+#include <unordered_map>
+
 namespace mooncake {
 namespace tent {
 
@@ -124,12 +127,30 @@ class CudaPlatform : public Platform {
 
     Status synchronizeDevices(const Topology* topology) override;
 
+    Status copyBatch(const std::vector<CopyOp>& ops) override;
+
+    Status registerHostMemory(void* addr, size_t length, void* device_hint,
+                              int& device_out) override;
+
+    Status unregisterHostMemory(void* addr, int device) override;
+
     Status getStreamFromPool(CUDAStreamHandle& outHandle,
                              int deviceId = CUDAStreamPool::kCurrentDevice);
 
    private:
     // Device owning `addr`, or kCurrentDevice when `addr` is not device memory.
     int getPointerDeviceId(void* addr);
+
+    // Whether copies to and from mapped host memory may run as one kernel on
+    // `device` (see batched_copy.h); copyBatch uses it from kMinKernelCopies.
+    bool kernelCopySupported(int device);
+    bool pageableKernelCopySupported(int device);
+    Status kernelCopy(const std::vector<const CopyOp*>& group,
+                      cudaStream_t stream);
+    static constexpr size_t kMinKernelCopies = 8;
+    std::mutex kernel_copy_mutex_;
+    std::unordered_map<int, bool> kernel_copy_supported_;
+    std::unordered_map<int, bool> pageable_copy_supported_;
 
     std::shared_ptr<Config> conf;
     CUDAStreamPool stream_pool;

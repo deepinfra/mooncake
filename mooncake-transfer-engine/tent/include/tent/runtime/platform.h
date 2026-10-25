@@ -55,6 +55,24 @@ struct DmabufExport {
     uint64_t offset = 0;
 };
 
+// One independent copy of a copyBatch() call. Either side may be device
+// memory owned by the platform.
+struct CopyOp {
+    void *dst;
+    void *src;
+    size_t length;
+    // >= 0: the host side (src if host_is_src, else dst) is registered with
+    // this device's context, so the device may address it directly.
+    int mapped_device = -1;
+    bool host_is_src = false;
+    // The host side is ordinary mapped memory the device may reach through
+    // its pageable-memory access (HMM), if it has that, without registration.
+    bool host_pageable = false;
+    // The host side is reachable only by mapped_device (a CUDA VMM mapping
+    // without CPU access): copy it there or not at all.
+    bool host_mapped_only = false;
+};
+
 class Platform {
    public:
     static Platform &getLoader(std::shared_ptr<Config> conf = nullptr);
@@ -93,6 +111,23 @@ class Platform {
     // an OK status populates `out`; per the DmabufExport contract the fd stays
     // owned by the exporting runtime and the caller must not close it.
     virtual Status exportDmabuf(void *addr, size_t length, DmabufExport &out);
+
+    // Run independent copies and wait for all of them. Device platforms
+    // submit them together (one stream, one sync per device) instead of one
+    // synchronous copy() each. The default loops over copy(). OK only if
+    // every copy succeeded.
+    virtual Status copyBatch(const std::vector<CopyOp> &ops);
+
+    // Make host memory a direct DMA target for the device runtime (e.g.
+    // cudaHostRegister), so copies to it do not bounce through driver
+    // staging. `device_hint` is device memory the region will be copied
+    // with; it picks the context and is reported in `device_out` for the
+    // matching unregisterHostMemory(). InvalidArgument when `device_hint` is
+    // not device memory. The default is a no-op.
+    virtual Status registerHostMemory(void *addr, size_t length,
+                                      void *device_hint, int &device_out);
+
+    virtual Status unregisterHostMemory(void *addr, int device);
 
    protected:
     static std::vector<int> topologyDeviceIndices(const Topology *topology,

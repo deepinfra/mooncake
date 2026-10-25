@@ -335,6 +335,13 @@ class TransferEngine {
                           const std::vector<Request>& request_list,
                           const Notification& notifi);
 
+    // Runs `request_list` synchronously through the SHM transport when every
+    // target is a same-host shared buffer, skipping batch bookkeeping and
+    // per-request transport selection (worth it for tens of thousands of
+    // KV-block slices). NotImplemented when the SHM transport does not apply;
+    // callers then fall back to submitTransfer().
+    Status copySameHost(const std::vector<Request>& request_list);
+
     // Best-effort task cancellation. Work that has not reached the transport
     // is prevented from being submitted. Device work already posted may still
     // complete, so callers must continue polling for a terminal status.

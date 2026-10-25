@@ -20,6 +20,7 @@
 #include "common/client_buffer_allocation.h"
 #include "client_buffer.h"
 #include "client_service.h"
+#include "cumem_store_segment.h"
 #include "device/cuda_ipc_buffer_handle.h"
 #include "mutex.h"
 #include "common/network.h"
@@ -1075,6 +1076,23 @@ class RealClient : public PyClient {
 
     std::vector<std::unique_ptr<void, HugepageSegmentDeleter>>
         hugepage_segment_ptrs_;
+    // Segments mapped from files in MC_STORE_SHM_SEGMENT_DIR, so same-host
+    // clients can map them (TENT SHM transport) instead of using the NIC.
+    struct ShmSegmentFile {
+        void *ptr = nullptr;
+        size_t size = 0;
+        std::string path;
+        ShmSegmentFile(void *p, size_t s, std::string f)
+            : ptr(p), size(s), path(std::move(f)) {}
+        ShmSegmentFile(const ShmSegmentFile &) = delete;
+        ShmSegmentFile &operator=(const ShmSegmentFile &) = delete;
+        ~ShmSegmentFile() { free_buffer_shm_file(ptr, size, path); }
+    };
+    std::vector<std::unique_ptr<ShmSegmentFile>> shm_segment_files_;
+    // Segments in CUDA VMM host memory (MC_STORE_CUMEM_SOCKET_DIR), which
+    // same-host clients import by fd and their GPUs copy without
+    // registering.
+    std::vector<CumemPoolPtr> cumem_pools_;
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;

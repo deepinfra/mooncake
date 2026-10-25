@@ -7,15 +7,24 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <dirent.h>
+#include <fcntl.h>
 #include <memory>
 #include <mutex>
 #include <numa.h>
 #include <numaif.h>
 #include <sys/mman.h>
+#include <sys/statfs.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
+
+#ifndef HUGETLBFS_MAGIC
+#define HUGETLBFS_MAGIC 0x958458f6
+#endif
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
@@ -294,6 +303,105 @@ void free_buffer_mmap_memory(void *ptr, size_t total_size) {
         VLOG(1) << "Freed direct mmap allocation at " << ptr
                 << ", size=" << map_size;
     }
+}
+
+namespace {
+
+constexpr char kShmSegmentPrefix[] = "mooncake_store_";
+
+// A crashed store leaves its files behind, and they keep their HugeTLB pages
+// reserved until unlinked. Peers that still map them let go once they see the
+// unlink (TENT SHM reap_interval_ms).
+void remove_stale_shm_segments(const std::string &dir) {
+    DIR *d = opendir(dir.c_str());
+    if (!d) return;
+    while (auto *entry = readdir(d)) {
+        if (strncmp(entry->d_name, kShmSegmentPrefix,
+                    sizeof(kShmSegmentPrefix) - 1) != 0)
+            continue;
+        const std::string path = dir + "/" + entry->d_name;
+        if (unlink(path.c_str()) == 0)
+            LOG(WARNING) << "Removed stale shared segment " << path;
+    }
+    closedir(d);
+}
+
+}  // namespace
+
+void *allocate_buffer_shm_file(const std::string &dir, size_t total_size,
+                               size_t *mapped_size, std::string *path) {
+    struct statfs fs;
+    if (statfs(dir.c_str(), &fs) != 0 ||
+        static_cast<unsigned long>(fs.f_type) != HUGETLBFS_MAGIC) {
+        // A plain directory would put the segment in the page cache of a disk.
+        LOG(ERROR) << "Shared segment dir " << dir
+                   << " is not a hugetlbfs mount";
+        return nullptr;
+    }
+    const size_t page_size = fs.f_bsize;
+    static std::once_flag cleaned;
+    std::call_once(cleaned, remove_stale_shm_segments, dir);
+
+    static std::atomic<int> sequence{0};
+    *path = dir + "/" + kShmSegmentPrefix + std::to_string(getpid()) + "_" +
+            std::to_string(sequence++);
+    const size_t map_size = align_up(total_size, page_size);
+    int fd = open(path->c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (fd < 0) {
+        LOG(ERROR) << "Failed to create shared segment " << *path << ": "
+                   << strerror(errno);
+        return nullptr;
+    }
+    if (ftruncate(fd, map_size) != 0) {
+        LOG(ERROR) << "Failed to size shared segment " << *path << ": "
+                   << strerror(errno);
+        close(fd);
+        unlink(path->c_str());
+        return nullptr;
+    }
+    // Shared HugeTLB mappings reserve their pages at mmap time. Right after a
+    // store restart, peers may still hold the previous store's pages for a
+    // few seconds, so wait for them instead of failing.
+    const char *wait_env = getenv("MC_STORE_SHM_SEGMENT_WAIT_S");
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::seconds(wait_env ? std::atol(wait_env) : 300);
+    void *ptr = MAP_FAILED;
+    for (int attempt = 0;; ++attempt) {
+        ptr = mmap(nullptr, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+                   0);
+        if (ptr != MAP_FAILED || errno != ENOMEM ||
+            std::chrono::steady_clock::now() >= deadline)
+            break;
+        if (attempt % 10 == 0)
+            LOG(WARNING) << "Waiting for " << map_size
+                         << " bytes of free HugeTLB pages for " << *path;
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    close(fd);
+    if (ptr == MAP_FAILED) {
+        LOG(ERROR) << "Failed to map shared segment " << *path
+                   << ", size=" << map_size << ": " << strerror(errno);
+        unlink(path->c_str());
+        return nullptr;
+    }
+    // Populate now: a peer that faulted a page in would be charged for it,
+    // and its HugeTLB limit is usually zero.
+    touch_mmap_pages(ptr, map_size, page_size);
+    *mapped_size = map_size;
+    LOG(INFO) << "Shared segment " << *path << ": " << map_size << " bytes, "
+              << page_size << "-byte pages";
+    return ptr;
+}
+
+void free_buffer_shm_file(void *ptr, size_t mapped_size,
+                          const std::string &path) {
+    if (ptr && munmap(ptr, mapped_size) != 0)
+        LOG(ERROR) << "munmap shared segment " << path
+                   << " failed: " << strerror(errno);
+    if (!path.empty() && unlink(path.c_str()) != 0 && errno != ENOENT)
+        LOG(ERROR) << "unlink shared segment " << path
+                   << " failed: " << strerror(errno);
 }
 
 // NUMA-segmented buffer allocation

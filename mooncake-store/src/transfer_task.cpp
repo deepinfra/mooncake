@@ -1810,6 +1810,15 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
             tr.intent_type = *tent_intent;
             tent_reqs.push_back(tr);
         }
+        // Same-host shared segments: copy right here, without the batch
+        // machinery (it costs microseconds per request, and KV loads are
+        // tens of thousands of block slices).
+        if (tent_engine_->copySameHost(tent_reqs).ok()) {
+            tent_engine_->freeBatch(batch_id);
+            auto state = std::make_shared<MemcpyOperationState>();
+            state->set_completed(ErrorCode::OK);
+            return TransferFuture(state);
+        }
         auto tent_status = tent_engine_->submitTransfer(batch_id, tent_reqs);
         if (!tent_status.ok()) {
             LOG(ERROR) << "Failed to submit all transfers, error: "

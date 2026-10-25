@@ -108,6 +108,22 @@ AlignedClientBufferAllocator::create(size_t size, const std::string& protocol,
     size_t aligned_size = align_up(size, kDirectIOAlignment);
 
     const bool use_protocol_allocator = UseProtocolAllocator(protocol);
+    // SSD restores land here and peers read them out; on a shared file a
+    // same-host peer copies them without a NIC, like the store segments.
+    const char* shm_dir = getenv("MC_STORE_SHM_SEGMENT_DIR");
+    if (shm_dir && *shm_dir && !use_protocol_allocator) {
+        size_t mapped_size = 0;
+        std::string path;
+        void* shm_buffer =
+            allocate_buffer_shm_file(shm_dir, aligned_size, &mapped_size, &path);
+        if (!shm_buffer) return nullptr;
+        auto allocator = std::shared_ptr<AlignedClientBufferAllocator>(
+            new AlignedClientBufferAllocator(shm_buffer, aligned_size, protocol,
+                                             false));
+        allocator->allocated_size_ = mapped_size;
+        allocator->shm_path_ = std::move(path);
+        return allocator;
+    }
     const bool use_mmap_hugepage = use_hugepage && !use_protocol_allocator;
     void* aligned_buffer =
         AllocateAlignedBuffer(aligned_size, protocol, use_mmap_hugepage);
@@ -150,7 +166,10 @@ AlignedClientBufferAllocator::~AlignedClientBufferAllocator() {
     // Free the aligned memory we allocated
     // The parent class destructor will not free it because is_external_memory_
     // is set to true
-    if (owns_memory_ && buffer_) {
+    if (owns_memory_ && buffer_ && !shm_path_.empty()) {
+        free_buffer_shm_file(buffer_, allocated_size_, shm_path_);
+        buffer_ = nullptr;
+    } else if (owns_memory_ && buffer_) {
         if (use_hugepage_) {
             LOG(INFO)
                 << "AlignedClientBufferAllocator: freeing hugepage memory "

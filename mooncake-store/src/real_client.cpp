@@ -1351,8 +1351,17 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
         size_t next_numa_node = 0;
 
+        const char *shm_segment_env = getenv("MC_STORE_SHM_SEGMENT_DIR");
+        const std::string shm_segment_dir =
+            shm_segment_env ? shm_segment_env : "";
+        if (!shm_segment_dir.empty()) {
+            LOG(INFO) << "Store segments are shared files in "
+                      << shm_segment_dir;
+        }
+        const std::string cumem_socket_dir = CumemSocketDirFromEnv();
         const bool parallel_hugetlb_population =
-            protocol == "rdma" && use_hugepage_;
+            protocol == "rdma" && use_hugepage_ && shm_segment_dir.empty() &&
+            cumem_socket_dir.empty();
 
         while (global_segment_size > 0) {
             size_t segment_size = GetNextSegmentSize(
@@ -1372,8 +1381,21 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             std::string seg_location = kWildcardLocation;
             bool use_mmap_segment = !seg_numa_nodes.empty() || use_hugepage_;
             std::vector<int> segment_numa_nodes;
+            std::string shm_segment_path;
 
-            if (egm_config.enabled) {
+            CumemPoolPtr cumem_pool;
+            if (!cumem_socket_dir.empty() && !egm_config.enabled) {
+                auto pool =
+                    CreateCumemStoreSegment(cumem_socket_dir, segment_size,
+                                            alignment, &ptr, &mapped_size);
+                if (!pool) return tl::unexpected(pool.error());
+                // A short pool (memory ran out) mounts what it has.
+                segment_size = mapped_size;
+                cumem_pool = std::move(*pool);
+            } else if (!shm_segment_dir.empty() && !egm_config.enabled) {
+                ptr = allocate_buffer_shm_file(shm_segment_dir, segment_size,
+                                               &mapped_size, &shm_segment_path);
+            } else if (egm_config.enabled) {
                 auto status = NvlinkHostNumaAllocation::Create(
                     egm_numa_nodes[egm_node_index], segment_size, alignment,
                     egm_owner);
@@ -1452,7 +1474,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             LOG(INFO) << "Mounting segment: " << mount_size << " bytes, "
                       << current_glbseg_size << " of " << total_glbseg_size;
 
-            if (egm_config.enabled) {
+            if (cumem_pool) {
+                cumem_pools_.push_back(std::move(cumem_pool));
+            } else if (!shm_segment_path.empty()) {
+                shm_segment_files_.push_back(std::make_unique<ShmSegmentFile>(
+                    ptr, mapped_size, shm_segment_path));
+            } else if (egm_config.enabled) {
                 egm_segment_ptrs_.emplace_back(std::move(egm_owner));
             } else if (this->protocol == "ascend" ||
                        this->protocol == "ubshmem") {
@@ -1958,12 +1985,23 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     if (!setup_segments_safe_to_free || setup_segment_memory_must_leak_) {
         for (auto &ptr : hugepage_segment_ptrs_) ptr.release();
         for (auto &ptr : segment_ptrs_) ptr.release();
+        // Keep the mapping (a transfer may still target it) but drop the
+        // name, so the pages go back once this process exits.
+        for (auto &file : shm_segment_files_) {
+            unlink(file->path.c_str());
+            (void)file.release();
+        }
+        // Peers' mappings outlive the owner; the pages go back once the
+        // last one unmaps.
+        for (auto &pool : cumem_pools_) (void)pool.release();
 #ifdef USE_MEMFABRIC
         for (auto &ptr : memfabric_segment_ptrs_) ptr.release();
 #endif
         setup_segment_memory_must_leak_ = false;
     }
     hugepage_segment_ptrs_.clear();
+    shm_segment_files_.clear();
+    cumem_pools_.clear();
     segment_ptrs_.clear();
 #ifdef USE_MEMFABRIC
     memfabric_segment_ptrs_.clear();
