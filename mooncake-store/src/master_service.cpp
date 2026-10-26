@@ -338,6 +338,14 @@ MasterService::MasterService(const MasterServiceConfig& config)
             LOG(INFO) << "Force-evict enabled: objects exceeding offload "
                          "cap will be evicted without disk offload";
         }
+        offload_min_loads_ = config.offload_min_loads;
+        offload_max_bytes_per_sec_ = config.offload_max_bytes_per_sec;
+        offload_budget_refilled_ = std::chrono::steady_clock::now();
+        if (offload_min_loads_ > 0 || offload_max_bytes_per_sec_ > 0) {
+            LOG(INFO) << "Offload admission: objects loaded at least "
+                      << offload_min_loads_ << " time(s), write budget "
+                      << offload_max_bytes_per_sec_ << " bytes/s (0 = none)";
+        }
     }
 
     // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
@@ -4614,6 +4622,7 @@ auto MasterService::ReadReplicaList(const TenantId& tenant_id,
     // when the client is reading it. Read path is group-agnostic: only the
     // object's own lease is refreshed.
     metadata.GrantReadLease(std::chrono::milliseconds(default_kv_lease_ttl_));
+    metadata.loads.fetch_add(1, std::memory_order_relaxed);
 
     // Promotion-on-hit eligibility: only when no MEMORY replica is
     // present but at least one LOCAL_DISK replica is. Decided here while
@@ -8495,6 +8504,29 @@ auto MasterService::NotifyOffloadSuccess(
     return {};
 }
 
+bool MasterService::AdmitOffload(const ObjectMetadata& metadata) {
+    if (metadata.loads.load(std::memory_order_relaxed) < offload_min_loads_) {
+        MasterMetricManager::instance().inc_offload_skipped_cold();
+        return false;
+    }
+    if (offload_max_bytes_per_sec_ == 0) return true;
+    const double rate = static_cast<double>(offload_max_bytes_per_sec_);
+    const double bytes = static_cast<double>(metadata.TotalLength());
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(offload_budget_mutex_);
+    const double elapsed =
+        std::chrono::duration<double>(now - offload_budget_refilled_).count();
+    offload_budget_refilled_ = now;
+    offload_budget_bytes_ = std::min(offload_budget_bytes_ + elapsed * rate,
+                                     rate * kOffloadBudgetWindowSec);
+    if (offload_budget_bytes_ < bytes) {
+        MasterMetricManager::instance().inc_offload_skipped_budget();
+        return false;
+    }
+    offload_budget_bytes_ -= bytes;
+    return true;
+}
+
 tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     const ObjectIdentity& object_id, Replica& replica,
     std::vector<UUID>* mirror_clients) {
@@ -9958,6 +9990,10 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
             return evict_replicas(quota_account, metadata, deferred_replicas);
         }
 
+        if (!AdmitOffload(metadata)) {
+            return evict_replicas(quota_account, metadata, deferred_replicas);
+        }
+
         if (offload_force_evict_ && offload_queued_this_call >= offload_cap) {
             ++offload_cap_forced_count;
             return evict_replicas(quota_account, metadata, deferred_replicas);
@@ -10247,6 +10283,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
         // LOCAL_DISK replica already exists — safe to delete MEMORY immediately
         if (has_local_disk_replica(metadata)) {
+            return evict_replicas(quota_account, metadata, deferred_replicas);
+        }
+
+        // Not worth a disk write: evict as without offload.
+        if (!AdmitOffload(metadata)) {
             return evict_replicas(quota_account, metadata, deferred_replicas);
         }
 

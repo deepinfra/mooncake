@@ -480,6 +480,13 @@ MasterMetricManager::MasterMetricManager()
       offload_enqueue_rejected_total_(
           "master_offload_enqueue_rejected_total",
           "SSD offload tasks rejected at enqueue (queue full)", {"client_id"}),
+      offload_skipped_cold_total_(
+          "master_offload_skipped_cold_total",
+          "Objects evicted without offload: loaded fewer than "
+          "offload_min_loads times"),
+      offload_skipped_budget_total_(
+          "master_offload_skipped_budget_total",
+          "Objects evicted without offload: offload_max_bytes_per_sec spent"),
 
       // Initialize CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd,
       // MoveRevoke Counters
@@ -582,6 +589,8 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     client_liveness_offline_transitions_.inc(0);
     client_offboarding_retries_.inc(0);
     client_offboarding_alerts_.inc(0);
+    offload_skipped_cold_total_.inc(0);
+    offload_skipped_budget_total_.inc(0);
     promotion_completed_.inc(0);
     promotion_completed_bytes_.inc(0);
     promotion_expired_.inc(0);
@@ -1449,6 +1458,14 @@ void MasterMetricManager::inc_offload_enqueue_rejected(
     offload_enqueue_rejected_total_.inc({client_id}, val);
 }
 
+void MasterMetricManager::inc_offload_skipped_cold(int64_t val) {
+    offload_skipped_cold_total_.inc(val);
+}
+
+void MasterMetricManager::inc_offload_skipped_budget(int64_t val) {
+    offload_skipped_budget_total_.inc(val);
+}
+
 int64_t MasterMetricManager::get_put_start_requests() {
     return put_start_requests_.value();
 }
@@ -2225,6 +2242,8 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(offload_failed_total_);
     serialize_metric(offload_cancelled_total_);
     serialize_metric(offload_enqueue_rejected_total_);
+    serialize_metric(offload_skipped_cold_total_);
+    serialize_metric(offload_skipped_budget_total_);
     serialize_metric(build_info_);
 
     return ss.str();

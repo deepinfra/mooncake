@@ -368,6 +368,9 @@ class MasterMetricManager {
     void inc_offload_cancelled(const std::string& client_id, int64_t val = 1);
     void inc_offload_enqueue_rejected(const std::string& client_id,
                                       int64_t val = 1);
+    // Offload-on-evict admission: evicted without offload
+    void inc_offload_skipped_cold(int64_t val = 1);
+    void inc_offload_skipped_budget(int64_t val = 1);
 
     // Promotion-on-hit Metrics Getters
     int64_t get_promotion_in_flight();
@@ -782,6 +785,8 @@ class MasterMetricManager {
     ylt::metric::dynamic_counter_1t offload_failed_total_;
     ylt::metric::dynamic_counter_1t offload_cancelled_total_;
     ylt::metric::dynamic_counter_1t offload_enqueue_rejected_total_;
+    ylt::metric::counter_t offload_skipped_cold_total_;
+    ylt::metric::counter_t offload_skipped_budget_total_;
 
     // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
     ylt::metric::counter_t copy_start_requests_;

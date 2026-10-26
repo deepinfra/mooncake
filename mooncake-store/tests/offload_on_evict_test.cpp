@@ -151,6 +151,86 @@ TEST_F(OffloadOnEvictTest, UpsertPreemptsQueuedOffloadWithOffloadOnEvict) {
     service->RemoveAll();
 }
 
+// =============================================================================
+// Offload admission: offload_min_loads and offload_max_bytes_per_sec decide
+// which evicted objects go to disk; the rest are evicted without offload.
+// =============================================================================
+
+TEST_F(OffloadOnEvictTest, MinLoadsOffloadsOnlyLoadedObjects) {
+    const uint64_t kv_lease_ttl = 500;
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.offload_on_evict = true;
+    config.offload_min_loads = 1;
+    config.default_kv_lease_ttl = kv_lease_ttl;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    constexpr size_t object_size = 1024 * 1024;
+    auto ctx =
+        PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(service->MountLocalDiskSegment(ctx.client_id, true));
+
+    std::vector<std::string> keys;
+    for (int i = 0; i < 8; ++i) {
+        keys.push_back("admit_loads_" + std::to_string(i));
+        PutObject(*service, ctx.client_id, keys.back(), object_size);
+    }
+    for (int i = 0; i < 3; ++i) {
+        ASSERT_TRUE(
+            service->GetReplicaList(keys[i], TenantId::Default()).has_value());
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl * 2));
+    MasterServiceTestPeer(*service).RunBatchEvictForTesting(1.0, 1.0);
+
+    auto queued = DrainOffloadQueue(*service, ctx.client_id);
+    EXPECT_EQ(queued.size(), 3u);
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(queued.count(keys[i]), 1u) << keys[i] << " was loaded";
+    }
+    for (int i = 3; i < 8; ++i) {
+        EXPECT_FALSE(
+            service->GetReplicaList(keys[i], TenantId::Default()).has_value())
+            << keys[i] << " was never loaded and must be evicted";
+    }
+
+    service->RemoveAll();
+}
+
+TEST_F(OffloadOnEvictTest, SpentWriteBudgetEvictsWithoutOffload) {
+    const uint64_t kv_lease_ttl = 500;
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.offload_on_evict = true;
+    config.offload_max_bytes_per_sec = 1;  // never covers a 1 MiB object
+    config.default_kv_lease_ttl = kv_lease_ttl;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    constexpr size_t object_size = 1024 * 1024;
+    auto ctx =
+        PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(service->MountLocalDiskSegment(ctx.client_id, true));
+
+    std::vector<std::string> keys;
+    for (int i = 0; i < 4; ++i) {
+        keys.push_back("admit_budget_" + std::to_string(i));
+        PutObject(*service, ctx.client_id, keys.back(), object_size);
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl * 2));
+    MasterServiceTestPeer(*service).RunBatchEvictForTesting(1.0, 1.0);
+
+    EXPECT_TRUE(DrainOffloadQueue(*service, ctx.client_id).empty());
+    for (const auto& key : keys) {
+        EXPECT_FALSE(
+            service->GetReplicaList(key, TenantId::Default()).has_value());
+    }
+
+    service->RemoveAll();
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

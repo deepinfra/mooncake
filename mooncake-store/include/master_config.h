@@ -185,6 +185,8 @@ struct MasterConfig {
     bool offload_force_evict = false;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
+    uint32_t offload_min_loads = 0;
+    uint64_t offload_max_bytes_per_sec = 0;
 
     // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
     // async copy back to MEMORY so the next Get is fast.
@@ -301,6 +303,8 @@ class MasterServiceSupervisorConfig {
     bool offload_force_evict = false;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
+    uint32_t offload_min_loads = 0;
+    uint64_t offload_max_bytes_per_sec = 0;
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
@@ -362,6 +366,8 @@ class MasterServiceSupervisorConfig {
         offload_force_evict = config.offload_force_evict;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
+        offload_min_loads = config.offload_min_loads;
+        offload_max_bytes_per_sec = config.offload_max_bytes_per_sec;
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
@@ -559,6 +565,8 @@ class WrappedMasterServiceConfig {
     bool offload_force_evict = false;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
+    uint32_t offload_min_loads = 0;
+    uint64_t offload_max_bytes_per_sec = 0;
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
@@ -651,6 +659,8 @@ class WrappedMasterServiceConfig {
         offload_force_evict = config.offload_force_evict;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
+        offload_min_loads = config.offload_min_loads;
+        offload_max_bytes_per_sec = config.offload_max_bytes_per_sec;
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
@@ -776,6 +786,8 @@ class WrappedMasterServiceConfig {
         offload_force_evict = config.offload_force_evict;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
+        offload_min_loads = config.offload_min_loads;
+        offload_max_bytes_per_sec = config.offload_max_bytes_per_sec;
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
@@ -1218,6 +1230,8 @@ class MasterServiceConfig {
     bool offload_force_evict = false;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
+    uint32_t offload_min_loads = 0;
+    uint64_t offload_max_bytes_per_sec = 0;
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
@@ -1308,6 +1322,8 @@ class MasterServiceConfig {
         offload_force_evict = config.offload_force_evict;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
+        offload_min_loads = config.offload_min_loads;
+        offload_max_bytes_per_sec = config.offload_max_bytes_per_sec;
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;

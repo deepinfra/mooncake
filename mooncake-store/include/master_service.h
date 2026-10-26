@@ -1668,6 +1668,12 @@ class MasterService {
         const ObjectIdentity& object_id, Replica& replica,
         std::vector<UUID>* mirror_clients = nullptr);
 
+    // Offload-on-evict admission for an object about to lose its MEMORY
+    // replicas: false when it was loaded fewer than offload_min_loads times
+    // or the write budget is spent, so it is evicted without offload. An
+    // admitted object's bytes come out of the budget.
+    bool AdmitOffload(const ObjectMetadata& metadata);
+
     // Cancels the offload task on `object_id`, releasing the source refcnt
     // and dropping the task marker along with its mirrors. Returns false
     // without touching the task if any mirror has already been drained by a
@@ -2304,6 +2310,16 @@ class MasterService {
     // exceeded (config: offload_force_evict, only effective when
     // offload_on_evict_=true)
     bool offload_force_evict_{false};
+    // Offload admission (config: offload_min_loads,
+    // offload_max_bytes_per_sec): loads an object needs, and a write budget
+    // refilled continuously and capped at kOffloadBudgetWindowSec of writes.
+    static constexpr double kOffloadBudgetWindowSec = 600;
+    uint32_t offload_min_loads_{0};
+    uint64_t offload_max_bytes_per_sec_{0};
+    std::mutex offload_budget_mutex_;
+    double offload_budget_bytes_ GUARDED_BY(offload_budget_mutex_){0};
+    std::chrono::steady_clock::time_point offload_budget_refilled_
+        GUARDED_BY(offload_budget_mutex_);
 
     // Promotion-on-hit: opt-in flag enabling LOCAL_DISK -> MEMORY promotion
     // when a Get observes a key with only LOCAL_DISK replicas.

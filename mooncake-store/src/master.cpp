@@ -275,6 +275,16 @@ DEFINE_validator(offload_cap_ratio, [](const char* flagname, double value) {
     }
     return true;
 });
+DEFINE_uint32(offload_min_loads, 0,
+              "Offload-on-evict admission: write an evicted object to disk "
+              "only if clients loaded it at least this many times since it was "
+              "put (0 admits all). Others are evicted without offload. Loads "
+              "come as prefixes, so the admitted blocks stay prefix chains");
+DEFINE_uint64(offload_max_bytes_per_sec, 0,
+              "Offload-on-evict write budget in bytes per second, averaged "
+              "over up to 10 minutes (0 = no budget). Admitted objects past "
+              "the budget are evicted without offload; size it to the "
+              "disks' endurance");
 DEFINE_bool(promotion_on_hit, false,
             "Promote LOCAL_DISK-only keys to MEMORY on read access (mirror of "
             "offload_on_evict)");
@@ -603,6 +613,12 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetDouble("offload_cap_ratio",
                              &master_config.offload_cap_ratio,
                              FLAGS_offload_cap_ratio);
+    default_config.GetUInt32("offload_min_loads",
+                             &master_config.offload_min_loads,
+                             FLAGS_offload_min_loads);
+    default_config.GetUInt64("offload_max_bytes_per_sec",
+                             &master_config.offload_max_bytes_per_sec,
+                             FLAGS_offload_max_bytes_per_sec);
     default_config.GetBool("promotion_on_hit", &master_config.promotion_on_hit,
                            FLAGS_promotion_on_hit);
     default_config.GetUInt32("promotion_admission_threshold",
@@ -951,6 +967,17 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.offload_cap_ratio = FLAGS_offload_cap_ratio;
+    }
+    if ((google::GetCommandLineFlagInfo("offload_min_loads", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_min_loads = FLAGS_offload_min_loads;
+    }
+    if ((google::GetCommandLineFlagInfo("offload_max_bytes_per_sec", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_max_bytes_per_sec =
+            FLAGS_offload_max_bytes_per_sec;
     }
     if ((google::GetCommandLineFlagInfo("promotion_on_hit", &info) &&
          !info.is_default) ||
@@ -1600,6 +1627,9 @@ int main(int argc, char* argv[]) {
         << ", offload_force_evict=" << master_config.offload_force_evict
         << ", offloading_queue_limit=" << master_config.offloading_queue_limit
         << ", offload_cap_ratio=" << master_config.offload_cap_ratio
+        << ", offload_min_loads=" << master_config.offload_min_loads
+        << ", offload_max_bytes_per_sec="
+        << master_config.offload_max_bytes_per_sec
         << ", ha_backend_type=" << master_config.ha_backend_type
         << ", ha_backend_connstring=" << ha_backend_connstring
         << ", ha_leader_lease_ttl_sec=" << master_config.ha_leader_lease_ttl_sec

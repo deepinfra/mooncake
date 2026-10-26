@@ -14,6 +14,7 @@
 // the envelope can read either without them tearing.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -155,6 +156,9 @@ struct ObjectMetadata {
     // otherwise be distinguished from the current write.
     std::optional<PendingSoftPinAction> pending_soft_pin_action;
     const bool hard_pinned{false};  // immutable, set at creation
+    // Client loads (ReadReplicaList) since creation, for offload admission
+    // (offload_min_loads). Not persisted.
+    mutable std::atomic<uint32_t> loads{0};
     bool memory_cache_total_accounted{false};
     bool disk_cache_total_accounted{false};
     TenantQuotaLedger quota_ledger;
