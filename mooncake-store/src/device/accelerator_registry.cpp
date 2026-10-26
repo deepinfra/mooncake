@@ -1,8 +1,10 @@
 #include "device/accelerator_registry.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace mooncake {
@@ -32,6 +34,16 @@ class AcceleratorRegistryImpl final : public AcceleratorRegistry {
     }
 
     RuntimeAccelerator RuntimeAccelerators(bool ensure = false) const override {
+        // MC_STORE_DISABLE_ACCELERATORS: a store whose segments are host
+        // memory sees GPUs only to allocate that memory (CUDA VMM host pools
+        // need a GPU per NUMA node). Probing pointers there would create a
+        // context holding device memory on a GPU a serving worker owns, so
+        // every pointer is host memory instead.
+        static const bool disabled = [] {
+            const char* env = getenv("MC_STORE_DISABLE_ACCELERATORS");
+            return env && *env && std::string(env) != "0";
+        }();
+        if (disabled) return RuntimeAccelerator();
         auto available_devices = std::atomic_load(&available_devices_);
         if (ShouldRefresh(ensure, available_devices)) {
             std::lock_guard<std::mutex> lock(refresh_mutex_);

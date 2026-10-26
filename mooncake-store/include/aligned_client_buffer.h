@@ -1,6 +1,7 @@
 #pragma once
 
 #include "client_buffer.h"
+#include "cumem_store_segment.h"
 
 namespace mooncake {
 
@@ -59,6 +60,8 @@ class AlignedClientBufferAllocator : public ClientBufferAllocator {
     std::string protocol_;
     // Set when the buffer is a shared file in MC_STORE_SHM_SEGMENT_DIR.
     std::string shm_path_;
+    // Set when the buffer is a CUDA VMM host pool (MC_STORE_CUMEM_SOCKET_DIR).
+    CumemPoolPtr cumem_pool_;
 };
 
 }  // namespace mooncake

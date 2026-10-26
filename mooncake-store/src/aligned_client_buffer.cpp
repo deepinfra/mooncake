@@ -108,8 +108,33 @@ AlignedClientBufferAllocator::create(size_t size, const std::string& protocol,
     size_t aligned_size = align_up(size, kDirectIOAlignment);
 
     const bool use_protocol_allocator = UseProtocolAllocator(protocol);
-    // SSD restores land here and peers read them out; on a shared file a
-    // same-host peer copies them without a NIC, like the store segments.
+    // SSD restores land here and peers read them out. With the store
+    // segments in a CUDA VMM host pool, this buffer is another served pool,
+    // so same-host peers import it and copy without a NIC like the segments.
+    const std::string cumem_socket_dir = CumemSocketDirFromEnv();
+    if (!cumem_socket_dir.empty() && !use_protocol_allocator) {
+        void* pool_buffer = nullptr;
+        size_t mapped_size = 0;
+        auto pool = CreateCumemStoreSegment(cumem_socket_dir, aligned_size,
+                                            kDirectIOAlignment, &pool_buffer,
+                                            &mapped_size);
+        if (!pool) return nullptr;
+        // FileStorage registers and uses the full size; a short pool (host
+        // memory ran out) cannot back it.
+        if (mapped_size < aligned_size) {
+            LOG(ERROR) << "AlignedClientBufferAllocator: CUDA VMM pool got "
+                       << mapped_size << " of " << aligned_size << " bytes";
+            return nullptr;
+        }
+        auto allocator = std::shared_ptr<AlignedClientBufferAllocator>(
+            new AlignedClientBufferAllocator(pool_buffer, mapped_size, protocol,
+                                             false));
+        allocator->cumem_pool_ = std::move(*pool);
+        LOG(INFO) << "AlignedClientBufferAllocator: " << mapped_size
+                  << " bytes of CUDA VMM host memory at " << pool_buffer;
+        return allocator;
+    }
+    // On a shared file a same-host peer copies them without a NIC.
     const char* shm_dir = getenv("MC_STORE_SHM_SEGMENT_DIR");
     if (shm_dir && *shm_dir && !use_protocol_allocator) {
         size_t mapped_size = 0;
@@ -166,7 +191,12 @@ AlignedClientBufferAllocator::~AlignedClientBufferAllocator() {
     // Free the aligned memory we allocated
     // The parent class destructor will not free it because is_external_memory_
     // is set to true
-    if (owns_memory_ && buffer_ && !shm_path_.empty()) {
+    if (cumem_pool_) {
+        // The pool owns the mapping; peers' mappings outlive it and its
+        // pages go back once the last one unmaps.
+        buffer_ = nullptr;
+        cumem_pool_.reset();
+    } else if (owns_memory_ && buffer_ && !shm_path_.empty()) {
         free_buffer_shm_file(buffer_, allocated_size_, shm_path_);
         buffer_ = nullptr;
     } else if (owns_memory_ && buffer_) {
