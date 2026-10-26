@@ -12463,11 +12463,14 @@ void MasterService::PublishKvRemovedAfterEvict(const std::string& key,
     if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
         return;
     }
-    // The object lost its last replica, so the caller is about to erase it and
-    // EraseMetadata publishes the full removal itself. Emitting here as well
-    // would repeat every medium. This mirrors the oplog eviction path, which
-    // already chooses between EraseMetadata and SyncKvObjectState.
+    // The object lost its last replica, so the caller is about to erase it.
+    // EraseMetadata cannot announce the evicted medium: BatchEvict already
+    // popped the replicas, so KvRemovalSnapshot finds no medium and nothing
+    // would be published. Retract the evicted medium here; EraseMetadata then
+    // publishes an empty set, so no event repeats.
     if (!metadata.IsValid()) {
+        kv_event_publisher_->PublishObjectRemoved(key, tenant_id.value(),
+                                                  metadata.group_id, {medium});
         return;
     }
     // The object survives. Feeding the evicted medium in as part of the
