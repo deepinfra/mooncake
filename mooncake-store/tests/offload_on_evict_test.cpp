@@ -76,6 +76,70 @@ class OffloadOnEvictTest : public ::testing::Test {
         }
         return queued;
     }
+
+    struct ShortfallResult {
+        int queued, admitted_gone, old_gone, young_gone, newest_gone;
+    };
+
+    // Oldest first: `admitted` objects loaded once (so deferred to the offload
+    // queue), then `old`, `young` and `newest` unloaded ones. One pass targets
+    // `target` evictions.
+    ShortfallResult RunShortfallScenario(int admitted, int old, int young,
+                                         int newest, int target) {
+        const uint64_t kv_lease_ttl = 200;
+        MasterServiceConfig config;
+        config.enable_offload = true;
+        config.offload_on_evict = true;
+        config.offload_min_loads = 1;
+        config.default_kv_lease_ttl = kv_lease_ttl;
+        auto service = std::make_unique<MasterService>(config);
+        auto ctx = PrepareSegment(*service, "test_segment",
+                                  kDefaultSegmentBase, 256 * 1024 * 1024);
+        EXPECT_TRUE(service->MountLocalDiskSegment(ctx.client_id, true));
+
+        auto put_batch = [&](const std::string& prefix, int n) {
+            for (int i = 0; i < n; ++i) {
+                PutObject(*service, ctx.client_id, prefix + std::to_string(i),
+                          4096);
+            }
+        };
+        auto gone = [&](const std::string& prefix, int n) {
+            int count = 0;
+            for (int i = 0; i < n; ++i) {
+                count += !service
+                              ->ExistKey(prefix + std::to_string(i),
+                                         TenantId::Default())
+                              .value_or(false);
+            }
+            return count;
+        };
+        put_batch("admitted_", admitted);
+        for (int i = 0; i < admitted; ++i) {
+            EXPECT_TRUE(service
+                            ->GetReplicaList("admitted_" + std::to_string(i),
+                                             TenantId::Default())
+                            .has_value());
+        }
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(kv_lease_ttl + 100));
+        put_batch("old_", old);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        put_batch("young_", young);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        put_batch("newest_", newest);
+        std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl * 2));
+
+        const double ratio =
+            static_cast<double>(target) / (admitted + old + young + newest);
+        MasterServiceTestPeer(*service).RunBatchEvictForTesting(ratio, ratio);
+
+        ShortfallResult result{
+            static_cast<int>(DrainOffloadQueue(*service, ctx.client_id).size()),
+            gone("admitted_", admitted), gone("old_", old),
+            gone("young_", young), gone("newest_", newest)};
+        service->RemoveAll();
+        return result;
+    }
 };
 
 // =============================================================================
@@ -229,6 +293,31 @@ TEST_F(OffloadOnEvictTest, SpentWriteBudgetEvictsWithoutOffload) {
     }
 
     service->RemoveAll();
+}
+
+// Deferred offloads free nothing during the pass, so a pass whose oldest
+// candidates are mostly admitted falls short of its target and keeps evicting.
+// It must keep going oldest first: the newest objects are the ones clients are
+// about to read, and a fixed walk order would take the same ones every pass.
+TEST_F(OffloadOnEvictTest, ShortfallEvictsOldestFirst) {
+    // Above the pre-bypass ratio: every object is a candidate.
+    auto r = RunShortfallScenario(1500, 1500, 600, 600, 2000);
+    EXPECT_EQ(r.queued, 1500);
+    EXPECT_EQ(r.admitted_gone, 0);
+    EXPECT_EQ(r.old_gone, 1500);
+    EXPECT_GE(r.young_gone, 500);
+    EXPECT_EQ(r.newest_gone, 0);
+}
+
+TEST_F(OffloadOnEvictTest, ShortfallRefillEvictsOldestFirst) {
+    // Below the pre-bypass ratio: a reserve frontier, then a refill from the
+    // younger objects once the deferrals exhaust it.
+    auto r = RunShortfallScenario(1500, 1500, 3000, 6000, 2400);
+    EXPECT_EQ(r.queued, 1500);
+    EXPECT_EQ(r.admitted_gone, 0);
+    EXPECT_EQ(r.old_gone, 1500);
+    EXPECT_GE(r.young_gone, 900);
+    EXPECT_EQ(r.newest_gone, 0);
 }
 
 }  // namespace mooncake::test

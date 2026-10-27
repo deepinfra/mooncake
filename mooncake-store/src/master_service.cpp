@@ -10766,11 +10766,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
     if (!candidates.empty()) {
         long evict_num = std::min(ideal_evict_num, (long)candidates.size());
 
-        std::nth_element(candidates.begin(),
-                         candidates.begin() + (evict_num - 1), candidates.end(),
-                         [](const Candidate& a, const Candidate& b) {
-                             return a.lease_timeout < b.lease_timeout;
-                         });
+        // A full sort, not a partition: candidates that free nothing (deferred
+        // to the offload queue, or failing re-validation) send the loop below
+        // past evict_num, and it must keep going oldest first.
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const Candidate& a, const Candidate& b) {
+                      return a.lease_timeout < b.lease_timeout;
+                  });
 
         // Treat evict_num as a minimum: if re-validation skips a candidate,
         // continue trying the next one so actual evicted count reaches
@@ -10822,6 +10824,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
             auto refill_candidates = collect_candidates(
                 /*use_cutoff=*/true, reserve_cutoff,
                 /*collect_older_or_equal=*/false);
+            // The refill holds every younger object in metadata-walk order,
+            // which is the same order every pass; evicting in it would take
+            // the same fresh objects each time. Keep the census order.
+            std::sort(refill_candidates.begin(), refill_candidates.end(),
+                      [](const Candidate& a, const Candidate& b) {
+                          return a.lease_timeout < b.lease_timeout;
+                      });
             evict_candidate_batch(refill_candidates);
         }
     }
