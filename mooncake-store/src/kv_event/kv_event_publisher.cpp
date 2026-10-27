@@ -17,7 +17,13 @@ namespace mooncake {
 namespace {
 
 constexpr int kZmqSendHwm = 10000;
-constexpr size_t kMaxBatchSize = 64;
+constexpr size_t kMaxBatchSize = 1024;
+// Producers enqueue one event at a time (an eviction pass publishes one removal
+// per object), so without a short wait each event leaves as its own message and
+// a 100k-object pass overruns subscribers' send queues (kZmqSendHwm), which they
+// see as sequence gaps. Waiting this long for a fuller batch bounds the added
+// latency.
+constexpr auto kCoalesceWindow = std::chrono::milliseconds(2);
 
 int64_t CurrentUnixTimeMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -338,6 +344,9 @@ void KvEventPublisher::WorkerLoop() {
             std::unique_lock<std::mutex> lock(queue_mutex_);
             queue_cv_.wait(lock,
                            [this] { return stop_.load() || !queue_.empty(); });
+            queue_cv_.wait_for(lock, kCoalesceWindow, [this] {
+                return stop_.load() || queue_.size() >= kMaxBatchSize;
+            });
             while (!queue_.empty() && batch.size() < kMaxBatchSize) {
                 batch.push_back(std::move(queue_.front()));
                 queue_.pop_front();

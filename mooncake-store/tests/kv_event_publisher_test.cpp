@@ -660,6 +660,28 @@ TEST(KvEventPublisherTest, EmptyMediumProducesNoEvent) {
     EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
 }
 
+TEST(KvEventPublisherTest, BurstOfSingleEventsLeavesInFewBatches) {
+    // An eviction pass publishes one removal per object; sent one per message,
+    // a large pass overruns a subscriber's send queue.
+    const std::string endpoint = MakeIpcEndpoint();
+    KvEventPublisher publisher(MakeEnabledConfig(endpoint));
+    constexpr uint64_t kEvents = 5000;
+    for (uint64_t i = 0; i < kEvents; ++i) {
+        publisher.PublishRemoved("object-" + std::to_string(i), "cpu",
+                                 "tenant-a", "group-a");
+    }
+    for (int i = 0; i < 100; ++i) {
+        if (publisher.GetStats().published_events == kEvents) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    const auto stats = publisher.GetStats();
+    EXPECT_EQ(stats.published_events, kEvents);
+    EXPECT_LE(stats.published_batches, 50u);
+    EXPECT_EQ(stats.dropped_events, 0u);
+}
+
 #endif  // MOONCAKE_ENABLE_KV_EVENTS
 
 }  // namespace
