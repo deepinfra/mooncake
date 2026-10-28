@@ -12382,35 +12382,49 @@ KvEventConfig MasterService::BuildKvEventConfig(
     return kv_config;
 }
 
+namespace {
+
+constexpr uint8_t kKvMediumCpu = 1;
+constexpr uint8_t kKvMediumDisk = 2;
+
 // Every non-memory replica type, including DFS, is normalized to the "disk"
 // medium so subscribers see one logical tier per storage class.
-std::vector<std::string> MasterService::KvMediaForMetadata(
-    const ObjectMetadata& metadata) {
-    bool has_cpu = false;
-    bool has_disk = false;
+uint8_t KvMediaBits(const ObjectMetadata& metadata) {
+    uint8_t media = 0;
     metadata.VisitReplicas(
         [](const Replica& replica) { return replica.is_completed(); },
         [&](const Replica& replica) {
             if (replica.is_memory_replica() &&
                 !replica.has_invalid_mem_handle()) {
-                has_cpu = true;
+                media |= kKvMediumCpu;
             } else if (replica.is_nof_replica() &&
                        !replica.has_invalid_nof_handle()) {
-                has_disk = true;
+                media |= kKvMediumDisk;
             } else if (replica.is_disk_replica() ||
                        replica.is_local_disk_replica() ||
                        replica.is_dfs_replica()) {
-                has_disk = true;
+                media |= kKvMediumDisk;
             }
         });
-    std::vector<std::string> media;
-    if (has_cpu) {
-        media.emplace_back("cpu");
-    }
-    if (has_disk) {
-        media.emplace_back("disk");
-    }
     return media;
+}
+
+std::vector<std::string> KvMediaNames(uint8_t media) {
+    std::vector<std::string> names;
+    if (media & kKvMediumCpu) {
+        names.emplace_back("cpu");
+    }
+    if (media & kKvMediumDisk) {
+        names.emplace_back("disk");
+    }
+    return names;
+}
+
+}  // namespace
+
+std::vector<std::string> MasterService::KvMediaForMetadata(
+    const ObjectMetadata& metadata) {
+    return KvMediaNames(KvMediaBits(metadata));
 }
 
 std::vector<std::string> MasterService::KvMediaForRemoval(
@@ -12571,6 +12585,59 @@ KvEventPublisher::Stats MasterService::GetKvEventStats() const {
         return {};
     }
     return kv_event_publisher_->GetStats();
+}
+
+auto MasterService::GetKvSnapshotPage(const TenantId& tenant_id,
+                                      size_t first_shard, size_t max_objects,
+                                      bool with_keys) const
+    -> tl::expected<KvSnapshotPage, ErrorCode> {
+    if (first_shard >= kNumShards || max_objects == 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
+    KvSnapshotPage page;
+    // Read before any shard: what changes after this point is published at
+    // this sequence or later.
+    if (KvEventsEnabled()) {
+        page.next_sequence = kv_event_publisher_->NextSequence();
+    }
+    // Writers to a shard wait while it is read, so the read copies only the
+    // strings into a reused buffer; the rest happens after the lock.
+    struct Held {
+        std::string object_key;
+        std::string group_id;
+        uint8_t media;
+    };
+    std::vector<Held> held;
+    size_t shard_index = first_shard;
+    while (shard_index < kNumShards && page.objects.size() < max_objects) {
+        held.clear();
+        {
+            MetadataShardAccessorRO shard(this, shard_index++);
+            auto tenant_it = shard->tenants.find(normalized_tenant);
+            if (tenant_it == shard->tenants.end()) {
+                continue;
+            }
+            const auto& objects = tenant_it->second.metadata;
+            held.reserve(objects.size());
+            for (const auto& [key, record] : objects) {
+                if (uint8_t media = KvMediaBits(record.metadata)) {
+                    held.push_back({with_keys ? key : std::string(),
+                                    record.metadata.group_id, media});
+                }
+            }
+        }
+        for (auto& object : held) {
+            page.objects.push_back({std::move(object.object_key),
+                                    std::move(object.group_id),
+                                    KvMediaNames(object.media)});
+        }
+    }
+    if (shard_index < kNumShards) {
+        page.next_shard = shard_index;
+    }
+    return page;
 }
 
 void MasterService::setHttpMetadataServer(HttpMetadataServer* server) {

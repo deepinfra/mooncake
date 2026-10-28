@@ -1,6 +1,7 @@
 #include "master_admin_service.h"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <exception>
@@ -12,6 +13,9 @@
 
 #include <asio/executor_work_guard.hpp>
 #include <glog/logging.h>
+#if defined(MOONCAKE_ENABLE_KV_EVENTS) && MOONCAKE_ENABLE_KV_EVENTS
+#include <msgpack.hpp>
+#endif
 #if __has_include(<jsoncpp/json/json.h>)
 #include <jsoncpp/json/json.h>
 #else
@@ -629,6 +633,112 @@ void MasterAdminServer::HandleKvEventsStatus(
             payload.skipped_keyless_events = stats.skipped_keyless_events;
             WriteJsonResponse(resp, coro_http::status_type::ok, payload);
         });
+}
+
+namespace {
+
+// Objects per /kv_events/snapshot page unless the request names a number, and
+// the most it may name.
+constexpr size_t kKvSnapshotDefaultPageObjects = 65536;
+constexpr size_t kKvSnapshotMaxPageObjects = 1 << 20;
+
+std::optional<size_t> ParseSizeQuery(std::string_view value, size_t fallback) {
+    if (value.empty()) {
+        return fallback;
+    }
+    size_t parsed = 0;
+    const auto [end, error] =
+        std::from_chars(value.data(), value.data() + value.size(), parsed);
+    if (error != std::errc() || end != value.data() + value.size()) {
+        return std::nullopt;
+    }
+    return parsed;
+}
+
+}  // namespace
+
+// GET /kv_events/snapshot?shard=S&max_objects=N[&tenant=T][&object_keys=0]
+//
+// One page of MasterService::GetKvSnapshotPage as msgpack:
+//   {"next_sequence": uint, or nil without KV events,
+//    "next_shard": uint, or nil after the last page,
+//    "objects": [[object_key, group_id or nil, [medium, ...]], ...]}
+// A subscriber starts at shard 0, follows next_shard, and then applies the KV
+// event batches from the first page's next_sequence on. object_keys=0 sends
+// nil keys, for subscribers that match on group_id alone.
+void MasterAdminServer::HandleKvEventsSnapshot(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+#if defined(MOONCAKE_ENABLE_KV_EVENTS) && MOONCAKE_ENABLE_KV_EVENTS
+    const auto shard = ParseSizeQuery(req.get_query_value("shard"), 0);
+    const auto max_objects = ParseSizeQuery(req.get_query_value("max_objects"),
+                                            kKvSnapshotDefaultPageObjects);
+    const auto object_keys = req.get_query_value("object_keys");
+    if (!shard || !max_objects || *max_objects == 0 ||
+        *max_objects > kKvSnapshotMaxPageObjects ||
+        (object_keys != "" && object_keys != "0" && object_keys != "1")) {
+        WriteSimpleErrorResponse(
+            resp, coro_http::status_type::bad_request,
+            "shard and max_objects (1 to " +
+                std::to_string(kKvSnapshotMaxPageObjects) +
+                ") must be unsigned integers, object_keys 0 or 1");
+        return;
+    }
+    std::string tenant(req.get_query_value("tenant"));
+    if (tenant.empty()) {
+        tenant = TenantId::kDefaultValue;
+    }
+    WithActiveService(
+        resp, [&](const std::shared_ptr<WrappedMasterService>& service) {
+            const bool with_keys = object_keys != "0";
+            auto page = service->GetKvSnapshotPageForAdmin(
+                tenant, *shard, *max_objects, with_keys);
+            if (!page) {
+                WriteErrorResponse(resp, ErrorCodeToHttpStatus(page.error()),
+                                   page.error(),
+                                   "Failed to read a KV snapshot page");
+                return;
+            }
+            msgpack::sbuffer buffer;
+            msgpack::packer<msgpack::sbuffer> packer(&buffer);
+            packer.pack_map(3);
+            packer.pack("next_sequence");
+            if (service->KvEventsEnabled()) {
+                packer.pack(page->next_sequence);
+            } else {
+                packer.pack_nil();
+            }
+            packer.pack("next_shard");
+            if (page->next_shard) {
+                packer.pack(*page->next_shard);
+            } else {
+                packer.pack_nil();
+            }
+            packer.pack("objects");
+            packer.pack_array(page->objects.size());
+            for (const auto& object : page->objects) {
+                packer.pack_array(3);
+                if (with_keys) {
+                    packer.pack(object.object_key);
+                } else {
+                    packer.pack_nil();
+                }
+                if (object.group_id.empty()) {
+                    packer.pack_nil();
+                } else {
+                    packer.pack(object.group_id);
+                }
+                packer.pack(object.media);
+            }
+            resp.add_header("Content-Type", "application/msgpack");
+            resp.set_status_and_content(
+                coro_http::status_type::ok,
+                std::string(buffer.data(), buffer.size()));
+        });
+#else
+    (void)req;
+    WriteSimpleErrorResponse(resp, coro_http::status_type::not_implemented,
+                             "master built without KV events");
+#endif
 }
 
 void MasterAdminServer::HandleQueryKey(coro_http::coro_http_request& req,
@@ -1472,6 +1582,11 @@ void MasterAdminServer::RegisterHandler() {
         "/kv_events/status",
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleKvEventsStatus(req, resp);
+        });
+    http_server_.set_http_handler<GET>(
+        "/kv_events/snapshot",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleKvEventsSnapshot(req, resp);
         });
     http_server_.set_http_handler<GET>(
         "/leader", [this](coro_http_request& req, coro_http_response& resp) {

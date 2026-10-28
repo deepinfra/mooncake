@@ -83,6 +83,11 @@ class KvEventPublisher {
         const std::string& group_id = "",
         const std::vector<std::string>& previous_media = {});
 
+    // The ZMQ sequence of the next batch to publish. An event enqueued after
+    // this call goes out in a batch numbered at least this, since a batch
+    // takes its number after its events are dequeued.
+    uint64_t NextSequence() const { return next_zmq_sequence_.load(); }
+
     struct Stats {
         uint64_t published_batches{0};
         uint64_t published_events{0};
@@ -157,6 +162,8 @@ class KvEventPublisher {
     void PublishObjectRemoved(const std::string&, const std::string& = "",
                               const std::string& = "",
                               const std::vector<std::string>& = {}) {}
+
+    uint64_t NextSequence() const { return 0; }
 
     struct Stats {
         uint64_t published_batches{0};

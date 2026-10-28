@@ -1656,6 +1656,15 @@ WrappedMasterService::GetAllKeysForAdmin() {
     return master_service_.GetAllKeys(TenantId::Default());
 }
 
+tl::expected<MasterService::KvSnapshotPage, ErrorCode>
+WrappedMasterService::GetKvSnapshotPageForAdmin(const std::string& tenant_id,
+                                                size_t first_shard,
+                                                size_t max_objects,
+                                                bool with_keys) {
+    return master_service_.GetKvSnapshotPage(TenantId(tenant_id), first_shard,
+                                             max_objects, with_keys);
+}
+
 tl::expected<std::vector<std::string>, ErrorCode>
 WrappedMasterService::GetAllSegmentsForAdmin() {
     return master_service_.GetAllSegments();

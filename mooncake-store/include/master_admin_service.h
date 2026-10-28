@@ -106,6 +106,8 @@ class MasterAdminServer {
                               coro_http::coro_http_response& resp);
     void HandleKvEventsStatus(coro_http::coro_http_request& req,
                               coro_http::coro_http_response& resp);
+    void HandleKvEventsSnapshot(coro_http::coro_http_request& req,
+                                coro_http::coro_http_response& resp);
     void HandleGetTenantQuotas(coro_http::coro_http_request& req,
                                coro_http::coro_http_response& resp);
     void HandleUpsertTenantQuota(coro_http::coro_http_request& req,

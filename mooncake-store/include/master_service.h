@@ -361,6 +361,38 @@ class MasterService {
     bool KvEventsEnabled() const;
     KvEventPublisher::Stats GetKvEventStats() const;
 
+    // An object as a KV event subscriber knows it: the fields of its `stored`
+    // events.
+    struct KvSnapshotObject {
+        std::string object_key;
+        std::string group_id;
+        std::vector<std::string> media;
+    };
+    struct KvSnapshotPage {
+        // The KV event sequence when the page began; 0 without KV events.
+        uint64_t next_sequence{0};
+        // The shard the next page starts at; none after the last page.
+        std::optional<size_t> next_shard;
+        std::vector<KvSnapshotObject> objects;
+    };
+
+    /**
+     * @brief One page of a tenant's objects that hold a KV event medium, for a
+     * KV event subscriber to start from instead of an empty index.
+     *
+     * A page reads whole metadata shards from `first_shard` on, each under its
+     * own read lock, until it holds at least `max_objects` objects or reaches
+     * the last shard. Events of an object are enqueued under its shard lock in
+     * the order of its changes, so a subscriber that loads every page and then
+     * applies every event batch from the first page's `next_sequence` on ends
+     * at the master's state. Batches before it are already in the pages.
+     * Without `with_keys` object keys are left empty, for subscribers that
+     * match on group_id alone.
+     */
+    auto GetKvSnapshotPage(const TenantId& tenant_id, size_t first_shard,
+                           size_t max_objects, bool with_keys = true) const
+        -> tl::expected<KvSnapshotPage, ErrorCode>;
+
     /**
      * @brief Batch clear KV cache replicas for specified object keys.
      * @param object_keys Vector of object key strings to clear.

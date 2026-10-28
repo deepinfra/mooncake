@@ -219,6 +219,10 @@ class WrappedMasterService {
 
     tl::expected<std::vector<std::string>, ErrorCode> GetAllKeysForAdmin();
 
+    tl::expected<MasterService::KvSnapshotPage, ErrorCode>
+    GetKvSnapshotPageForAdmin(const std::string& tenant_id, size_t first_shard,
+                              size_t max_objects, bool with_keys = true);
+
     tl::expected<std::vector<std::string>, ErrorCode> GetAllSegmentsForAdmin();
 
     tl::expected<std::vector<MasterService::SegmentDetailInfo>, ErrorCode>
