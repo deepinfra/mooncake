@@ -10,6 +10,8 @@
 //   replica that offload pinned, which no plan names while pinned, so its
 //   memory goes through the inner reclaimer too. Another offload would pin a
 //   replica nothing unpins: an object tracks one offload at a time.
+// - An object the queue does not admit is not worth a disk write, so its
+//   memory goes through the inner reclaimer as well.
 // - Otherwise one memory replica the plan names is pinned and queued for
 //   offload, and the rest are released now: the data survives through the
 //   pinned one, which a later run frees once the copy lands.
@@ -28,11 +30,18 @@
 #include "types.h"
 
 namespace mooncake {
+
+struct ObjectMetadata;
+
 namespace eviction {
 
 // Where offloads are queued.
 class OffloadQueue {
    public:
+    // Whether the object is worth a disk write; asked once per object a run
+    // would offload.
+    virtual bool Admit(const ObjectMetadata& metadata) { return true; }
+
     // Queues `source`, a memory replica of the object `key` names, for a copy
     // to its host's local disk. True when it was queued, in which case the
     // destinations are appended to `mirror_clients`.

@@ -39,6 +39,7 @@
 // The owner keeps them in step with each write through the RouteObserver, so
 // they describe the key as of the last write guard released on it.
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cassert>
@@ -59,6 +60,7 @@
 #include <boost/intrusive/list.hpp>
 #include <glog/logging.h>
 
+#include "common/shrink_buckets.h"
 #include "common/transparent_string_hash.h"
 #include "metadata/group_index.h"
 #include "metadata/object_state.h"
@@ -252,6 +254,12 @@ inline void SlotHandle::reset() noexcept {
     std::unique_lock<std::shared_mutex> lock(stripe->lock);
     if (slot->state_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
         stripe->slots.erase(stripe->slots.find(slot->key()));
+        // erase() never gives bucket memory back, so a stripe that once held
+        // far more slots than it does now would keep its high-water buckets
+        // for good. Rehashing moves no node, so the slots guards point at stay
+        // put; only map iterators, which a cursor holds under the shared
+        // stripe lock, are invalidated.
+        ShrinkBucketsIfSparse(stripe->slots);
     }
 }
 
@@ -447,6 +455,10 @@ class ObjectRoute {
     // the cursor keeps `ref()` and goes through Write(ref).
     [[nodiscard]] Cursor<LockMode::kRead> ReadCursor() const;
     [[nodiscard]] Cursor<LockMode::kWrite> WriteCursor();
+    // A read cursor over the stripes [first_stripe, end_stripe) alone, for a
+    // walk done in parts. A key's stripe never changes.
+    [[nodiscard]] Cursor<LockMode::kRead> ReadCursor(size_t first_stripe,
+                                                     size_t end_stripe) const;
 
     // The member keys of one group, as a snapshot to resolve again: a key in
     // it may hold a different object by the time the caller reads it, or none.
@@ -630,7 +642,11 @@ class ObjectRoute::Cursor {
    private:
     friend class ObjectRoute;
 
-    explicit Cursor(const ObjectRoute& route) : route_(route) {
+    explicit Cursor(const ObjectRoute& route, size_t first_stripe = 0,
+                    size_t end_stripe = kStripeCount)
+        : route_(route),
+          stripe_(first_stripe),
+          end_stripe_(std::min(end_stripe, kStripeCount)) {
 #ifndef NDEBUG
         route_.live_cursors_.fetch_add(1, std::memory_order_relaxed);
 #endif
@@ -647,7 +663,7 @@ class ObjectRoute::Cursor {
     // the end. The position is always past the slot stood on, so this
     // resumes from it whichever phase the cursor is in.
     void Settle() NO_THREAD_SAFETY_ANALYSIS {
-        for (; stripe_ < kStripeCount; ++stripe_) {
+        for (; stripe_ < end_stripe_; ++stripe_) {
             Stripe& stripe = route_.stripes_[stripe_];
             if (!stripe_lock_.owns_lock()) {
                 AssertNotInCursor();
@@ -713,6 +729,7 @@ class ObjectRoute::Cursor {
 
     const ObjectRoute& route_;
     size_t stripe_ = 0;
+    const size_t end_stripe_;
     std::shared_lock<std::shared_mutex> stripe_lock_;
     // The next slot to try in the stripe held.
     typename SlotMap::iterator slot_it_;
@@ -832,6 +849,11 @@ inline ObjectRoute::Cursor<LockMode::kRead> ObjectRoute::ReadCursor() const {
 
 inline ObjectRoute::Cursor<LockMode::kWrite> ObjectRoute::WriteCursor() {
     return Cursor<LockMode::kWrite>(*this);
+}
+
+inline ObjectRoute::Cursor<LockMode::kRead> ObjectRoute::ReadCursor(
+    size_t first_stripe, size_t end_stripe) const {
+    return Cursor<LockMode::kRead>(*this, first_stripe, end_stripe);
 }
 
 inline void ObjectRoute::RebuildGroupState() {

@@ -110,6 +110,25 @@ Status Platform::unregisterHostMemory(void* addr, int device) {
     return Status::OK();
 }
 
+// Fallback for platforms without a pinned-host API: ordinary pageable
+// memory (see platform.h). Page alignment is required for O_DIRECT staging.
+Status Platform::allocatePinnedHost(void** pptr, size_t size) {
+    if (!pptr || size == 0)
+        return Status::InvalidArgument(
+            "Invalid pinned host allocation" LOC_MARK);
+    if (posix_memalign(pptr, 4096, size) != 0) {
+        *pptr = nullptr;
+        return Status::InternalError("posix_memalign failed" LOC_MARK);
+    }
+    return Status::OK();
+}
+
+Status Platform::freePinnedHost(void* ptr, size_t size) {
+    (void)size;
+    std::free(ptr);
+    return Status::OK();
+}
+
 std::vector<int> Platform::topologyDeviceIndices(const Topology* topology,
                                                  Topology::MemType mem_type) {
     std::vector<int> devices;

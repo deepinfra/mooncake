@@ -22,6 +22,9 @@ tl::expected<Effect, ErrorCode> OffloadingReclaimer::Apply(
     if (hold.state().offloading_task.has_value()) {
         return inner_.Apply(ns, hold, plan, so_far);
     }
+    if (!queue_.Admit(metadata)) {
+        return inner_.Apply(ns, hold, plan, so_far);
+    }
     if (options_.force_evict && static_cast<long>(so_far.Count(
                                     Outcome::kOffloadQueued)) >= options_.cap) {
         return WithoutOffload(ns, hold, plan, so_far, DropReason::kOffloadCap);

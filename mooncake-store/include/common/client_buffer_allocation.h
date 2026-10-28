@@ -83,6 +83,14 @@ void* allocate_buffer_shm_file(const std::string& dir, size_t total_size,
 void free_buffer_shm_file(void* ptr, size_t mapped_size,
                           const std::string& path);
 
+// The entries of `nodes` this process may allocate from, in order: its
+// cpuset's mems_allowed, narrowed to an MPOL_BIND task policy if it has one.
+// mbind() to a node outside the cpuset fails with EINVAL, and binding to one
+// outside the task policy overrides it, so a NUMA-segmented buffer must use
+// only these. Returns `nodes` unchanged if the kernel does not answer (a
+// seccomp profile that blocks get_mempolicy blocks mbind too).
+std::vector<int> FilterNumaNodesToAllowed(const std::vector<int>& nodes);
+
 void* allocate_buffer_numa_segments(size_t total_size,
                                     const std::vector<int>& numa_nodes,
                                     size_t page_size = 0);

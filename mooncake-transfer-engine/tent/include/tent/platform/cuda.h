@@ -134,6 +134,11 @@ class CudaPlatform : public Platform {
 
     Status unregisterHostMemory(void* addr, int device) override;
 
+    // cudaHostAlloc(cudaHostAllocPortable): pinned for every CUDA context.
+    Status allocatePinnedHost(void** pptr, size_t size) override;
+
+    Status freePinnedHost(void* ptr, size_t size) override;
+
     Status getStreamFromPool(CUDAStreamHandle& outHandle,
                              int deviceId = CUDAStreamPool::kCurrentDevice);
 
