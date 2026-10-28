@@ -10,6 +10,9 @@ using shared mem (`shm`), which
 
 when the transfer happens on the same host.
 
+How we merge upstream weekly, and where each of our patches lives:
+[UPSTREAM-MERGE.md](UPSTREAM-MERGE.md).
+
 ## How it works
 
 We aim to achieve SoTA KV cache hit rates on our nodes with no InfiniBand
@@ -114,7 +117,8 @@ upstream/main ──merge──▶ di-main ──merge──▶ di-<model>
   files upstream changes often (`real_client.cpp`, `client_service.cpp`,
   `transfer_engine_impl.cpp`).
 - Don't edit upstream's `README.md` or `docs/`. DeepInfra documentation lives
-  in this file.
+  in this file and [UPSTREAM-MERGE.md](UPSTREAM-MERGE.md), which covers the
+  weekly upstream merge and where each of our patches lives.
 - Anything useful beyond DeepInfra should go upstream
   ([CONTRIBUTING.md](../CONTRIBUTING.md)). Code that lands there is code we no
   longer carry.
