@@ -292,6 +292,24 @@ class KvSnapshotTest : public MasterServiceTest {
         return state;
     }
 
+    // Waits until the master publishes nothing more and `log` holds it all;
+    // returns the batches published.
+    static uint64_t WaitUntilQuiet(MasterService& service,
+                                   const EventLog& log) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        uint64_t published = 0;
+        while (std::chrono::steady_clock::now() < deadline) {
+            published = service.GetKvEventStats().published_batches;
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            if (published == service.GetKvEventStats().published_batches &&
+                log.Count() == published) {
+                break;
+            }
+        }
+        return published;
+    }
+
     static MasterServiceConfig EventsConfig(const std::string& endpoint) {
         MasterServiceConfig config = MasterServiceConfig::builder().build();
         config.enable_kv_events = true;
@@ -420,19 +438,8 @@ TEST_F(KvSnapshotTest, EventsFromTheFirstPageSequenceBringPagesUpToDate) {
             writer.join();
         }
 
-        // Background eviction goes on after the writers stop: wait until the
-        // master is quiet and everything it published has arrived.
-        const auto deadline =
-            std::chrono::steady_clock::now() + std::chrono::seconds(30);
-        uint64_t published = 0;
-        while (std::chrono::steady_clock::now() < deadline) {
-            published = service.GetKvEventStats().published_batches;
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            if (published == service.GetKvEventStats().published_batches &&
-                log.Count() == published) {
-                break;
-            }
-        }
+        // Background eviction goes on after the writers stop.
+        const uint64_t published = WaitUntilQuiet(service, log);
         const auto truth = Truth(service, pool);
         const auto stats = service.GetKvEventStats();
         const auto batches = log.Batches();
@@ -488,6 +495,38 @@ TEST_F(KvSnapshotTest, EventsFromTheFirstPageSequenceBringPagesUpToDate) {
     }
     // Not a property of the code under test; shows this test can fail.
     EXPECT_GT(late_fence_misses, 0u);
+}
+
+// Unmounting a segment drops its replicas without a write to them: the sweep
+// that erases them must retract them, or subscribers keep them for good.
+TEST_F(KvSnapshotTest, UnmountedSegmentsObjectsAreRetracted) {
+    const auto endpoint = MakeIpcEndpoint();
+    MasterService service(EventsConfig(endpoint));
+    const auto gone = PrepareSimpleSegment(service, "gone_segment");
+    PrepareSimpleSegment(service, "kept_segment",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+    EventLog log(endpoint);
+    std::vector<std::string> pool;
+    for (int i = 0; i < 200; ++i) {
+        const std::string key = "unmount_" + std::to_string(i);
+        ReplicateConfig config = GroupConfig(key);
+        config.preferred_segment = i % 2 ? "gone_segment" : "kept_segment";
+        PutCompletedObject(service, gone.client_id, key, config);
+        pool.push_back(key);
+    }
+    ASSERT_EQ(Truth(service, pool).size(), 200u);
+    ASSERT_TRUE(
+        service.UnmountSegment(gone.segment_id, gone.client_id).has_value());
+
+    WaitUntilQuiet(service, log);
+    const auto truth = Truth(service, pool);
+    EXPECT_EQ(truth.size(), 100u);
+    ObjectMedia replayed;
+    for (const auto& batch : log.Batches()) {
+        Apply(replayed, batch);
+    }
+    EXPECT_EQ(Differences(replayed, truth), 0u);
+    EXPECT_EQ(Differences(StateOf(ReadSnapshot(service, 64)), truth), 0u);
 }
 
 // The HTTP view of the same pages.

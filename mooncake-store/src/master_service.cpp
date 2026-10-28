@@ -7740,7 +7740,15 @@ bool MasterService::CleanupStaleHandles(
     const std::function<bool(const Replica&)>& is_stale,
     MetadataShardAccessorRW* shard) {
     auto& metadata = record.metadata;
-    const auto previous_kv_media = KvMediaSnapshot(metadata);
+    auto previous_kv_media = KvMediaSnapshot(metadata);
+    // A memory replica stopped counting when its segment was unmounted, which
+    // published nothing: retract its medium now that it is erased.
+    if (KvEventsEnabled()) {
+        metadata.VisitReplicas(is_stale, [&](const Replica& replica) {
+            previous_kv_media.emplace_back(
+                replica.is_memory_replica() ? "cpu" : "disk");
+        });
+    }
     bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
         return r.is_local_disk_replica() && r.is_completed();
     });
