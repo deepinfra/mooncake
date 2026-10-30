@@ -39,6 +39,31 @@ patches below. Our `main` mirrors upstream. Upstream is merged into `di-main` we
 
 ## Log
 
+### 2026-10-30: upstream `6c83ea2b`
+
+There were 17 upstream commits since the base `811c97f0`. Nothing conflicted, and none of them makes one of our patches
+obsolete.
+
+- **#5032 (`390290f0`) removed dead and test-only code from `MasterService`**: the `BatchReplicaClear` overload pair,
+  `SubmitReplicaActionProposal`, `MetadataAccessorRW`'s `cleanup_invalid` flag, and the segment-op retry queue
+  (`PersistSegmentOpForHAOrEnqueue` is now `PersistSegmentOpForHA`, without retry). It is the only commit that touches
+  our files. None of our patches uses what it removed, and the functions it changed hold none of our code.
+  `UnmountSegment` changed only in its HA oplog call; our retraction stays in `CleanupStaleHandles`.
+- Closest in topic, but not overlapping:
+  - **#4885 (`c5d355a2`)** lets the Conductor index vLLM CPU events as `cpu_local`, with the store's `cpu_share`
+    taking precedence. We do not run the Conductor; our KV events and snapshot serve the Dynamo FE.
+  - **#5068 (`5e50b615`)** waits for in-flight io_uring reads before TENT frees a sub-batch. That is TENT's io_uring
+    transport, not the store's SSD tier (`MOONCAKE_OFFLOAD_USE_URING`) or our SHM transport.
+- The rest are RDMA (TENT selective signaling #4632, classic congestion control #5064, no-atomics QPs #5047), hp_tcp,
+  EFA, EP, PG, CI and docs.
+
+Tests (fresh tree in `mc-build-mert`, the flags above):
+- Passing: `kv_snapshot_test` 6/6, `kv_event_publisher_test` 16/16, `offload_on_evict_test` 5/5, `evictor_test` 26/26,
+  `master_service_evict_scenario_test` 23/23, `object_route_test` 37/37, `eviction_index_test` 13/13.
+- `master_admin_server_test` 64/65: the same `DfsShardCountExpandsAndValidatesRequests` failure as before.
+- `high_availability_test` does not compile in this container (`StringFlagDestructor`, a gflags macro); neither
+  upstream nor our patches touched it this round.
+
 ### 2026-10-28: upstream `811c97f0`
 
 There were 65 upstream commits since the base `12a7e9f1`. Ten files conflicted, in 14 hunks.
