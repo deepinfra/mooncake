@@ -8,11 +8,14 @@
 
 #include <glog/logging.h>
 
+#include "ha/common/sqlite/sqlite_ha_store.h"
 #include "ha/kv/etcd_ha_kv_backend.h"
+#include "ha/kv/ha_kv_backend_factory.h"
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_coordinator.h"
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
 #include "ha/snapshot/batch_oplog/metadata.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
+#include "ha/snapshot/snapshot_maintenance_lease.h"
 #include "hot_standby_service.h"
 
 namespace mooncake {
@@ -121,14 +124,35 @@ class CapabilityDrivenStandbyController final : public StandbyController {
           start_error_injector_(std::move(start_error_injector)) {
         if (config_.enable_oplog_snapshot) {
             try {
-                if (spec_.type != HABackendType::ETCD ||
+                if ((spec_.type != HABackendType::ETCD &&
+                     spec_.type != HABackendType::SQLITE) ||
                     !capabilities_.has_oplog_following ||
                     config_.snapshot_chunk_object_count == 0) {
                     throw std::invalid_argument(
-                        "batch snapshot requires etcd OpLog and positive chunk "
-                        "count");
+                        "batch snapshot requires etcd or sqlite OpLog and "
+                        "positive chunk count");
                 }
-                batch_backend_ = std::make_unique<EtcdHaKvBackend>();
+                BatchOpLogSnapshotCoordinator::LeaseFactory lease_factory;
+                if (spec_.type == HABackendType::SQLITE) {
+                    auto backend = CreateHaKvBackend(spec_);
+                    auto lease_store =
+                        sqlite::SqliteHaStore::Open(spec_.connstring);
+                    if (!backend || !lease_store) {
+                        throw std::invalid_argument(
+                            "cannot open the sqlite HA store " +
+                            spec_.connstring);
+                    }
+                    batch_backend_ = std::move(backend.value());
+                    std::shared_ptr<sqlite::SqliteHaStore> shared_store =
+                        std::move(lease_store.value());
+                    lease_factory = [cluster_id = config_.cluster_id,
+                                     shared_store] {
+                        return std::make_unique<SnapshotMaintenanceLease>(
+                            cluster_id, shared_store);
+                    };
+                } else {
+                    batch_backend_ = std::make_shared<EtcdHaKvBackend>();
+                }
                 auto type = ParseSnapshotObjectStoreType(
                     config_.snapshot_object_store_type);
                 snapshot_object_store_ = SnapshotObjectStore::Create(type);
@@ -153,7 +177,8 @@ class CapabilityDrivenStandbyController final : public StandbyController {
                                 config_.snapshot_chunk_object_count,
                             .snapshot_root = snapshot_root,
                             .clock = {},
-                        });
+                        },
+                        std::move(lease_factory));
             } catch (const std::exception& e) {
                 throw std::runtime_error(
                     std::string("Failed to initialize batch OpLog snapshot: ") +
@@ -445,7 +470,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
     MasterServiceSupervisorConfig config_;
     StandbyRuntimeCapabilities capabilities_;
     std::unique_ptr<HotStandbyService> standby_service_;
-    std::unique_ptr<HaKvBackend> batch_backend_;
+    std::shared_ptr<HaKvBackend> batch_backend_;
     std::unique_ptr<SnapshotObjectStore> snapshot_object_store_;
     std::unique_ptr<BatchOpLogSnapshotCoordinator>
         batch_oplog_snapshot_coordinator_;
