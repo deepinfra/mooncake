@@ -1,5 +1,6 @@
 #include "ha/snapshot/snapshot_maintenance_lease.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -118,7 +119,11 @@ ErrorCode SnapshotMaintenanceLease::Acquire() {
 }
 
 ErrorCode SnapshotMaintenanceLease::AcquireSqlite() {
-    const std::string owner = UuidToString(generate_uuid());
+    // Snapshot ids embed the owner token as a positive int64 (an etcd lease
+    // id), so the token is one too.
+    const EtcdLeaseId lease_id = std::max<EtcdLeaseId>(
+        1, static_cast<EtcdLeaseId>(generate_uuid().first >> 1));
+    const std::string owner = std::to_string(lease_id);
     const auto started = std::chrono::steady_clock::now();
     EtcdRevisionId create_revision = 0;
     ErrorCode err = sqlite_store_->CreateLeasedKey(lock_key_, owner, kSqliteTtl,
@@ -155,7 +160,7 @@ ErrorCode SnapshotMaintenanceLease::AcquireSqlite() {
             }
         });
     std::lock_guard<std::mutex> lock(mutex_);
-    lease_id_ = create_revision;
+    lease_id_ = lease_id;
     lock_create_revision_ = create_revision;
     owner_token_ = owner;
     lock_created_ = true;
