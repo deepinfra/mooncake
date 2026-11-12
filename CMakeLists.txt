@@ -86,6 +86,11 @@ option(STORE_USE_REDIS "build mooncake store with redis" OFF)
 if(STORE_USE_REDIS)
   add_compile_definitions(STORE_USE_REDIS)
 endif()
+option(STORE_USE_SQLITE "build mooncake store with the SQLite HA backend" OFF)
+if(STORE_USE_SQLITE)
+  find_package(SQLite3 REQUIRED)
+  add_compile_definitions(STORE_USE_SQLITE)
+endif()
 option(ENABLE_KV_EVENTS
        "Build master KV events ZMQ publisher (requires libzmq when ON)" OFF)
 option(STORE_USE_K8S_LEASE

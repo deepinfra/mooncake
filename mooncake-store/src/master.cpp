@@ -1535,7 +1535,8 @@ int main(int argc, char* argv[]) {
     }
     if (master_config.enable_oplog &&
         !mooncake::ha::HaBackendSupportsOpLog(master_config.ha_backend_type)) {
-        LOG(FATAL) << "enable_oplog requires ha_backend_type=etcd or redis";
+        LOG(FATAL)
+            << "enable_oplog requires ha_backend_type=etcd, redis or sqlite";
         return 1;
     }
     if (auto error = ValidateBatchOpLogSnapshotConfig(master_config)) {

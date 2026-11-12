@@ -69,6 +69,9 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     shutdown_request.cpp
     ha/kv/etcd_ha_kv_backend.cpp
     ha/kv/redis_ha_kv_backend.cpp
+    ha/kv/sqlite_ha_kv_backend.cpp
+    ha/common/sqlite/sqlite_ha_store.cpp
+    ha/leadership/backends/sqlite/sqlite_leader_coordinator.cpp
     ha/kv/ha_kv_backend_factory.cpp
     ha/standby_controller.cpp
     ha/standby_metadata_store.cpp
@@ -585,6 +588,9 @@ endif()
 if(STORE_USE_REDIS)
   target_link_libraries(mooncake_store_master_objects PRIVATE Mooncake::hiredis)
 endif()
+if(STORE_USE_SQLITE)
+  target_link_libraries(mooncake_store_master_objects PRIVATE SQLite::SQLite3)
+endif()
 if(STORE_USE_ETCD)
   add_dependencies(mooncake_store_master_objects build_etcd_wrapper)
 endif()
@@ -684,6 +690,9 @@ endif()
 if(STORE_USE_REDIS)
   target_link_libraries(mooncake_store_master PRIVATE Mooncake::hiredis)
 endif()
+if(STORE_USE_SQLITE)
+  target_link_libraries(mooncake_store_master PRIVATE SQLite::SQLite3)
+endif()
 if(USE_UB)
   target_link_libraries(mooncake_store_master PRIVATE ub_allocator)
 endif()
@@ -726,6 +735,9 @@ if(KV_EVENTS_ZMQ_FOUND)
 endif()
 if(STORE_USE_REDIS)
   target_link_libraries(mooncake_store PRIVATE Mooncake::hiredis)
+endif()
+if(STORE_USE_SQLITE)
+  target_link_libraries(mooncake_store PRIVATE SQLite::SQLite3)
 endif()
 if(TARGET Mooncake::liburing)
   target_compile_definitions(mooncake_store PUBLIC USE_URING)

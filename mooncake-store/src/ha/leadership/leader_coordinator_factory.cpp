@@ -2,6 +2,7 @@
 
 #include "ha/leadership/backends/etcd/etcd_leader_coordinator.h"
 #include "ha/leadership/backends/redis/redis_leader_coordinator.h"
+#include "ha/leadership/backends/sqlite/sqlite_leader_coordinator.h"
 #ifdef STORE_USE_K8S_LEASE
 #include "ha/leadership/backends/k8s/k8s_leader_coordinator.h"
 #endif
@@ -26,6 +27,16 @@ CreateLeaderCoordinator(const HABackendSpec& spec) {
         case HABackendType::REDIS: {
             auto coordinator =
                 std::make_unique<backends::redis::RedisLeaderCoordinator>(spec);
+            auto err = coordinator->Connect();
+            if (err != ErrorCode::OK) {
+                return tl::make_unexpected(err);
+            }
+            return std::unique_ptr<LeaderCoordinator>(std::move(coordinator));
+        }
+        case HABackendType::SQLITE: {
+            auto coordinator =
+                std::make_unique<backends::sqlite::SqliteLeaderCoordinator>(
+                    spec);
             auto err = coordinator->Connect();
             if (err != ErrorCode::OK) {
                 return tl::make_unexpected(err);

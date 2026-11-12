@@ -8,11 +8,19 @@
 
 namespace mooncake {
 
+namespace ha::sqlite {
+class SqliteHaStore;
+}
+
 class SnapshotMaintenanceLease {
    public:
     static constexpr int64_t kTtlSeconds = 30;
 
     explicit SnapshotMaintenanceLease(std::string cluster_id);
+    // Holds the lock as a leased key in the SQLite HA store instead of an
+    // etcd session.
+    SnapshotMaintenanceLease(std::string cluster_id,
+                             std::shared_ptr<ha::sqlite::SqliteHaStore> store);
     ~SnapshotMaintenanceLease();
 
     SnapshotMaintenanceLease(const SnapshotMaintenanceLease&) = delete;
@@ -34,8 +42,11 @@ class SnapshotMaintenanceLease {
         EtcdRevisionId lock_create_revision = 1);
 
    private:
+    struct SqliteKeepalive;
+
     SnapshotMaintenanceLease(std::string cluster_id, std::string owner_token,
                              bool testing, EtcdRevisionId create_revision);
+    ErrorCode AcquireSqlite();
 
     std::string cluster_id_;
     std::string lock_key_;
@@ -46,6 +57,8 @@ class SnapshotMaintenanceLease {
     mutable std::mutex mutex_;
     bool testing_{false};
     bool lock_created_{false};
+    std::shared_ptr<ha::sqlite::SqliteHaStore> sqlite_store_;
+    std::shared_ptr<SqliteKeepalive> sqlite_keepalive_;
 };
 
 }  // namespace mooncake

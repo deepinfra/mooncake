@@ -17,8 +17,10 @@ inline std::optional<std::string> ValidateBatchOpLogSnapshotConfig(
     if (!config.enable_oplog) {
         return "enable_oplog_snapshot requires enable_oplog=true";
     }
-    if (!config.enable_ha || config.ha_backend_type != "etcd") {
-        return "enable_oplog_snapshot requires HA with ha_backend_type=etcd";
+    if (!config.enable_ha || (config.ha_backend_type != "etcd" &&
+                              config.ha_backend_type != "sqlite")) {
+        return "enable_oplog_snapshot requires HA with ha_backend_type=etcd "
+               "or sqlite";
     }
     if (config.snapshot_chunk_object_count == 0) {
         return "snapshot_chunk_object_count must be greater than 0";

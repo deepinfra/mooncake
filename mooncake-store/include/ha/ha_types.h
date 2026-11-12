@@ -22,6 +22,7 @@ enum class HABackendType {
     ETCD = 1,
     REDIS = 2,
     K8S = 3,
+    SQLITE = 4,
 };
 
 inline std::string HABackendTypeToString(HABackendType type) {
@@ -34,6 +35,8 @@ inline std::string HABackendTypeToString(HABackendType type) {
             return "redis";
         case HABackendType::K8S:
             return "k8s";
+        case HABackendType::SQLITE:
+            return "sqlite";
     }
     return "unknown";
 }
@@ -42,6 +45,7 @@ inline bool HaBackendSupportsOpLog(HABackendType type) {
     switch (type) {
         case HABackendType::ETCD:
         case HABackendType::REDIS:
+        case HABackendType::SQLITE:
             return true;
         case HABackendType::UNKNOWN:
         case HABackendType::K8S:
@@ -59,6 +63,9 @@ inline std::optional<HABackendType> ParseHABackendType(std::string_view type) {
     }
     if (type == "k8s") {
         return HABackendType::K8S;
+    }
+    if (type == "sqlite") {
+        return HABackendType::SQLITE;
     }
     return std::nullopt;
 }
@@ -86,6 +93,12 @@ inline ErrorCode ValidateHABackendAvailability(HABackendType type) {
 #endif
         case HABackendType::K8S:
 #ifdef STORE_USE_K8S_LEASE
+            return ErrorCode::OK;
+#else
+            return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+#endif
+        case HABackendType::SQLITE:
+#ifdef STORE_USE_SQLITE
             return ErrorCode::OK;
 #else
             return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;

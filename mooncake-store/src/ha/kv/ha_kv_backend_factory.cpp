@@ -3,6 +3,7 @@
 #include "etcd_helper.h"
 #include "ha/kv/etcd_ha_kv_backend.h"
 #include "ha/kv/redis_ha_kv_backend.h"
+#include "ha/kv/sqlite_ha_kv_backend.h"
 
 namespace mooncake {
 
@@ -38,6 +39,16 @@ tl::expected<std::shared_ptr<HaKvBackend>, ErrorCode> CreateHaKvBackend(
 #else
             return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
 #endif
+        }
+        case ha::HABackendType::SQLITE: {
+            if (spec.connstring.empty()) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            auto backend = SqliteHaKvBackend::Open(spec.connstring);
+            if (!backend) {
+                return tl::make_unexpected(backend.error());
+            }
+            return std::shared_ptr<HaKvBackend>(std::move(backend.value()));
         }
         case ha::HABackendType::UNKNOWN:
         case ha::HABackendType::K8S:
