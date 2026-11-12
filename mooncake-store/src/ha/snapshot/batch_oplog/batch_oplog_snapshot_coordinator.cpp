@@ -466,6 +466,7 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
         capture_active_ = false;
     }
     if (!descriptor) {
+        LOG(WARNING) << "Batch snapshot write failed: " << descriptor.error();
         lease_observer.reset();
         FinishAttempt(ErrorCode::INTERNAL_ERROR, true);
         return ErrorCode::INTERNAL_ERROR;

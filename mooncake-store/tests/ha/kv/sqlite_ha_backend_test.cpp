@@ -18,6 +18,7 @@
 #include "ha/oplog/oplog_batch_storage.h"
 #include "ha/oplog/oplog_batch_types.h"
 #include "ha/oplog/oplog_types.h"
+#include "ha/snapshot/batch_oplog/metadata.h"
 #include "ha/snapshot/snapshot_maintenance_lease.h"
 #include "metadata_store.h"
 
@@ -302,8 +303,12 @@ TEST_F(SqliteHaTest, MaintenanceLeaseIsExclusive) {
     SnapshotMaintenanceLease second(kCluster, store);
     ASSERT_EQ(ErrorCode::OK, first.Acquire());
     EXPECT_TRUE(first.IsHeld());
-    EXPECT_FALSE(first.owner_token().empty());
     EXPECT_GT(first.lock_create_revision(), 0);
+    EXPECT_EQ(std::to_string(first.lease_id()), first.owner_token());
+    // A snapshot id is "<batch>-<owner token>" and must parse back.
+    EXPECT_FALSE(ha::BuildBatchOpLogSnapshotArtifactPrefix(
+                     "root", "7-" + first.owner_token())
+                     .empty());
     EXPECT_EQ(ErrorCode::ETCD_TRANSACTION_FAIL, second.Acquire());
     EXPECT_FALSE(second.IsHeld());
 
