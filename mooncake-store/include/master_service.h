@@ -2391,6 +2391,20 @@ class MasterService {
 
     ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
 
+    // A restored endpoint is the old process's memory only until someone else
+    // takes it. A client that outlived the restart remounts; a fresh mount of
+    // that endpoint is a new process whose memory the restored replicas must
+    // never be bound to. Neither within the grace: the owner died while no
+    // master ran. Either way the restored replicas are dropped (their keepalive
+    // goes, ClearInvalidHandles sweeps them through the OpLog).
+    static constexpr std::chrono::minutes kStandbyRemountGrace{5};
+    std::chrono::steady_clock::time_point standby_restored_at_{};
+    void DropStandbySegmentsLocked(
+        const std::function<bool(const StandbySegmentInfo&)>& matches,
+        std::string_view reason);
+    void DropStandbySegmentsTakenBy(const Segment& segment);
+    void DropUnremountedStandbySegments();
+
     // True while the replica sits on an endpoint in
     // invalid_replica_endpoints_. The read path asks only this, never the set.
     bool IsAwaitingRemount(const Replica& replica) const;
