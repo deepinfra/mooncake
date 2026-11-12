@@ -935,6 +935,7 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     ErrorCode mount_result = ErrorCode::INTERNAL_ERROR;
     {
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+        DropStandbySegmentsTakenBy(segment);
         auto [record_it, inserted] = client_liveness_records_.try_emplace(
             client_id, std::make_shared<ClientLivenessRecord>(
                            ClientLivenessRecord::Clock::now()));
@@ -4112,6 +4113,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     standby_memory_segments_ = std::move(restored_memory_segments);
     standby_allocator_keepalive_ = std::move(restored_allocators);
     invalid_replica_endpoints_ = std::move(restored_invalid_endpoints);
+    standby_restored_at_ = std::chrono::steady_clock::now();
     for (auto& [client_id, record] : new_known_owner_records) {
         // Copy, not move: rollback_restored_state() still needs a valid
         // record (state() for the removal metric) when a later durable
@@ -4522,6 +4524,64 @@ auto MasterService::BatchReplicaClear(
     }
 
     return cleared_keys;
+}
+
+void MasterService::DropStandbySegmentsLocked(
+    const std::function<bool(const StandbySegmentInfo&)>& matches,
+    std::string_view reason) {
+    std::erase_if(
+        standby_memory_segments_, [&](const StandbySegmentInfo& standby) {
+            const bool awaiting =
+                invalid_replica_endpoints_.contains(
+                    standby.transport_endpoint) ||
+                invalid_replica_endpoints_.contains(standby.segment_name);
+            if (!awaiting || !matches(standby)) {
+                return false;
+            }
+            LOG(WARNING) << "segment_name=" << standby.segment_name
+                         << ", endpoint=" << standby.transport_endpoint
+                         << ", action=drop_restored_segment, reason=" << reason;
+            invalid_replica_endpoints_.erase(standby.transport_endpoint);
+            invalid_replica_endpoints_.erase(standby.segment_name);
+            standby_allocator_keepalive_.erase(standby.transport_endpoint);
+            standby_allocator_keepalive_.erase(standby.segment_name);
+            if (auto accounted =
+                    standby_accounted_memory_bytes_.find(standby.segment_name);
+                accounted != standby_accounted_memory_bytes_.end()) {
+                MasterMetricManager::instance().dec_allocated_mem_size(
+                    standby.segment_name,
+                    static_cast<int64_t>(accounted->second));
+                standby_accounted_memory_bytes_.erase(accounted);
+            }
+            return true;
+        });
+}
+
+void MasterService::DropStandbySegmentsTakenBy(const Segment& segment) {
+    std::unique_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
+    if (invalid_replica_endpoints_.empty()) {
+        return;
+    }
+    DropStandbySegmentsLocked(
+        [&segment](const StandbySegmentInfo& standby) {
+            return standby.transport_endpoint == segment.te_endpoint ||
+                   standby.segment_name == segment.name;
+        },
+        "endpoint_mounted_by_a_new_client");
+}
+
+void MasterService::DropUnremountedStandbySegments() {
+    {
+        std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
+        if (invalid_replica_endpoints_.empty() ||
+            std::chrono::steady_clock::now() - standby_restored_at_ <
+                kStandbyRemountGrace) {
+            return;
+        }
+    }
+    std::unique_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
+    DropStandbySegmentsLocked([](const StandbySegmentInfo&) { return true; },
+                              "no_remount_within_grace");
 }
 
 bool MasterService::IsAwaitingRemount(const Replica& replica) const {
@@ -10020,6 +10080,7 @@ void MasterService::ClientMonitorFunc() {
             continue;
         }
 
+        DropUnremountedStandbySegments();
         const auto now = ClientLivenessRecord::Clock::now();
         std::vector<std::pair<UUID, std::shared_ptr<ClientLivenessRecord>>>
             clients;
