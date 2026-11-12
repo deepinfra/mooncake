@@ -312,6 +312,10 @@ class KvSnapshotTest : public MasterServiceTest {
 
     static MasterServiceConfig EventsConfig(const std::string& endpoint) {
         MasterServiceConfig config = MasterServiceConfig::builder().build();
+        // A put of a held key renews its read lease (#5066), and a leased
+        // object can be neither removed nor evicted, so churning writers
+        // would freeze the store. Leases are not under test here.
+        config.default_kv_lease_ttl = 0;
         config.enable_kv_events = true;
         config.kv_events_bind_endpoint = endpoint;
         config.kv_events_backend_id = "kv-snapshot-test";

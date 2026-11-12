@@ -157,9 +157,19 @@ Status CudaPlatform::allocate(void** pptr, size_t size,
 }
 
 Status CudaPlatform::free(void* ptr, size_t size) {
-    if (getCudaDeviceForPtr(ptr) >= 0) {
+    CudaPointerInfo info;
+    const CUresult result = getCudaPointerInfo(ptr, info);
+    // Only an initialization result of CUDA_ERROR_NO_DEVICE permits fallback.
+    if (!(result == CUDA_ERROR_NO_DEVICE &&
+          cudaDriverInitResult() == CUDA_ERROR_NO_DEVICE))
+        CHECK_CU(result);
+    if (info.isCuda()) {
         CHECK_CUDA(cudaFree(ptr));
     } else {
+        // CUDA host registration does not establish NUMA allocator ownership.
+        if (info.registered_host)
+            return Status::InvalidArgument(
+                "Cannot NUMA-free registered CUDA host memory");
         numa_free(ptr, size);
     }
     return Status::OK();
@@ -191,10 +201,11 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
     // may live on cuda:R; taking the stream from the buffer's device routes the
     // copy correctly without mutating the calling thread's current device.
     // Host-only copies keep the current device.
-    int device_id = getPointerDeviceId(dst);
-    if (device_id == CUDAStreamPool::kCurrentDevice) {
-        device_id = getPointerDeviceId(src);
-    }
+    int dst_device, src_device;
+    CHECK_STATUS(getPointerDeviceId(dst, dst_device));
+    CHECK_STATUS(getPointerDeviceId(src, src_device));
+    int device_id =
+        dst_device == CUDAStreamPool::kCurrentDevice ? src_device : dst_device;
     if (device_id == CUDAStreamPool::kCurrentDevice) {
         // Host-to-host: plain memcpy. The stream pool would create a primary
         // context on the thread's default device (GPU 0).
@@ -360,9 +371,10 @@ Status CudaPlatform::copyBatch(const std::vector<CopyOp>& ops) {
                 continue;
             }
         }
-        int device = getPointerDeviceId(op.dst);
+        int device;
+        CHECK_STATUS(getPointerDeviceId(op.dst, device));
         if (device == CUDAStreamPool::kCurrentDevice)
-            device = getPointerDeviceId(op.src);
+            CHECK_STATUS(getPointerDeviceId(op.src, device));
         if (device == CUDAStreamPool::kCurrentDevice) {
             ::memcpy(op.dst, op.src, op.length);
             continue;
@@ -550,7 +562,8 @@ Status CudaPlatform::kernelCopy(const std::vector<const CopyOp*>& group,
 Status CudaPlatform::registerHostMemory(void* addr, size_t length,
                                         void* device_hint, int& device_out) {
     device_out = -1;
-    const int device = getPointerDeviceId(device_hint);
+    int device;
+    CHECK_STATUS(getPointerDeviceId(device_hint, device));
     // Without a device on the other side there is nothing to make DMA-able,
     // and touching the runtime here would create a context on GPU 0.
     if (device == CUDAStreamPool::kCurrentDevice)
