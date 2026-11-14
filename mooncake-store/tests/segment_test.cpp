@@ -13,6 +13,8 @@
 #include <functional>
 #include <future>
 #include <mutex>
+#include <random>
+#include <set>
 #include <semaphore>
 #include <string>
 #include <thread>
@@ -89,6 +91,11 @@ class SegmentTest : public ::testing::Test {
     void TearDown() override {
         // Cleanup glog
         google::ShutdownGoogleLogging();
+    }
+
+    static std::vector<std::string> LiveAllocatorNames(
+        const SegmentManager& segment_manager) {
+        return segment_manager.allocator_manager_.getNames();
     }
 
     void ValidateMountedSegments(const SegmentManager& segment_manager,
@@ -1544,6 +1551,389 @@ TEST_F(SegmentTest, QuerySegments) {
         ErrorCode::SEGMENT_NOT_FOUND);
     ASSERT_EQ(used, 0);
     ASSERT_EQ(capacity, 0);
+}
+
+namespace {
+
+struct PlacementFixtureSegment {
+    Segment segment;
+    UUID client_id;
+    bool mounted = false;
+    bool draining = false;
+};
+
+Segment MakePlacementSegment(size_t index, const std::string& host_id,
+                             size_t size) {
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "seg_" + std::to_string(index);
+    segment.size = size;
+    segment.base = 0x100000000ULL * (index + 1);
+    segment.host_id = host_id;
+    return segment;
+}
+
+std::vector<std::string> ReplicaSegments(
+    const std::vector<Replica>& replicas) {
+    std::vector<std::string> names;
+    for (const auto& replica : replicas) {
+        const auto segment_names = replica.get_segment_names();
+        names.push_back(segment_names.empty() || !segment_names[0]
+                            ? std::string()
+                            : *segment_names[0]);
+    }
+    return names;
+}
+
+}  // namespace
+
+TEST_F(SegmentTest, PlacementViewIsReusedUntilTopologyChanges) {
+    SegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    const UUID client_id = generate_uuid();
+    const Segment segment0 = MakePlacementSegment(0, "host0", 16 << 20);
+    const Segment segment1 = MakePlacementSegment(1, "host1", 16 << 20);
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(
+            segment_access.MountSegment(segment0, SessionFor(client_id)),
+            ErrorCode::OK);
+    }
+
+    std::shared_ptr<const PlacementView> first;
+    std::shared_ptr<const PlacementView> again;
+    {
+        auto allocator_access = segment_manager.getAllocatorAccess();
+        first = allocator_access.GetPlacementView();
+        again = allocator_access.GetPlacementView();
+    }
+    ASSERT_NE(first, nullptr);
+    EXPECT_EQ(first, again);
+    EXPECT_EQ(first->allocators().getNames().size(), 1u);
+
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(
+            segment_access.MountSegment(segment1, SessionFor(client_id)),
+            ErrorCode::OK);
+    }
+    std::shared_ptr<const PlacementView> after_mount;
+    {
+        auto allocator_access = segment_manager.getAllocatorAccess();
+        after_mount = allocator_access.GetPlacementView();
+    }
+    EXPECT_NE(after_mount, first);
+    EXPECT_EQ(after_mount->allocators().getNames().size(), 2u);
+    EXPECT_EQ(after_mount->HostCount(), 2u);
+    // The old view stays usable for the request that holds it.
+    EXPECT_EQ(first->allocators().getNames().size(), 1u);
+
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(segment_access.SetSegmentStatusByName(
+                      segment1.name, SegmentStatus::DRAINING),
+                  ErrorCode::OK);
+    }
+    {
+        auto allocator_access = segment_manager.getAllocatorAccess();
+        auto view = allocator_access.GetPlacementView();
+        EXPECT_NE(view, after_mount);
+        EXPECT_EQ(view->allocators().getNames().size(), 1u);
+    }
+}
+
+TEST_F(SegmentTest, PlacementViewMatchesLiveIndexAcrossTopologyChanges) {
+    SegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    std::mt19937_64 rng(20261114);
+    const std::vector<std::string> hosts = {"host_a", "host_b", "host_c",
+                                            "host_d", "host_e"};
+    // Writers that are not a mounted host exercise the lower_bound and
+    // wrap-around starts.
+    const std::vector<std::string> writers = {
+        "host_a", "host_c", "host_e", "host_0", "host_bb", "zz", ""};
+    std::vector<PlacementFixtureSegment> segments;
+
+    auto check = [&](const std::string& context) {
+        for (const auto& writer : writers) {
+            for (int k = 0; k < 4; ++k) {
+                const std::string key = "key_" + std::to_string(rng());
+                std::vector<std::string> expected;
+                {
+                    auto segment_access = segment_manager.getSegmentAccess();
+                    expected =
+                        segment_access.GetHostOrderedSegments(writer, key);
+                }
+                std::vector<std::string> actual;
+                {
+                    auto allocator_access =
+                        segment_manager.getAllocatorAccess();
+                    actual =
+                        allocator_access.GetHostOrderedSegments(writer, key);
+                }
+                ASSERT_EQ(actual, expected)
+                    << context << " writer=" << writer << " key=" << key;
+            }
+        }
+        std::vector<std::string> live = LiveAllocatorNames(segment_manager);
+        std::vector<std::string> cached;
+        {
+            auto allocator_access = segment_manager.getAllocatorAccess();
+            cached = allocator_access.GetPlacementView()
+                         ->allocators()
+                         .getNames();
+        }
+        std::sort(live.begin(), live.end());
+        std::sort(cached.begin(), cached.end());
+        ASSERT_EQ(cached, live) << context;
+    };
+
+    for (int step = 0; step < 300; ++step) {
+        const int op = static_cast<int>(rng() % 4);
+        std::string context = "step " + std::to_string(step);
+        if (op == 0 || segments.size() < 3) {
+            PlacementFixtureSegment entry;
+            entry.segment = MakePlacementSegment(
+                segments.size(), hosts[rng() % hosts.size()], 1 << 20);
+            entry.client_id = generate_uuid();
+            auto segment_access = segment_manager.getSegmentAccess();
+            ASSERT_EQ(segment_access.MountSegment(
+                          entry.segment, SessionFor(entry.client_id)),
+                      ErrorCode::OK);
+            entry.mounted = true;
+            segments.push_back(entry);
+            context += " mount";
+        } else {
+            auto& entry = segments[rng() % segments.size()];
+            if (!entry.mounted) {
+                continue;
+            }
+            auto segment_access = segment_manager.getSegmentAccess();
+            if (op == 1) {
+                size_t metrics_dec_capacity = 0;
+                ASSERT_EQ(segment_access.PrepareUnmountSegment(
+                              entry.segment.id, metrics_dec_capacity),
+                          ErrorCode::OK);
+                ASSERT_EQ(segment_access.CommitUnmountSegment(
+                              entry.segment.id, entry.client_id,
+                              metrics_dec_capacity),
+                          ErrorCode::OK);
+                entry.mounted = false;
+                context += " unmount";
+            } else {
+                entry.draining = !entry.draining;
+                ASSERT_EQ(segment_access.SetSegmentStatusByName(
+                              entry.segment.name,
+                              entry.draining ? SegmentStatus::DRAINING
+                                             : SegmentStatus::OK),
+                          ErrorCode::OK);
+                context += entry.draining ? " drain" : " undrain";
+            }
+        }
+        check(context);
+    }
+}
+
+TEST_F(SegmentTest, HostOrderedAllocationMatchesPreferredListAllocation) {
+    SegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    std::mt19937_64 rng(1114);
+    const std::vector<std::string> hosts = {"h1", "h2", "h3", "h4"};
+    constexpr size_t kSegmentSize = 8 << 20;
+    constexpr size_t kValue = 1 << 20;
+    std::vector<Segment> segments;
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        for (size_t i = 0; i < 14; ++i) {
+            segments.push_back(MakePlacementSegment(
+                i, hosts[i % hosts.size()], kSegmentSize));
+            ASSERT_EQ(segment_access.MountSegment(
+                          segments.back(), SessionFor(generate_uuid())),
+                      ErrorCode::OK);
+        }
+    }
+
+    RandomAllocationStrategy strategy;
+    ASSERT_TRUE(strategy.TriesPreferredSegmentsInOrder());
+    std::shared_ptr<const PlacementView> view;
+    {
+        auto allocator_access = segment_manager.getAllocatorAccess();
+        view = allocator_access.GetPlacementView();
+    }
+
+    // Fill several segments, some completely, so placement has to skip them.
+    std::vector<Replica> filler;
+    for (size_t i = 0; i < segments.size(); i += 2) {
+        const size_t blocks = i % 4 == 0 ? kSegmentSize / kValue : 3;
+        for (size_t b = 0; b < blocks; ++b) {
+            auto replica = strategy.AllocateFrom(view->allocators(), kValue,
+                                                 segments[i].name);
+            if (replica) {
+                filler.push_back(std::move(*replica));
+            }
+        }
+    }
+
+    const std::vector<std::string> writers = {"h1", "h3", "h0", "h9", ""};
+    for (int trial = 0; trial < 400; ++trial) {
+        const std::string key = "k" + std::to_string(rng());
+        const std::string writer = writers[rng() % writers.size()];
+        const size_t replica_num = 1 + rng() % 3;
+        std::vector<std::string> preferred;
+        if (rng() % 3 == 0) {
+            preferred.push_back(segments[rng() % segments.size()].name);
+        }
+        if (rng() % 5 == 0) {
+            preferred.push_back("not_mounted");
+        }
+
+        std::vector<std::string> actual;
+        {
+            auto result = AllocateHostOrdered(strategy, *view, key, kValue,
+                                              replica_num, preferred, writer);
+            ASSERT_TRUE(result.has_value());
+            actual = ReplicaSegments(*result);
+        }
+
+        std::vector<std::string> full_preferred = preferred;
+        for (const auto& name : view->HostOrderedSegments(writer, key)) {
+            if (std::find(full_preferred.begin(), full_preferred.end(),
+                          name) == full_preferred.end()) {
+                full_preferred.push_back(name);
+            }
+        }
+        std::vector<std::string> expected;
+        {
+            auto result = strategy.Allocate(view->allocators(), kValue,
+                                            replica_num, full_preferred);
+            ASSERT_TRUE(result.has_value());
+            expected = ReplicaSegments(*result);
+        }
+        if (writer.empty()) {
+            // Without a writer host both may fall through to random
+            // placement; only the count is comparable.
+            EXPECT_EQ(actual.size(), expected.size());
+            continue;
+        }
+        ASSERT_EQ(actual, expected)
+            << "writer=" << writer << " key=" << key
+            << " replica_num=" << replica_num;
+    }
+}
+
+TEST_F(SegmentTest, HostOrderedAllocationFailsWhenNothingFits) {
+    SegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    const Segment segment = MakePlacementSegment(0, "h1", 1 << 20);
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(
+                      segment, SessionFor(generate_uuid())),
+                  ErrorCode::OK);
+    }
+    RandomAllocationStrategy strategy;
+    std::shared_ptr<const PlacementView> view;
+    {
+        auto allocator_access = segment_manager.getAllocatorAccess();
+        view = allocator_access.GetPlacementView();
+    }
+    auto too_big =
+        AllocateHostOrdered(strategy, *view, "k", 2 << 20, 1, {}, "h1");
+    ASSERT_FALSE(too_big.has_value());
+    EXPECT_EQ(too_big.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    auto empty_value =
+        AllocateHostOrdered(strategy, *view, "k", 0, 1, {}, "h1");
+    ASSERT_FALSE(empty_value.has_value());
+    EXPECT_EQ(empty_value.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(SegmentTest, PlacementViewSurvivesConcurrentTopologyChanges) {
+    SegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    RandomAllocationStrategy strategy;
+    const std::vector<std::string> hosts = {"h1", "h2", "h3"};
+    std::vector<Segment> stable;
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        for (size_t i = 0; i < 6; ++i) {
+            stable.push_back(
+                MakePlacementSegment(i, hosts[i % hosts.size()], 64 << 20));
+            ASSERT_EQ(segment_access.MountSegment(
+                          stable.back(), SessionFor(generate_uuid())),
+                      ErrorCode::OK);
+        }
+    }
+
+    std::atomic<bool> stop{false};
+    std::atomic<size_t> allocations{0};
+    std::vector<std::thread> writers;
+    for (int w = 0; w < 6; ++w) {
+        writers.emplace_back([&, w] {
+            std::mt19937_64 rng(w);
+            while (!stop.load()) {
+                std::shared_ptr<const PlacementView> view;
+                {
+                    auto allocator_access =
+                        segment_manager.getAllocatorAccess();
+                    view = allocator_access.GetPlacementView();
+                }
+                const std::string writer =
+                    rng() % 2 ? hosts[rng() % hosts.size()] : std::string();
+                auto result = AllocateHostOrdered(
+                    strategy, *view, "k" + std::to_string(rng()), 64 << 10,
+                    1 + rng() % 2, {}, writer);
+                if (result.has_value()) {
+                    allocations += result->size();
+                }
+            }
+        });
+    }
+
+    std::thread churn([&] {
+        std::mt19937_64 rng(99);
+        for (size_t round = 0; round < 200; ++round) {
+            Segment segment = MakePlacementSegment(
+                100 + round, hosts[rng() % hosts.size()], 8 << 20);
+            const UUID client_id = generate_uuid();
+            {
+                auto segment_access = segment_manager.getSegmentAccess();
+                ASSERT_EQ(segment_access.MountSegment(
+                              segment, SessionFor(client_id)),
+                          ErrorCode::OK);
+            }
+            {
+                auto segment_access = segment_manager.getSegmentAccess();
+                ASSERT_EQ(segment_access.SetSegmentStatusByName(
+                              segment.name, SegmentStatus::DRAINING),
+                          ErrorCode::OK);
+            }
+            {
+                auto segment_access = segment_manager.getSegmentAccess();
+                size_t metrics_dec_capacity = 0;
+                ASSERT_EQ(segment_access.PrepareUnmountSegment(
+                              segment.id, metrics_dec_capacity),
+                          ErrorCode::OK);
+                ASSERT_EQ(segment_access.CommitUnmountSegment(
+                              segment.id, client_id, metrics_dec_capacity),
+                          ErrorCode::OK);
+            }
+        }
+    });
+    churn.join();
+    stop = true;
+    for (auto& writer : writers) {
+        writer.join();
+    }
+    EXPECT_GT(allocations.load(), 0u);
+
+    // After the churn only the stable segments remain in the view.
+    std::vector<std::string> names;
+    {
+        auto allocator_access = segment_manager.getAllocatorAccess();
+        names = allocator_access.GetPlacementView()->allocators().getNames();
+    }
+    std::sort(names.begin(), names.end());
+    std::vector<std::string> expected;
+    for (const auto& segment : stable) {
+        expected.push_back(segment.name);
+    }
+    std::sort(expected.begin(), expected.end());
+    EXPECT_EQ(names, expected);
 }
 
 }  // namespace mooncake
