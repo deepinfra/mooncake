@@ -26,8 +26,12 @@ Segment MakeSegment(const std::string& name, uintptr_t base) {
     return segment;
 }
 
+// With HA the remount needs the walk to be over; the heartbeats of the other
+// clients must not wait with it.
 TEST(MasterJoinStallTest, RemountWaitingForAMetadataWalkDoesNotBlockPing) {
-    MasterService service;
+    MasterServiceConfig config;
+    config.enable_ha = true;
+    MasterService service(config);
     const UUID resident = generate_uuid();
     ASSERT_TRUE(
         service.MountSegment(MakeSegment("resident", 0x300000000), resident)
@@ -49,7 +53,7 @@ TEST(MasterJoinStallTest, RemountWaitingForAMetadataWalkDoesNotBlockPing) {
     remount = std::async(std::launch::async,
                          [&] { return service.ReMountSegment({}, joiner); });
     ASSERT_EQ(remount.wait_for(300ms), std::future_status::timeout)
-        << "the remount is expected to wait for the walk";
+        << "with HA the remount is expected to wait for the walk";
 
     ping =
         std::async(std::launch::async, [&] { return service.Ping(resident); });
@@ -65,6 +69,37 @@ TEST(MasterJoinStallTest, RemountWaitingForAMetadataWalkDoesNotBlockPing) {
     auto joined = service.Ping(joiner);
     ASSERT_TRUE(joined.has_value());
     EXPECT_EQ(joined->client_status, ClientStatus::OK);
+}
+
+// Without HA a client joins while the walk is still going.
+TEST(MasterJoinStallTest, RemountDoesNotWaitForAMetadataWalk) {
+    MasterService service;
+    const UUID resident = generate_uuid();
+    ASSERT_TRUE(
+        service.MountSegment(MakeSegment("resident", 0x300000000), resident)
+            .has_value());
+    ASSERT_TRUE(service.ReMountSegment({}, resident).has_value());
+
+    std::future<tl::expected<void, ErrorCode>> remount;
+    std::shared_lock<std::shared_mutex> walk(
+        MasterServiceTestPeer::MasterStateMutex(service));
+
+    const UUID joiner = generate_uuid();
+    const Segment segment = MakeSegment("joiner", 0x400000000);
+    ASSERT_TRUE(service.MountSegment(segment, joiner).has_value());
+    remount = std::async(std::launch::async, [&] {
+        return service.ReMountSegment({segment}, joiner);
+    });
+    ASSERT_EQ(remount.wait_for(2s), std::future_status::ready)
+        << "the remount waited for a walk it has no need to wait for";
+    EXPECT_TRUE(remount.get().has_value());
+
+    auto joined = service.Ping(joiner);
+    ASSERT_TRUE(joined.has_value());
+    EXPECT_EQ(joined->client_status, ClientStatus::OK);
+    auto still_there = service.Ping(resident);
+    ASSERT_TRUE(still_there.has_value());
+    EXPECT_EQ(still_there->client_status, ClientStatus::OK);
 }
 
 TEST(MasterJoinStallTest, MountDoesNotWaitForAMetadataWalk) {

@@ -1104,19 +1104,30 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         }
     }
     {
-        // Both locks are taken exclusively, and neither is waited for while
-        // the other is held. master_state_mutex_ is held shared by whatever
-        // walks the metadata -- an offboarding sweep, an eviction round --
-        // and waiting for it with client_mutex_ held would keep every Ping,
-        // which runs on the rpc io threads, behind that walk: the master
-        // would stop reading every connection until the walk let go.
+        // Neither lock is waited for while the other is held.
+        // master_state_mutex_ is held shared by whatever walks the metadata
+        // -- an offboarding sweep, an eviction round -- and waiting for it
+        // with client_mutex_ held would keep every Ping, which runs on the
+        // rpc io threads, behind that walk: the master would stop reading
+        // every connection until the walk let go.
+        //
+        // master_state_mutex_ is needed exclusively for the repair of replicas
+        // restored from a standby, which only a master run with HA has.
+        // Without HA nothing below touches what that lock alone guards, and it
+        // is taken shared, as MountSegment takes it: a writer waits for every
+        // reader, and the handlers of the data plane overlap enough to keep
+        // one out for seconds.
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_,
                                                         std::defer_lock);
         std::unique_lock<std::shared_mutex> snapshot_lock(master_state_mutex_,
                                                           std::defer_lock);
-        {
+        std::shared_lock<std::shared_mutex> shared_snapshot_lock(
+            master_state_mutex_, std::defer_lock);
+        if (enable_ha_) {
             WriteIntent intent(state_write_intents_);
             std::lock(snapshot_lock, client_lock);
+        } else {
+            std::lock(shared_snapshot_lock, client_lock);
         }
         auto [record_it, record_inserted] =
             client_liveness_records_.try_emplace(
@@ -1422,10 +1433,13 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 (void)restore.replicas[i]->replace_memory_buffer(
                     std::move(restore.buffers[i]));
             }
-            invalid_replica_endpoints_.erase(restore.segment.te_endpoint);
-            invalid_replica_endpoints_.erase(restore.segment.name);
-            standby_allocator_keepalive_.erase(restore.segment.te_endpoint);
-            standby_allocator_keepalive_.erase(restore.segment.name);
+            if (enable_ha_) {
+                // Only a restore from a standby fills these.
+                invalid_replica_endpoints_.erase(restore.segment.te_endpoint);
+                invalid_replica_endpoints_.erase(restore.segment.name);
+                standby_allocator_keepalive_.erase(restore.segment.te_endpoint);
+                standby_allocator_keepalive_.erase(restore.segment.name);
+            }
         }
         for (const auto& [tenant_id, object] : affected_objects) {
             MetadataAccessorRW accessor(this, tenant_id, object);
