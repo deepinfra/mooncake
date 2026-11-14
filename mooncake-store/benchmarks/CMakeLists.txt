@@ -14,6 +14,11 @@ add_executable(master_bench master_bench.cpp)
 target_link_libraries(master_bench PRIVATE cachelib_memory_allocator
                                            mooncake_store)
 
+# Fleet churn benchmark: what clients see while others leave and join
+add_executable(master_churn_bench master_churn_bench.cpp)
+target_link_libraries(master_churn_bench PRIVATE cachelib_memory_allocator
+                                                 mooncake_store)
+
 # Add BatchGetReplicaList latency benchmark executable
 add_executable(batch_get_replica_bench batch_get_replica_bench.cpp)
 target_link_libraries(batch_get_replica_bench PRIVATE cachelib_memory_allocator

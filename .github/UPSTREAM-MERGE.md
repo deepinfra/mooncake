@@ -19,7 +19,8 @@ patches below. Our `main` mirrors upstream. Upstream is merged into `di-main` we
    ```
 4. Run the tests for what our patches touch: `kv_snapshot_test`, `kv_event_publisher_test`,
    `offload_on_evict_test`, `evictor_test`, `master_service_evict_scenario_test`, `master_admin_server_test`,
-   `object_route_test`.
+   `object_route_test`, `master_join_stall_test`, `shared_lock_relay_test`, `liveness_blackout_guard_test`,
+   `master_service_test`.
 5. Commit the merge as "Merge upstream kvcache-ai/Mooncake main (<sha>) into di-main". Put each port in the
    body, in 5 lines or fewer. Commits are signed before they are pushed.
 
@@ -35,6 +36,8 @@ patches below. Our `main` mirrors upstream. Upstream is merged into `di-main` we
 | `ace0b076` | Oldest-first eviction under offload deferrals | Dropped at the 2026-10-28 merge; its tests stay |
 | `66bb2fec` | `GET /kv_events/snapshot` | `GetKvSnapshotPage`, which pages `ObjectRoute` stripes |
 | `65405206` | Unmounted segments retract their KV media | `CleanupStaleHandles` |
+| Master join stall | A client that mounts again while the master walks its metadata no longer keeps every Ping waiting. `ReMountSegment` never waits for `master_state_mutex_` while it holds `client_mutex_`; offboarding sweeps, stale-handle sweeps and eviction rounds give `master_state_mutex_` up between parts; one sweep serves every offboarding job queued when it starts; the liveness monitor does not judge clients by time the master was not hearing them (`MC_MASTER_LIVENESS_BLACKOUT_*`) | `shared_lock_relay.h`, `liveness_blackout_guard.h`; call sites in `ReMountSegment`, `ClearStaleHandles`, `SweepOfflineClients`, `ProcessClientOffboardingJob`, `BatchEvict`, `Ping`, `ClientMonitorFunc` |
+| `master_churn_bench` | Fleet churn benchmark: what the fleet sees while clients leave and join, at production key counts with no memory behind the segments | `mooncake-store/benchmarks/master_churn_bench.cpp` |
 | `MC_STORE_BATCHED_GET` (part of `4d01e691`) | Group multi-buffer reads per target | `GroupMultiBufferReadsFromEnv` in `real_client.cpp`, which turns on upstream's per-target grouping for `batch_get_into_multi_buffers` |
 
 ## Log
