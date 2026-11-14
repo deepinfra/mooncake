@@ -1595,7 +1595,7 @@ TEST_F(SegmentTest, PlacementViewIsReusedUntilTopologyChanges) {
     {
         auto segment_access = segment_manager.getSegmentAccess();
         ASSERT_EQ(
-            segment_access.MountSegment(segment0, client_id, client_liveness_),
+            segment_access.MountSegment(segment0, SessionFor(client_id)),
             ErrorCode::OK);
     }
 
@@ -1613,7 +1613,7 @@ TEST_F(SegmentTest, PlacementViewIsReusedUntilTopologyChanges) {
     {
         auto segment_access = segment_manager.getSegmentAccess();
         ASSERT_EQ(
-            segment_access.MountSegment(segment1, client_id, client_liveness_),
+            segment_access.MountSegment(segment1, SessionFor(client_id)),
             ErrorCode::OK);
     }
     std::shared_ptr<const PlacementView> after_mount;
@@ -1696,7 +1696,7 @@ TEST_F(SegmentTest, PlacementViewMatchesLiveIndexAcrossTopologyChanges) {
             entry.client_id = generate_uuid();
             auto segment_access = segment_manager.getSegmentAccess();
             ASSERT_EQ(segment_access.MountSegment(
-                          entry.segment, entry.client_id, client_liveness_),
+                          entry.segment, SessionFor(entry.client_id)),
                       ErrorCode::OK);
             entry.mounted = true;
             segments.push_back(entry);
@@ -1745,7 +1745,7 @@ TEST_F(SegmentTest, HostOrderedAllocationMatchesPreferredListAllocation) {
             segments.push_back(MakePlacementSegment(
                 i, hosts[i % hosts.size()], kSegmentSize));
             ASSERT_EQ(segment_access.MountSegment(
-                          segments.back(), generate_uuid(), client_liveness_),
+                          segments.back(), SessionFor(generate_uuid())),
                       ErrorCode::OK);
         }
     }
@@ -1823,8 +1823,8 @@ TEST_F(SegmentTest, HostOrderedAllocationFailsWhenNothingFits) {
     const Segment segment = MakePlacementSegment(0, "h1", 1 << 20);
     {
         auto segment_access = segment_manager.getSegmentAccess();
-        ASSERT_EQ(segment_access.MountSegment(segment, generate_uuid(),
-                                              client_liveness_),
+        ASSERT_EQ(segment_access.MountSegment(
+                      segment, SessionFor(generate_uuid())),
                   ErrorCode::OK);
     }
     RandomAllocationStrategy strategy;
@@ -1854,7 +1854,7 @@ TEST_F(SegmentTest, PlacementViewSurvivesConcurrentTopologyChanges) {
             stable.push_back(
                 MakePlacementSegment(i, hosts[i % hosts.size()], 64 << 20));
             ASSERT_EQ(segment_access.MountSegment(
-                          stable.back(), generate_uuid(), client_liveness_),
+                          stable.back(), SessionFor(generate_uuid())),
                       ErrorCode::OK);
         }
     }
@@ -1892,8 +1892,8 @@ TEST_F(SegmentTest, PlacementViewSurvivesConcurrentTopologyChanges) {
             const UUID client_id = generate_uuid();
             {
                 auto segment_access = segment_manager.getSegmentAccess();
-                ASSERT_EQ(segment_access.MountSegment(segment, client_id,
-                                                      client_liveness_),
+                ASSERT_EQ(segment_access.MountSegment(
+                              segment, SessionFor(client_id)),
                           ErrorCode::OK);
             }
             {
