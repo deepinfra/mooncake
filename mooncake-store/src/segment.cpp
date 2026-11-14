@@ -2,7 +2,10 @@
 
 #include "master_metric_manager.h"
 
+#include <algorithm>
 #include <functional>
+#include <set>
+#include <unordered_set>
 namespace mooncake {
 namespace {
 
@@ -112,12 +115,153 @@ void AddAllocatorUsage(
 
 }  // namespace
 
+size_t PlacementView::StartHost(const std::string& writer_host_id) const {
+    const auto it =
+        std::lower_bound(hosts_.begin(), hosts_.end(), writer_host_id);
+    return it == hosts_.end() ? 0 : static_cast<size_t>(it - hosts_.begin());
+}
+
+std::vector<std::string> PlacementView::HostOrderedSegments(
+    const std::string& writer_host_id, const std::string& key) const {
+    std::vector<std::string> ordered_segments;
+    if (writer_host_id.empty() || hosts_.empty()) {
+        return ordered_segments;
+    }
+    const size_t key_hash = std::hash<std::string>{}(key);
+    const size_t start = StartHost(writer_host_id);
+    for (size_t i = 0; i < hosts_.size(); ++i) {
+        ForEachHostSegment((start + i) % hosts_.size(), key_hash,
+                           [&ordered_segments](const std::string& name) {
+                               ordered_segments.push_back(name);
+                               return true;
+                           });
+    }
+    return ordered_segments;
+}
+
+// Places memory replicas exactly as passing the preferred segments followed
+// by the host-ordered segments to strategy.Allocate() would, for a strategy
+// that tries preferred segments in order. Walks those segments lazily, so a
+// write placed on its own host costs O(1) however many segments are mounted.
+tl::expected<std::vector<Replica>, ErrorCode> AllocateHostOrdered(
+    AllocationStrategy& strategy, const PlacementView& placement,
+    const std::string& key, uint64_t value_length, size_t replica_num,
+    const std::vector<std::string>& preferred_segments,
+    const std::string& writer_host_id) {
+    const AllocatorManager& allocators = placement.allocators();
+    if (value_length == 0) {
+        return strategy.Allocate(allocators, value_length, replica_num,
+                                 preferred_segments, std::set<std::string>(),
+                                 ReplicaType::MEMORY);
+    }
+
+    std::vector<Replica> replicas;
+    replicas.reserve(replica_num);
+    std::set<std::string> used_segments;
+    // A name is tried once, as the deduplicated preferred list would.
+    std::unordered_set<std::string> tried_segments;
+    auto try_segment = [&](const std::string& name) {
+        if (name.empty() || !tried_segments.insert(name).second) {
+            return true;
+        }
+        auto replica = strategy.AllocateFrom(allocators, value_length, name);
+        if (replica.has_value()) {
+            replicas.push_back(std::move(replica.value()));
+            used_segments.insert(name);
+        }
+        return replicas.size() < replica_num;
+    };
+
+    bool keep_trying = true;
+    for (const auto& name : preferred_segments) {
+        if (!(keep_trying = try_segment(name))) {
+            break;
+        }
+    }
+    if (keep_trying && !writer_host_id.empty() && placement.HostCount() > 0) {
+        const size_t key_hash = std::hash<std::string>{}(key);
+        const size_t start = placement.StartHost(writer_host_id);
+        for (size_t i = 0; keep_trying && i < placement.HostCount(); ++i) {
+            keep_trying = placement.ForEachHostSegment(
+                (start + i) % placement.HostCount(), key_hash, try_segment);
+        }
+    }
+    if (replicas.size() >= replica_num) {
+        return replicas;
+    }
+
+    auto rest = strategy.Allocate(
+        allocators, value_length, replica_num - replicas.size(),
+        std::vector<std::string>(), used_segments, ReplicaType::MEMORY);
+    if (rest.has_value()) {
+        for (auto& replica : rest.value()) {
+            replicas.push_back(std::move(replica));
+        }
+    } else if (replicas.empty()) {
+        return tl::make_unexpected(rest.error());
+    }
+    return replicas;
+}
+
+std::shared_ptr<const PlacementView> ScopedAllocatorAccess::GetPlacementView()
+    const {
+    if (segment_manager_ == nullptr) {
+        return nullptr;
+    }
+    return segment_manager_->GetPlacementView();
+}
+
 std::vector<std::string> ScopedAllocatorAccess::GetHostOrderedSegments(
     const std::string& writer_host_id, const std::string& key) const {
     if (segments_by_host_ == nullptr) {
         return {};
     }
+    if (segment_manager_ != nullptr) {
+        return segment_manager_->GetPlacementView()->HostOrderedSegments(
+            writer_host_id, key);
+    }
     return BuildHostOrderedSegments(*segments_by_host_, writer_host_id, key);
+}
+
+void SegmentManager::InvalidatePlacementView() {
+    std::lock_guard<std::mutex> guard(placement_view_mutex_);
+    placement_view_.reset();
+}
+
+std::shared_ptr<const PlacementView> SegmentManager::GetPlacementView() const {
+    std::lock_guard<std::mutex> guard(placement_view_mutex_);
+    if (placement_view_ != nullptr) {
+        // Every topology change drops the view. A count that no longer
+        // matches means one did not, so rebuild rather than place on stale
+        // segments.
+        const bool matches =
+            placement_view_->allocators_.getNames().size() ==
+                allocator_manager_.getNames().size() &&
+            placement_view_->hosts_.size() == segments_by_host_.size() &&
+            placement_view_->owner_count_ == client_by_name_.size();
+        if (matches) {
+            return placement_view_;
+        }
+        LOG(ERROR) << "action=rebuild_stale_placement_view";
+    }
+
+    auto view = std::make_shared<PlacementView>();
+    view->allocators_ = allocator_manager_.Snapshot(&client_by_name_);
+    view->owner_count_ = client_by_name_.size();
+    view->hosts_.reserve(segments_by_host_.size());
+    view->host_segments_.reserve(segments_by_host_.size());
+    for (const auto& [host_id, segments_by_name] : segments_by_host_) {
+        view->hosts_.push_back(host_id);
+        auto& names = view->host_segments_.emplace_back();
+        names.reserve(segments_by_name.size());
+        for (const auto& [name, segment_ids] : segments_by_name) {
+            if (!segment_ids.empty()) {
+                names.push_back(name);
+            }
+        }
+    }
+    placement_view_ = std::move(view);
+    return placement_view_;
 }
 
 StorageUsageSnapshot SegmentManager::GetMemoryUsageSnapshot() const {
@@ -166,6 +310,7 @@ std::optional<UUID> ScopedAllocatorAccess::GetOwnerClientId(
 
 ErrorCode ScopedSegmentAccess::MountSegment(
     const Segment& segment, ClientSessionSharedPtr owner_session) {
+    segment_manager_->InvalidatePlacementView();
     if (!owner_session) {
         return ErrorCode::INVALID_PARAMS;
     }
@@ -288,6 +433,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(
 
 void ScopedSegmentAccess::BindClientSession(
     const ClientSessionSharedPtr& owner_session) {
+    segment_manager_->InvalidatePlacementView();
     CHECK(owner_session);
     const auto client_segments_it =
         segment_manager_->client_segments_.find(owner_session->ClientId());
@@ -399,6 +545,7 @@ bool ScopedSegmentAccess::GetSegment(const UUID& segment_id,
 
 bool ScopedSegmentAccess::ReplaceAllocators(
     const std::vector<AllocatorReplacement>& replacements) {
+    segment_manager_->InvalidatePlacementView();
     std::vector<AllocatorManager::RegistrationReplacement> manager_replacements;
     manager_replacements.reserve(replacements.size());
     for (const auto& replacement : replacements) {
@@ -451,6 +598,7 @@ std::shared_ptr<BufferAllocatorBase> ScopedSegmentAccess::GetAllocator(
 
 ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
     const UUID& segment_id, size_t& metrics_dec_capacity) {
+    segment_manager_->InvalidatePlacementView();
     auto it = segment_manager_->mounted_segments_.find(segment_id);
     if (it == segment_manager_->mounted_segments_.end()) {
         LOG(WARNING) << "segment_id=" << segment_id
@@ -497,6 +645,7 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
 
 ErrorCode ScopedSegmentAccess::PrepareGracefulUnmountSegment(
     const UUID& segment_id) {
+    segment_manager_->InvalidatePlacementView();
     auto it = segment_manager_->mounted_segments_.find(segment_id);
     if (it == segment_manager_->mounted_segments_.end()) {
         LOG(WARNING) << "segment_id=" << segment_id
@@ -539,6 +688,7 @@ ErrorCode ScopedSegmentAccess::PrepareGracefulUnmountSegment(
 
 void ScopedSegmentAccess::ReindexSegmentNameAfterRemoval(
     const UUID& removed_segment_id, const std::string& segment_name) {
+    segment_manager_->InvalidatePlacementView();
     const auto indexed =
         segment_manager_->segment_id_by_name_.find(segment_name);
     if (indexed == segment_manager_->segment_id_by_name_.end() ||
@@ -579,6 +729,7 @@ void ScopedSegmentAccess::ReindexSegmentNameAfterRemoval(
 ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
     const UUID& segment_id, const UUID& client_id,
     const size_t& metrics_dec_capacity, bool retain_name_registration) {
+    segment_manager_->InvalidatePlacementView();
     auto mounted = segment_manager_->mounted_segments_.find(segment_id);
     if (mounted == segment_manager_->mounted_segments_.end()) {
         return ErrorCode::SEGMENT_NOT_FOUND;
@@ -810,6 +961,7 @@ ErrorCode ScopedSegmentAccess::GetSegmentStatusById(
 
 ErrorCode ScopedSegmentAccess::SetSegmentStatusByName(
     const std::string& segment_name, SegmentStatus status) {
+    segment_manager_->InvalidatePlacementView();
     auto segment_id_it =
         segment_manager_->segment_id_by_name_.find(segment_name);
     if (segment_id_it == segment_manager_->segment_id_by_name_.end()) {

@@ -4955,45 +4955,68 @@ auto MasterService::AllocateReplicas(const std::string& key,
                 append_preferred_segment(preferred_segment);
             }
         }
+        // HCA affinity is set on a per-request allocator copy, so it keeps
+        // the copying path.
+        const bool place_from_view =
+            !StoreHcaAffinityEnabled() &&
+            allocation_strategy_->TriesPreferredSegmentsInOrder();
+        std::shared_ptr<const PlacementView> placement;
         AllocatorManager allocator_snapshot;
         {
             ScopedAllocatorAccess allocator_access =
                 segment_manager_.getAllocatorAccess();
-            if (!writer_host_id.empty()) {
-                auto host_ordered_segments =
-                    allocator_access.GetHostOrderedSegments(writer_host_id,
-                                                            key);
-                for (const auto& segment_name : host_ordered_segments) {
-                    append_preferred_segment(segment_name);
-                }
-                if (!host_ordered_segments.empty()) {
-                    VLOG(1) << "key=" << key
-                            << ", writer_host_id=" << writer_host_id
-                            << ", local_first_preferred_segments="
-                            << host_ordered_segments.size();
-                }
+            if (place_from_view) {
+                placement = allocator_access.GetPlacementView();
             }
-            allocator_snapshot = allocator_access.SnapshotAllocatorManager();
+            if (placement == nullptr) {
+                if (!writer_host_id.empty()) {
+                    auto host_ordered_segments =
+                        allocator_access.GetHostOrderedSegments(
+                            writer_host_id, key);
+                    for (const auto& segment_name : host_ordered_segments) {
+                        append_preferred_segment(segment_name);
+                    }
+                    if (!host_ordered_segments.empty()) {
+                        VLOG(1) << "key=" << key
+                                << ", writer_host_id=" << writer_host_id
+                                << ", local_first_preferred_segments="
+                                << host_ordered_segments.size();
+                    }
+                }
+                allocator_snapshot =
+                    allocator_access.SnapshotAllocatorManager();
+            }
         }
 
-        if (StoreHcaAffinityEnabled()) {
-            allocator_snapshot.SetHcaAffinity(
-                config.preferred_hca_names.value_or(
-                    std::vector<std::string>{}));
+        tl::expected<std::vector<Replica>, ErrorCode> allocation_result =
+            tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        if (placement != nullptr) {
+            allocation_result = AllocateHostOrdered(
+                *allocation_strategy_, *placement, key, value_length,
+                config.replica_num, preferred_segments, writer_host_id);
+        } else {
+            if (StoreHcaAffinityEnabled()) {
+                allocator_snapshot.SetHcaAffinity(
+                    config.preferred_hca_names.value_or(
+                        std::vector<std::string>{}));
+            }
+            allocation_result = allocation_strategy_->Allocate(
+                allocator_snapshot, value_length, config.replica_num,
+                preferred_segments, std::set<std::string>(),
+                ReplicaType::MEMORY);
         }
-        auto allocation_result = allocation_strategy_->Allocate(
-            allocator_snapshot, value_length, config.replica_num,
-            preferred_segments, std::set<std::string>(), ReplicaType::MEMORY);
 
         // Only failed or short allocations need this eviction hint. Count on
-        // the retained snapshot after releasing the segment read lock.
+        // the retained view or snapshot after releasing the segment read lock.
         if ((!allocation_result &&
              allocation_result.error() != ErrorCode::INVALID_PARAMS) ||
             (allocation_result &&
              allocation_result->size() != config.replica_num)) {
+            const AllocatorManager& serving =
+                placement != nullptr ? placement->allocators()
+                                     : allocator_snapshot;
             has_enough_memory_segments =
-                allocator_snapshot.getServingNames().size() >=
-                config.replica_num;
+                serving.countServing(config.replica_num) >= config.replica_num;
         }
 
         if (!allocation_result.has_value()) {

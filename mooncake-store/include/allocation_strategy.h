@@ -180,6 +180,20 @@ class AllocatorManager {
                            });
     }
 
+    // Counts serving segments, stopping once `limit` are found.
+    [[nodiscard]] size_t countServing(size_t limit) const {
+        size_t serving = 0;
+        for (const auto& name : names_) {
+            if (serving >= limit) {
+                break;
+            }
+            if (isServing(name)) {
+                ++serving;
+            }
+        }
+        return serving;
+    }
+
     [[nodiscard]] std::vector<std::string> getServingNames() const {
         std::vector<std::string> serving_names;
         serving_names.reserve(names_.size());
@@ -299,6 +313,14 @@ class AllocationStrategy {
     virtual tl::expected<Replica, ErrorCode> AllocateFrom(
         const AllocatorManager& allocator_manager, const size_t slice_length,
         const std::string& segment_name) = 0;
+
+    /**
+     * @brief True when Allocate() first tries preferred_segments in order,
+     *        one AllocateFrom() each, skipping excluded and used segments,
+     *        before placing anything else. A caller may then try a prefix of
+     *        the preferred segments itself and pass the rest.
+     */
+    virtual bool TriesPreferredSegmentsInOrder() const { return false; }
 };
 
 /**
@@ -318,6 +340,8 @@ class AllocationStrategy {
 class RandomAllocationStrategy : public AllocationStrategy {
    public:
     RandomAllocationStrategy() = default;
+
+    bool TriesPreferredSegmentsInOrder() const override { return true; }
 
     tl::expected<std::vector<Replica>, ErrorCode> Allocate(
         const AllocatorManager& allocator_manager, const size_t slice_length,
@@ -682,6 +706,8 @@ class SsdFreeRatioFirstAllocationStrategy final
     explicit SsdFreeRatioFirstAllocationStrategy(
         const LocalSsdManager& local_ssd)
         : local_ssd_(local_ssd) {}
+
+    bool TriesPreferredSegmentsInOrder() const override { return false; }
 
     tl::expected<std::vector<Replica>, ErrorCode> Allocate(
         const ScopedAllocatorAccess& placement, const size_t slice_length,
