@@ -3,6 +3,8 @@
 #include <boost/functional/hash.hpp>
 #include <chrono>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <ostream>
 #include <optional>
 #include <set>
@@ -297,6 +299,74 @@ class ScopedNoFSegmentAccess {
 };
 
 /**
+ * @brief An immutable copy of the allocators and the host index, shared by
+ *        allocations until the segment topology changes, so an allocation
+ *        does not pay for every mounted segment.
+ */
+class PlacementView {
+   public:
+    const AllocatorManager& allocators() const { return allocators_; }
+
+    size_t HostCount() const { return hosts_.size(); }
+
+    /**
+     * @brief Index of the host whose segments are tried first for a writer:
+     *        the writer's own host, else the next host in name order, else
+     *        the first. Matches BuildHostOrderedSegments.
+     */
+    size_t StartHost(const std::string& writer_host_id) const;
+
+    /**
+     * @brief The allocatable segments of one host, in the key-rotated order
+     *        BuildHostOrderedSegments lists them.
+     */
+    template <typename Fn>
+    bool ForEachHostSegment(size_t host_index, size_t key_hash,
+                            Fn&& visit) const {
+        if (host_index >= host_segments_.size()) {
+            return true;
+        }
+        const auto& names = host_segments_[host_index];
+        if (names.empty()) {
+            return true;
+        }
+        const size_t start = key_hash % names.size();
+        for (size_t i = 0; i < names.size(); ++i) {
+            if (!visit(names[(start + i) % names.size()])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    std::vector<std::string> HostOrderedSegments(
+        const std::string& writer_host_id, const std::string& key) const;
+
+   private:
+    friend class SegmentManager;
+
+    AllocatorManager allocators_;
+    // Hosts in ascending order, as HostSegmentIndex iterates them.
+    std::vector<std::string> hosts_;
+    // Per host: allocatable segment names in ascending order.
+    std::vector<std::vector<std::string>> host_segments_;
+    size_t owner_count_ = 0;
+};
+
+/**
+ * @brief Places memory replicas exactly as passing preferred_segments then
+ *        the writer's host-ordered segments to strategy.Allocate() would,
+ *        for a strategy whose TriesPreferredSegmentsInOrder() is true. The
+ *        segments are walked lazily, so a write that fits on its own host
+ *        costs O(1) however many segments are mounted.
+ */
+tl::expected<std::vector<Replica>, ErrorCode> AllocateHostOrdered(
+    AllocationStrategy& strategy, const PlacementView& placement,
+    const std::string& key, uint64_t value_length, size_t replica_num,
+    const std::vector<std::string>& preferred_segments,
+    const std::string& writer_host_id);
+
+/**
  * @brief RAII-style access to allocators for thread-safe allocator usage
  */
 class ScopedAllocatorAccess {
@@ -309,11 +379,20 @@ class ScopedAllocatorAccess {
         const AllocatorManager& allocator_manager,
         const HostSegmentIndex& segments_by_host,
         const std::unordered_map<std::string, UUID>& client_by_name,
-        std::shared_mutex& mutex)
+        std::shared_mutex& mutex,
+        const SegmentManager* segment_manager = nullptr)
         : allocator_manager_(allocator_manager),
           segments_by_host_(&segments_by_host),
           client_by_name_(&client_by_name),
+          segment_manager_(segment_manager),
           lock_(mutex) {}
+
+    /**
+     * @brief The current placement view, or nullptr when this access has no
+     *        host index. Valid after the access is released; it stops
+     *        reflecting mounts, unmounts and status changes made after.
+     */
+    std::shared_ptr<const PlacementView> GetPlacementView() const;
 
     const AllocatorManager& getAllocatorManager() const {
         return allocator_manager_;
@@ -332,6 +411,7 @@ class ScopedAllocatorAccess {
     const AllocatorManager& allocator_manager_;
     const HostSegmentIndex* segments_by_host_{nullptr};
     const std::unordered_map<std::string, UUID>* client_by_name_{nullptr};
+    const SegmentManager* segment_manager_{nullptr};
     std::shared_lock<std::shared_mutex> lock_;
 };
 
@@ -372,7 +452,7 @@ class SegmentManager {
      */
     ScopedAllocatorAccess getAllocatorAccess() {
         return ScopedAllocatorAccess(allocator_manager_, segments_by_host_,
-                                     client_by_name_, segment_mutex_);
+                                     client_by_name_, segment_mutex_, this);
     }
 
     /**
@@ -406,9 +486,18 @@ class SegmentManager {
    private:
     void AttachMountedUsageTrackers();
 
+    // Every change to allocator_manager_, segments_by_host_ or
+    // client_by_name_ calls this with segment_mutex_ held exclusively.
+    void InvalidatePlacementView();
+    // Requires segment_mutex_ held, shared or exclusive.
+    std::shared_ptr<const PlacementView> GetPlacementView() const;
+
     std::shared_ptr<StorageUsageTracker> usage_tracker_ =
         std::make_shared<StorageUsageTracker>();
     mutable std::shared_mutex segment_mutex_;
+    // Lock order: segment_mutex_, then placement_view_mutex_.
+    mutable std::mutex placement_view_mutex_;
+    mutable std::shared_ptr<const PlacementView> placement_view_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
     const BufferAllocatorType
         memory_allocator_;  // Type of buffer allocator to use
@@ -429,6 +518,7 @@ class SegmentManager {
     HostSegmentIndex segments_by_host_;  // host_id -> segment name -> segment
                                          // ids for allocatable segments
     friend class ScopedSegmentAccess;
+    friend class ScopedAllocatorAccess;
     friend class SegmentTest;  // for unit tests
 };
 
