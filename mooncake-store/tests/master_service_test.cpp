@@ -1327,6 +1327,70 @@ TEST_F(MasterServiceTest, DfsBucketMemoryAllocationFailurePreservesBuckets) {
     std::filesystem::remove_all(dfs_root, ec);
 }
 
+TEST_F(MasterServiceTest, ShortMemoryPlacementWithDfsStillRequestsEviction) {
+    // replica_num 2 with a DFS replica is strict: one memory replica is a
+    // failure, and it must still nudge eviction like a full failure does.
+    const auto dfs_root =
+        (std::filesystem::temp_directory_path() /
+         ("master_short_memory_eviction_" + std::to_string(::getpid())))
+            .string();
+    std::filesystem::create_directories(dfs_root);
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
+    ScopedEnvVar shard_count("MOONCAKE_DFS_SHARD_COUNT", "1");
+    ScopedEnvVar shard_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "67108864");
+    ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar eviction("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+    ScopedEnvVar deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    {
+        MasterService service(MasterServiceConfig::builder()
+                                  .set_memory_allocator(BufferAllocatorType::OFFSET)
+                                  .set_eviction_ratio(0.0)
+                                  .set_eviction_high_watermark_ratio(1.0)
+                                  .build());
+        ASSERT_TRUE(MasterServiceTestPeer::EnableDfs(service));
+        constexpr size_t kMiB = 1024 * 1024;
+        const UUID owner = generate_uuid();
+        Segment seg_a;
+        seg_a.id = generate_uuid();
+        seg_a.name = "seg_a";
+        seg_a.base = 0x100000000ULL;
+        seg_a.size = 16 * kMiB;
+        seg_a.te_endpoint = "seg_a";
+        Segment seg_b = seg_a;
+        seg_b.id = generate_uuid();
+        seg_b.name = "seg_b";
+        seg_b.base = 0x200000000ULL;
+        seg_b.te_endpoint = "seg_b";
+        ASSERT_TRUE(service.MountSegment(seg_a, owner));
+        ASSERT_TRUE(service.MountSegment(seg_b, owner));
+
+        ReplicateConfig fill;
+        fill.replica_num = 1;
+        fill.preferred_segment = "seg_a";
+        ASSERT_TRUE(service
+                        .PutStart(owner, "filler", TenantId::Default(),
+                                  15 * kMiB, fill)
+                        .has_value());
+
+        MasterServiceTestPeer::NeedMemEviction(service).store(false);
+        ReplicateConfig config;
+        config.replica_num = 2;
+        config.dfs_replica_num = 1;
+        auto result = service.PutStart(owner, "short", TenantId::Default(),
+                                       4 * kMiB, config);
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+        EXPECT_TRUE(MasterServiceTestPeer::NeedMemEviction(service).load());
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(dfs_root, ec);
+}
+
 TEST_F(MasterServiceTest, DfsBucketUpsertRestoresEvictedReplica) {
     const auto dfs_root =
         (std::filesystem::temp_directory_path() /
