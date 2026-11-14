@@ -4887,7 +4887,9 @@ auto MasterService::AllocateReplicas(const std::string& key,
             allocation_result = AllocateHostOrdered(
                 *allocation_strategy_, *placement, key, value_length,
                 config.replica_num, preferred_segments, writer_host_id);
-            if (!allocation_result.has_value()) {
+            // Both the failure and the short-placement paths below read it.
+            if (!allocation_result.has_value() ||
+                allocation_result->size() < config.replica_num) {
                 has_enough_memory_segments =
                     placement->allocators().countServing(config.replica_num) >=
                     config.replica_num;

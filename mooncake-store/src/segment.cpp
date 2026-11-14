@@ -139,10 +139,6 @@ std::vector<std::string> PlacementView::HostOrderedSegments(
     return ordered_segments;
 }
 
-// Places memory replicas exactly as passing the preferred segments followed
-// by the host-ordered segments to strategy.Allocate() would, for a strategy
-// that tries preferred segments in order. Walks those segments lazily, so a
-// write placed on its own host costs O(1) however many segments are mounted.
 tl::expected<std::vector<Replica>, ErrorCode> AllocateHostOrdered(
     AllocationStrategy& strategy, const PlacementView& placement,
     const std::string& key, uint64_t value_length, size_t replica_num,
@@ -155,8 +151,11 @@ tl::expected<std::vector<Replica>, ErrorCode> AllocateHostOrdered(
                                  ReplicaType::MEMORY);
     }
 
+    if (allocators.getNames().empty()) {
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
     std::vector<Replica> replicas;
-    replicas.reserve(replica_num);
+    replicas.reserve(std::min(replica_num, allocators.getNames().size()));
     std::set<std::string> used_segments;
     // A name is tried once, as the deduplicated preferred list would.
     std::unordered_set<std::string> tried_segments;
