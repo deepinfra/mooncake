@@ -36,9 +36,11 @@
 #include "deadline_scheduler.h"
 #include "dynamic_replication_controller.h"
 #include "lease.h"
+#include "liveness_blackout_guard.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "segment.h"
+#include "shared_lock_relay.h"
 #include "local_ssd/manager.h"
 #include "tenant/quota_policy.h"
 #include "types.h"
@@ -96,6 +98,11 @@ class PrefetchTaskMasterTest;
  * Strict tenant admission and policy mutation paths that need both the
  * quota policy lock and master_state_mutex_ must acquire the policy lock
  * first, then master_state_mutex_.
+ * Nothing waits for master_state_mutex_ exclusively while it holds
+ * client_mutex_: Ping takes client_mutex_ on the rpc io threads, and a walk of
+ * all metadata holds master_state_mutex_ shared. ReMountSegment takes the two
+ * with std::lock, and such walks give master_state_mutex_ up between parts
+ * (see shared_lock_relay.h).
  * The recompute lock serializes the capacity snapshot and the corresponding
  * quota-table update. The segment mutex is released before entering the
  * quota table, so these two locks are never nested.
@@ -1198,6 +1205,8 @@ class MasterService {
     // raises it again when the round could free nothing that was there to
     // free.
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
+    // Objects one slice of an eviction round aims to free; see BatchEvict.
+    static constexpr uint64_t kEvictionSliceObjects = 4096;
     void NoFBatchEvict(double evict_ratio_target,
                        double evict_ratio_lowerbound);
     using NamespaceEvictionResult = StoreControl::EvictionResult;
@@ -1222,9 +1231,11 @@ class MasterService {
     std::string GetClientHostId(const UUID& client_id) const;
 
     void ClearInvalidHandles();
-    // Caller owns master_state_mutex_ (shared) while metadata is swept.
+    // Caller owns master_state_mutex_ (shared) while metadata is swept. With
+    // `relay`, that hold is given up between the parts of the sweep.
     void ClearInvalidHandles(
-        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients);
+        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients,
+        SharedLockRelay* relay = nullptr);
     // Clear completed LOCAL_DISK replicas owned by exactly this client, in
     // every tenant. Owner-targeted on purpose: a liveness-complement sweep
     // classifies by absence from a point-in-time set, so an owner that
@@ -1237,9 +1248,37 @@ class MasterService {
     // tenant is first read to pick the objects that match, and only those are
     // cleaned, each under its own write lock, since a mass client expiry marks
     // handles stale table-wide.
+    //
+    // The walk goes one stripe of a tenant's objects at a time. `observe`,
+    // when set, sees every object the walk reads, under that object's read
+    // lock. `relay`, when set, gives the caller's shared hold of
+    // master_state_mutex_ up after each stripe, with no key held.
     tl::expected<void, ErrorCode> ClearStaleHandles(
-        const std::function<bool(const Replica&)>& is_stale);
+        const std::function<bool(const Replica&)>& is_stale,
+        const std::function<void(const ObjectMetadata&)>& observe = {},
+        SharedLockRelay* relay = nullptr);
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
+
+    // One sweep of the replicas offline clients left behind, for every client
+    // that is offline when it starts, so that clients retired together are
+    // cleaned up by one walk of the metadata and not by one walk each.
+    struct OfflineSweep {
+        // Counts the sweeps that finished; 0 before the first.
+        uint64_t id{0};
+        // Jobs scheduled up to here had their segments taken out of service
+        // before the sweep started, so it saw all they left.
+        uint64_t covers_seq{0};
+        // Offline clients that still had a replica being written.
+        std::unordered_set<const ClientLivenessRecord*> unfinished;
+    };
+    // Offboarding worker thread only.
+    OfflineSweep last_offline_sweep_;
+    // Runs a sweep on behalf of `job`. `state_lock` is the caller's shared
+    // hold of master_state_mutex_, the only lock it holds; it is given up and
+    // taken again along the way.
+    tl::expected<void, ErrorCode> SweepOfflineClients(
+        const ClientOffboardingJob& job,
+        std::shared_lock<std::shared_mutex>& state_lock);
     // We need to clean up finished tasks periodically to avoid memory leak
     // And also we can add some task ttl mechanism in the future
     void TaskCleanupThreadFunc();
@@ -1981,6 +2020,9 @@ class MasterService {
     std::atomic<bool> client_monitor_running_{false};
     static constexpr uint64_t kClientMonitorSleepMs =
         1000;  // 1000 ms sleep between client monitor checks
+    // Keeps the monitor from judging clients by time the master was not
+    // serving heartbeats; see liveness_blackout_guard.h.
+    LivenessBlackoutGuard liveness_blackout_guard_;
     const int64_t client_active_ttl_sec_;
     const int64_t client_suspicion_ttl_sec_;
     const std::chrono::seconds nof_heartbeat_interval_sec_;
@@ -2150,6 +2192,8 @@ class MasterService {
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
 
     mutable std::shared_mutex master_state_mutex_;
+    // Writers waiting for master_state_mutex_; see shared_lock_relay.h.
+    mutable std::atomic<int> state_write_intents_{0};
 
     // Restore lifecycle state (RFC #4700, slice 1). Declared next to
     // master_state_mutex_ because the follow-up slices replace that lock's

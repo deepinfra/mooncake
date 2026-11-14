@@ -101,7 +101,11 @@ std::string AllocatedBuffer::getTransportEndpoint(
         endpoint = alloc->getTransportEndpoint();
         if (locality) *locality = alloc->GetLocality();
     } else {
-        LOG(ERROR) << "allocator=expired_or_null in getTransportEndpoint";
+        // Every replica left on an unmounted segment comes through here when
+        // it is swept: millions of them after a client goes away.
+        LOG_EVERY_N(WARNING, 100000)
+            << "allocator=expired_or_null in getTransportEndpoint"
+            << ", occurrences=" << google::COUNTER;
     }
 
     if (this->protocol == "cxl") {

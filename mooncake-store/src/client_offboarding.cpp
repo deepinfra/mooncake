@@ -54,6 +54,8 @@ void ClientOffboardingWorker::ScheduleReserved(ClientOffboardingJob job) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         CHECK(running_);
+        job.scheduled_seq =
+            last_scheduled_seq_.fetch_add(1, std::memory_order_acq_rel) + 1;
         jobs_.push_back(std::move(job));
     }
     cv_.notify_one();

@@ -44,6 +44,14 @@ struct ClientOffboardingJob {
     std::vector<PreparedSegmentOffboarding> prepared_segments;
     bool metadata_cleanup_accepted{false};
     bool local_ssd_unregistered{false};
+    // Set when the job is scheduled, after the client went offline and its
+    // segments were taken out of service: a metadata sweep that starts later
+    // sees everything the client left.
+    uint64_t scheduled_seq{0};
+    // The oldest sweep whose result this job may take. Raised when an attempt
+    // takes a segment out of service itself or has to wait for a replica that
+    // is still being written.
+    uint64_t min_sweep_id{0};
     uint64_t retry_count{0};
     std::chrono::steady_clock::time_point next_attempt_at{
         std::chrono::steady_clock::now()};
@@ -64,6 +72,10 @@ class ClientOffboardingWorker {
     void Stop();
     [[nodiscard]] bool HasPending() const {
         return pending_jobs_.load(std::memory_order_acquire) != 0;
+    }
+    // The scheduled_seq of the job scheduled last; 0 before the first.
+    [[nodiscard]] uint64_t LastScheduledSeq() const {
+        return last_scheduled_seq_.load(std::memory_order_acquire);
     }
 
    private:
@@ -89,6 +101,7 @@ class ClientOffboardingWorker {
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::atomic<size_t> pending_jobs_{0};
+    std::atomic<uint64_t> last_scheduled_seq_{0};
 };
 
 }  // namespace mooncake

@@ -63,6 +63,46 @@ namespace mooncake {
 
 namespace {
 
+// A whole number of seconds from the environment; `fallback` when the variable
+// is unset or not a number.
+int64_t SecondsFromEnv(const char* name, int64_t fallback) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr || *raw == '\0') {
+        return fallback;
+    }
+    char* end = nullptr;
+    const long long value = std::strtoll(raw, &end, 10);
+    if (end == raw || *end != '\0' || value < 0) {
+        LOG(WARNING) << name << "=" << raw << " is not a number of seconds; "
+                     << "using " << fallback;
+        return fallback;
+    }
+    return static_cast<int64_t>(value);
+}
+
+// The blackout guard of the client liveness monitor.
+//   MC_MASTER_LIVENESS_BLACKOUT_SEC: how late a monitor tick, or how long a
+//     fleet-wide silence, counts as the master not hearing its clients
+//     (default 5; 0 turns the guard off).
+//   MC_MASTER_LIVENESS_BLACKOUT_MIN_FLEET: clients a fleet has before its
+//     silence counts (default 8).
+//   MC_MASTER_LIVENESS_BLACKOUT_MAX_SILENCE_SEC: silence after which the
+//     fleet is taken to be gone (default twice the two liveness TTLs, at
+//     least 60).
+LivenessBlackoutGuard MakeLivenessBlackoutGuard(int64_t active_ttl_sec,
+                                                int64_t suspicion_ttl_sec) {
+    const int64_t threshold =
+        SecondsFromEnv("MC_MASTER_LIVENESS_BLACKOUT_SEC", 5);
+    const int64_t min_fleet =
+        SecondsFromEnv("MC_MASTER_LIVENESS_BLACKOUT_MIN_FLEET", 8);
+    const int64_t max_silence = SecondsFromEnv(
+        "MC_MASTER_LIVENESS_BLACKOUT_MAX_SILENCE_SEC",
+        std::max<int64_t>(60, 2 * (active_ttl_sec + suspicion_ttl_sec)));
+    return LivenessBlackoutGuard(std::chrono::seconds(threshold),
+                                 std::chrono::seconds(max_silence),
+                                 static_cast<size_t>(min_fleet));
+}
+
 uint64_t SaturatingAdd(uint64_t lhs, uint64_t rhs) {
     if (lhs > std::numeric_limits<uint64_t>::max() - rhs) {
         return std::numeric_limits<uint64_t>::max();
@@ -423,6 +463,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       nof_eviction_high_watermark_ratio_(
           config.nof_eviction_high_watermark_ratio),
       view_version_(config.view_version),
+      liveness_blackout_guard_(MakeLivenessBlackoutGuard(
+          config.client_active_ttl_sec, config.client_suspicion_ttl_sec)),
       client_active_ttl_sec_(config.client_active_ttl_sec),
       client_suspicion_ttl_sec_(config.client_suspicion_ttl_sec),
       nof_heartbeat_interval_sec_(
@@ -1051,7 +1093,31 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
     {
-        std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+        // A client the master declared offline asks again every second until
+        // its offboarding is done. Refuse it here, as cheaply as a Ping.
+        std::shared_lock<std::shared_mutex> probe_lock(client_mutex_);
+        const auto known = client_liveness_records_.find(client_id);
+        if (known != client_liveness_records_.end() &&
+            !known->second->ShouldRetainResources()) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+    }
+    {
+        // Both locks are taken exclusively, and neither is waited for while
+        // the other is held. master_state_mutex_ is held shared by whatever
+        // walks the metadata -- an offboarding sweep, an eviction round --
+        // and waiting for it with client_mutex_ held would keep every Ping,
+        // which runs on the rpc io threads, behind that walk: the master
+        // would stop reading every connection until the walk let go.
+        std::unique_lock<std::shared_mutex> client_lock(client_mutex_,
+                                                        std::defer_lock);
+        std::unique_lock<std::shared_mutex> snapshot_lock(master_state_mutex_,
+                                                          std::defer_lock);
+        {
+            WriteIntent intent(state_write_intents_);
+            std::lock(snapshot_lock, client_lock);
+        }
         auto [record_it, record_inserted] =
             client_liveness_records_.try_emplace(
                 client_id, std::make_shared<ClientLivenessRecord>(
@@ -1073,7 +1139,6 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             MasterMetricManager::instance().on_client_liveness_record_removed(
                 ClientLivenessState::ACTIVE);
         };
-        std::unique_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
         for (const auto& segment : segments) {
             if (!segment.host_id.empty()) {
                 client_host_id_[client_id] = segment.host_id;
@@ -2372,17 +2437,21 @@ void MasterService::ClearInvalidHandles() {
     std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
     auto retaining_clients = GetRetainingClientIdsLocked();
     client_lock.unlock();
-    ClearInvalidHandles(retaining_clients);
+    SharedLockRelay relay(snapshot_lock, state_write_intents_);
+    ClearInvalidHandles(retaining_clients, &relay);
 }
 
 void MasterService::ClearInvalidHandles(
-    const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients) {
-    (void)ClearStaleHandles([&retaining_clients](const Replica& replica) {
-        return (replica.has_invalid_mem_handle() ||
-                replica.has_invalid_nof_handle() ||
-                replica.has_stale_local_disk_client(retaining_clients)) &&
-               replica.is_completed();
-    });
+    const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients,
+    SharedLockRelay* relay) {
+    (void)ClearStaleHandles(
+        [&retaining_clients](const Replica& replica) {
+            return (replica.has_invalid_mem_handle() ||
+                    replica.has_invalid_nof_handle() ||
+                    replica.has_stale_local_disk_client(retaining_clients)) &&
+                   replica.is_completed();
+        },
+        {}, relay);
 }
 
 void MasterService::ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
@@ -2393,75 +2462,161 @@ void MasterService::ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
 }
 
 tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
-    const std::function<bool(const Replica&)>& is_stale) {
+    const std::function<bool(const Replica&)>& is_stale,
+    const std::function<void(const ObjectMetadata&)>& observe,
+    SharedLockRelay* relay) {
     std::optional<ErrorCode> first_persist_error;
     VisitNamespaces([&](const TenantId& tenant_id, metadata::Namespace& ns) {
-        // Reader pre-check: an object with nothing to sweep never takes the
-        // write lock. Each picked object is classified again under its own
-        // write lock below, since it may have changed, and one torn down or
-        // published again meanwhile is left alone.
-        std::vector<route::ObjectRef> to_sweep;
-        for (auto object : ns.objects.ReadCursor()) {
-            const auto& metadata = object.metadata();
-            if (metadata.HasReplica(is_stale) || !metadata.IsValid()) {
-                to_sweep.push_back(object.ref());
+        // One stripe at a time, so that what is picked to sweep stays small
+        // after a mass client expiry, and so that the caller's hold of
+        // master_state_mutex_ can be given up between stripes.
+        for (size_t stripe = 0; stripe < route::ObjectRoute::kStripeCount;
+             ++stripe) {
+            // Reader pre-check: an object with nothing to sweep never takes the
+            // write lock. Each picked object is classified again under its own
+            // write lock below, since it may have changed, and one torn down or
+            // published again meanwhile is left alone.
+            std::vector<route::ObjectRef> to_sweep;
+            for (auto object : ns.objects.ReadCursor(stripe, stripe + 1)) {
+                const auto& metadata = object.metadata();
+                if (observe) {
+                    observe(metadata);
+                }
+                if (metadata.HasReplica(is_stale) || !metadata.IsValid()) {
+                    to_sweep.push_back(object.ref());
+                }
             }
-        }
-        for (const auto& object : to_sweep) {
-            // The by-reference accessor skips the invalid-replica cleanup,
-            // which would drop the stale replicas before this pass could see
-            // what it erased.
-            MetadataAccessorRW accessor(this, tenant_id, object);
-            if (!accessor.IsPublished()) {
-                continue;
-            }
-            auto& metadata = accessor.Get();
-            const auto cleanup_plan =
-                BuildStaleHandleCleanupPlan(metadata, is_stale);
-            if (!cleanup_plan.removed_ids.empty()) {
-                if (enable_ha_ && enable_oplog_) {
-                    // The erase runs from the durable-finalize callback.
-                    auto persist_result = PersistStaleHandleCleanupForHA(
-                        "ClearStaleHandles", tenant_id, object.key, metadata,
-                        cleanup_plan);
-                    if (!persist_result && !first_persist_error) {
-                        first_persist_error = persist_result.error();
-                    }
+            for (const auto& object : to_sweep) {
+                // The by-reference accessor skips the invalid-replica cleanup,
+                // which would drop the stale replicas before this pass could
+                // see what it erased.
+                MetadataAccessorRW accessor(this, tenant_id, object);
+                if (!accessor.IsPublished()) {
                     continue;
                 }
-                if (!CleanupStaleHandles(object.key, tenant_id, metadata,
-                                         accessor.GetState(), is_stale)) {
-                    continue;
-                }
-            } else if (metadata.IsValid()) {
-                continue;
-            } else if (enable_ha_) {
-                if (enable_oplog_) {
-                    auto persist_result = AppendOpLogWithDurableFinalize(
-                        OpType::REMOVE, tenant_id.value(), object.key, {},
-                        [this, object](const OpLogEntry& durable_entry) {
-                            FinalizeMetadataEraseAfterDurable(
-                                object, TenantId(durable_entry.tenant_id));
-                        });
-                    if (!persist_result) {
-                        LOG(WARNING)
-                            << "ClearStaleHandles(last replica)"
-                            << ": REMOVE persist failed for key=" << object.key
-                            << ", err="
-                            << static_cast<int>(persist_result.error());
-                        if (!first_persist_error) {
+                auto& metadata = accessor.Get();
+                const auto cleanup_plan =
+                    BuildStaleHandleCleanupPlan(metadata, is_stale);
+                if (!cleanup_plan.removed_ids.empty()) {
+                    if (enable_ha_ && enable_oplog_) {
+                        // The erase runs from the durable-finalize callback.
+                        auto persist_result = PersistStaleHandleCleanupForHA(
+                            "ClearStaleHandles", tenant_id, object.key,
+                            metadata, cleanup_plan);
+                        if (!persist_result && !first_persist_error) {
                             first_persist_error = persist_result.error();
                         }
+                        continue;
                     }
+                    if (!CleanupStaleHandles(object.key, tenant_id, metadata,
+                                             accessor.GetState(), is_stale)) {
+                        continue;
+                    }
+                } else if (metadata.IsValid()) {
+                    continue;
+                } else if (enable_ha_) {
+                    if (enable_oplog_) {
+                        auto persist_result = AppendOpLogWithDurableFinalize(
+                            OpType::REMOVE, tenant_id.value(), object.key, {},
+                            [this, object](const OpLogEntry& durable_entry) {
+                                FinalizeMetadataEraseAfterDurable(
+                                    object, TenantId(durable_entry.tenant_id));
+                            });
+                        if (!persist_result) {
+                            LOG(WARNING)
+                                << "ClearStaleHandles(last replica)"
+                                << ": REMOVE persist failed for key="
+                                << object.key << ", err="
+                                << static_cast<int>(persist_result.error());
+                            if (!first_persist_error) {
+                                first_persist_error = persist_result.error();
+                            }
+                        }
+                    }
+                    continue;
                 }
-                continue;
+                accessor.Erase();
             }
-            accessor.Erase();
+            if (relay != nullptr) {
+                // No key and no stripe is held here.
+                relay->Yield();
+            }
         }
     });
     if (first_persist_error) {
         return tl::make_unexpected(*first_persist_error);
     }
+    return {};
+}
+
+tl::expected<void, ErrorCode> MasterService::SweepOfflineClients(
+    const ClientOffboardingJob& job,
+    std::shared_lock<std::shared_mutex>& state_lock) {
+    // Jobs scheduled before this point had their segments taken out of
+    // service before the walk starts, so the walk sees everything they left.
+    const uint64_t covers_seq = client_offboarding_worker_.LastScheduledSeq();
+    const auto started = std::chrono::steady_clock::now();
+    // LOCAL_DISK replicas name their owner by id. client_mutex_ comes before
+    // master_state_mutex_, so the registry is read with the latter let go;
+    // nothing else is held here. A client retired after covers_seq was read
+    // may be missing from the set, and is not counted as swept either.
+    std::unordered_set<UUID, boost::hash<UUID>> offline_ids;
+    state_lock.unlock();
+    {
+        std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
+        for (const auto& [client_id, record] : client_liveness_records_) {
+            if (!record->ShouldRetainResources()) {
+                offline_ids.insert(client_id);
+            }
+        }
+    }
+    state_lock.lock();
+    SharedLockRelay relay(state_lock, state_write_intents_);
+    // What the job's own client left is swept whatever its state says, as it
+    // always was; the other clients' only once they are offline.
+    const auto owner_is_offline = [&offline_ids, &job](const Replica& replica) {
+        if (replica.is_local_disk_replica()) {
+            const auto owner = replica.get_local_disk_client_id();
+            return owner.has_value() &&
+                   (*owner == job.client_id || offline_ids.contains(*owner));
+        }
+        if (!replica.is_memory_replica()) {
+            return false;
+        }
+        const auto record = replica.getClientLiveness();
+        return record != nullptr &&
+               (record == job.liveness || !record->ShouldRetainResources());
+    };
+    std::unordered_set<const ClientLivenessRecord*> unfinished;
+    const auto result = ClearStaleHandles(
+        [&owner_is_offline](const Replica& replica) {
+            return replica.is_completed() && owner_is_offline(replica);
+        },
+        [&](const ObjectMetadata& metadata) {
+            // A replica still being written cannot be swept; its client's
+            // offboarding waits for it to finish or to be discarded.
+            (void)metadata.HasReplica([&](const Replica& replica) {
+                if (replica.is_processing() && owner_is_offline(replica)) {
+                    unfinished.insert(replica.getClientLiveness().get());
+                }
+                return false;
+            });
+        },
+        &relay);
+    if (!result) {
+        return result;
+    }
+    last_offline_sweep_.id += 1;
+    last_offline_sweep_.covers_seq = covers_seq;
+    last_offline_sweep_.unfinished = std::move(unfinished);
+    LOG(INFO) << "action=offline_client_sweep, sweep_id="
+              << last_offline_sweep_.id << ", covers_seq=" << covers_seq
+              << ", offline_clients=" << offline_ids.size()
+              << ", waiting_for_writes="
+              << last_offline_sweep_.unfinished.size() << ", duration_ms="
+              << std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - started)
+                     .count();
     return {};
 }
 
@@ -2471,6 +2626,9 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
         std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
 
         if (!job.pending_prepare_segments.empty()) {
+            // A sweep that started before these segments were taken out of
+            // service may have missed what was written to them since.
+            job.min_sweep_id = last_offline_sweep_.id + 1;
             ScopedSegmentAccess segment_access =
                 segment_manager_.getSegmentAccess();
             for (auto it = job.pending_prepare_segments.begin();
@@ -2516,42 +2674,27 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
         }
 
         if (!job.metadata_cleanup_accepted) {
-            const auto cleanup_result =
-                ClearStaleHandles([&job](const Replica& replica) {
-                    if (!replica.is_completed()) {
-                        return false;
-                    }
-                    if (replica.is_local_disk_replica()) {
-                        return replica.get_local_disk_client_id() ==
-                               job.client_id;
-                    }
-                    return replica.is_memory_replica() &&
-                           replica.isAffiliatedWith(job.liveness);
-                });
-            if (!cleanup_result) {
-                LOG(ERROR) << "client_id=" << job.client_id
-                           << ", action=queue_client_offboarding_metadata"
-                           << ", error=" << toString(cleanup_result.error());
-                return false;
+            // One sweep serves every client that was offline, with its
+            // segments out of service, when the sweep started: clients
+            // retired together do not walk the metadata once each.
+            const bool swept =
+                job.scheduled_seq != 0 && last_offline_sweep_.id > 0 &&
+                last_offline_sweep_.id >= job.min_sweep_id &&
+                last_offline_sweep_.covers_seq >= job.scheduled_seq;
+            if (!swept) {
+                const auto cleanup_result =
+                    SweepOfflineClients(job, snapshot_lock);
+                if (!cleanup_result) {
+                    LOG(ERROR)
+                        << "client_id=" << job.client_id
+                        << ", action=queue_client_offboarding_metadata"
+                        << ", error=" << toString(cleanup_result.error());
+                    return false;
+                }
             }
-            bool unfinished_affiliated_replica = false;
-            VisitNamespaces([&](const TenantId& /*tenant_id*/,
-                                metadata::Namespace& ns) {
-                if (unfinished_affiliated_replica) {
-                    return;
-                }
-                for (auto object : ns.objects.ReadCursor()) {
-                    if (object.metadata().HasReplica(
-                            [&job](const Replica& replica) {
-                                return replica.is_processing() &&
-                                       replica.isAffiliatedWith(job.liveness);
-                            })) {
-                        unfinished_affiliated_replica = true;
-                        break;
-                    }
-                }
-            });
-            if (unfinished_affiliated_replica) {
+            if (last_offline_sweep_.unfinished.contains(job.liveness.get())) {
+                // Whatever is still being written is seen by the next sweep.
+                job.min_sweep_id = last_offline_sweep_.id + 1;
                 LOG(ERROR)
                     << "client_id=" << job.client_id
                     << ", action=wait_client_offboarding_processing_replica";
@@ -2720,7 +2863,8 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     if (enable_async_segment_cleanup_) {
         replica_cleanup_worker_.Schedule();
     } else {
-        ClearInvalidHandles(retaining_clients);
+        SharedLockRelay relay(shared_lock, state_write_intents_);
+        ClearInvalidHandles(retaining_clients, &relay);
     }
 
     // Cache endpoint before commit removes segment from registry.
@@ -7990,11 +8134,12 @@ size_t MasterService::GetKeyCount() const {
 auto MasterService::Ping(const UUID& client_id)
     -> tl::expected<PingResponse, ErrorCode> {
     std::shared_lock<std::shared_mutex> lock(client_mutex_);
+    const auto now = ClientLivenessRecord::Clock::now();
+    liveness_blackout_guard_.NoteHeartbeat(now);
     const auto record_it = client_liveness_records_.find(client_id);
     bool observation_accepted = false;
     if (record_it != client_liveness_records_.end()) {
-        const auto observation =
-            record_it->second->Observe(ClientLivenessRecord::Clock::now());
+        const auto observation = record_it->second->Observe(now);
         observation_accepted =
             observation != ClientLivenessObservation::REJECTED_OFFLINE;
         if (observation == ClientLivenessObservation::RECOVERED_ACTIVE) {
@@ -9864,10 +10009,56 @@ void MasterService::BatchEvict(double evict_ratio_target,
             DiscardExpiredProcessingReplicas(ns, now);
         });
     const uint64_t released_discarded = ReleaseExpiredDiscardedReplicas(now);
-    const eviction::Report report = memory_eviction_->evictor.Run(
-        eviction::Scope::All(),
-        eviction::ObjectGoal{.target_ratio = evict_ratio_target,
-                             .min_ratio = evict_ratio_lowerbound});
+
+    // A round frees a share of every object, which on a large pool takes
+    // minutes. It is run in slices of about kEvictionSliceObjects, with the
+    // hold of master_state_mutex_ given up in between, so that a writer of
+    // that lock waits for one slice. A round too small to slice is one run,
+    // as before.
+    uint64_t objects = 0;
+    VisitNamespaces(
+        [&objects](const TenantId& /*tenant_id*/, metadata::Namespace& ns) {
+            objects += ns.objects.ObjectCount();
+        });
+    const double round_objects =
+        static_cast<double>(objects) * std::max(evict_ratio_target, 0.0);
+    const uint64_t slices =
+        round_objects > static_cast<double>(kEvictionSliceObjects)
+            ? static_cast<uint64_t>(
+                  std::ceil(round_objects / kEvictionSliceObjects))
+            : 1;
+    SharedLockRelay relay(shared_lock, state_write_intents_);
+    eviction::Report report;
+    double min_left = std::min(evict_ratio_lowerbound, evict_ratio_target);
+    for (uint64_t slice = 0; slice < slices; ++slice) {
+        if (slice > 0) {
+            relay.Yield();
+        }
+        const double slice_target =
+            evict_ratio_target / static_cast<double>(slices);
+        const double slice_min = std::min(min_left, slice_target);
+        min_left -= slice_min;
+        const eviction::Report part = memory_eviction_->evictor.Run(
+            eviction::Scope::All(),
+            eviction::ObjectGoal{.target_ratio = slice_target,
+                                 .min_ratio = slice_min});
+        if (slice == 0) {
+            report.filed = part.filed;
+        }
+        report.evicted_objects += part.evicted_objects;
+        report.released_bytes += part.released_bytes;
+        report.offload_bytes += part.offload_bytes;
+        for (size_t i = 0; i < report.outcomes.size(); ++i) {
+            report.outcomes[i] += part.outcomes[i];
+        }
+        report.offload_cap_drops += part.offload_cap_drops;
+        report.offload_rejected_drops += part.offload_rejected_drops;
+        report.stopped = part.stopped;
+        if (part.stopped || !part.MadeProgress()) {
+            // An OpLog write failed, or nothing more qualifies.
+            break;
+        }
+    }
     const bool made_progress = report.MadeProgress() || released_discarded > 0;
     if (allocation_pressure && !report.stopped && !made_progress &&
         report.filed > 0) {
@@ -10049,7 +10240,6 @@ void MasterService::ClientMonitorFunc() {
             continue;
         }
 
-        const auto now = ClientLivenessRecord::Clock::now();
         std::vector<std::pair<UUID, std::shared_ptr<ClientLivenessRecord>>>
             clients;
         {
@@ -10057,6 +10247,28 @@ void MasterService::ClientMonitorFunc() {
             clients.reserve(client_liveness_records_.size());
             for (const auto& entry : client_liveness_records_) {
                 clients.push_back(entry);
+            }
+        }
+        // Read after client_mutex_ is held: time spent waiting for it is
+        // time no Ping was answered either.
+        const auto now = ClientLivenessRecord::Clock::now();
+        const size_t judged = static_cast<size_t>(std::count_if(
+            clients.begin(), clients.end(), [](const auto& entry) {
+                return entry.second->ShouldRetainResources();
+            }));
+        const auto verdict = liveness_blackout_guard_.OnTick(now, judged);
+        if (verdict == LivenessBlackoutGuard::Verdict::kSkip) {
+            LOG_EVERY_N(WARNING, 10)
+                << "action=client_liveness_blackout, clients=" << judged;
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kClientMonitorSleepMs));
+            continue;
+        }
+        if (verdict == LivenessBlackoutGuard::Verdict::kGraceThenEvaluate) {
+            LOG(WARNING) << "action=client_liveness_blackout_over, clients="
+                         << judged;
+            for (const auto& entry : clients) {
+                entry.second->GrantGrace(now);
             }
         }
 

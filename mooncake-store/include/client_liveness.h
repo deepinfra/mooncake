@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <mutex>
@@ -122,6 +123,23 @@ class ClientLivenessRecord {
         TimePoint now, Clock::duration active_ttl,
         Clock::duration suspicion_ttl) {
         return EvaluateAndRetire(now, active_ttl, suspicion_ttl, [] {});
+    }
+
+    // The master was not hearing its clients until `now` (see
+    // liveness_blackout_guard.h): the client's active or suspicion window is
+    // counted from here. An offline client stays offline.
+    void GrantGrace(TimePoint now) {
+        std::lock_guard<std::mutex> lock(transition_mutex_);
+        switch (state_.load(std::memory_order_relaxed)) {
+            case ClientLivenessState::ACTIVE:
+                last_liveness_at_ = std::max(last_liveness_at_, now);
+                break;
+            case ClientLivenessState::SUSPECTED:
+                suspected_since_ = std::max(suspected_since_, now);
+                break;
+            case ClientLivenessState::OFFLINE:
+                break;
+        }
     }
 
     template <typename RetireOperation>
