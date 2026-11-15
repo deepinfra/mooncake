@@ -1075,8 +1075,26 @@ class MasterService {
                                                  const std::string& key);
     void FollowerSegmentMount(const SegmentMountOp& op);
     void FollowerSegmentUnmount(const SegmentUnmountOp& op);
+    // Drops every followed object and segment, before a new baseline.
+    void FollowerClear();
+    // Turns the followed index into the leader's, without visiting objects:
+    // takes the OpLog with a fenced writer for `view_version` at `applied`
+    // (which must be the durable prefix), and leaves what a restore would.
+    // Ends in kReady; on failure in kFailed, and the process should restart.
+    tl::expected<void, ErrorCode> ActivateFollower(
+        ViewVersionId view_version, const DurablePrefix& applied,
+        const std::vector<StandbySegmentInfo>& segments,
+        const WeightMetadataSnapshot& weights);
     std::vector<StandbySegmentInfo> FollowerSegments() const;
     ReplicaID FollowerMaxReplicaId() const;
+    std::optional<StandbyObjectMetadata> FollowerGet(
+        const std::string& tenant_id, const std::string& key);
+    size_t FollowerKeyCount(const std::string& tenant_id) const;
+    // A walk over the followed objects in chunks, as a snapshot capture
+    // makes. Apply must stay paused for the walk, as it is today.
+    FollowerTraversalCursor FollowerBeginTraversal() const;
+    bool FollowerCopyNextChunk(size_t count, FollowerTraversalCursor& cursor,
+                               std::vector<StandbyObjectEntry>& out) const;
     // Restored replicas dropped because a later entry claimed their bytes,
     // and entries dropped as malformed.
     uint64_t FollowerOrphanedReplicas() const;
@@ -1459,9 +1477,9 @@ class MasterService {
     // Returns why a remove may not take the object, or nothing if it may: its
     // lease is still held (unless `force`), a replica is incomplete, or a
     // replication task reads it.
-    static tl::expected<void, ErrorCode> CheckRemovable(
+    tl::expected<void, ErrorCode> CheckRemovable(
         const ObjectMetadata& metadata, const route::ObjectState& state,
-        bool force, std::chrono::system_clock::time_point now);
+        bool force, std::chrono::system_clock::time_point now) const;
     struct RemoveResult {
         long removed_count{0};
         int64_t freed_bytes{0};
@@ -1716,6 +1734,16 @@ class MasterService {
     // Eviction thread related members
     std::thread eviction_thread_;
     std::atomic<bool> eviction_running_{false};
+    // A reader of the previous term may hold a lease this index never saw.
+    // After an activation every object counts as leased until the floor,
+    // and memory eviction waits for it.
+    bool InheritedLeaseHeld(std::chrono::system_clock::time_point now) const;
+    bool LeaseExpired(const ObjectMetadata& metadata,
+                      std::chrono::system_clock::time_point now) const;
+    bool LeaseExpired(const ObjectMetadata& metadata) const;
+    bool MemoryEvictionPaused() const;
+    std::atomic<int64_t> inherited_lease_floor_ms_{0};
+
     static constexpr auto kOpLogForegroundReserveWait =
         std::chrono::milliseconds(100);
     static constexpr auto kOpLogBackgroundReserveWait =
@@ -2464,6 +2492,9 @@ class MasterService {
         std::optional<UUID> segment_id;
     };
     bool follower_mode_{false};
+    std::optional<KvEventConfig> follower_kv_event_config_;
+    std::string follower_ha_backend_type_;
+    std::string follower_ha_backend_connstring_;
     mutable std::mutex follower_mutex_;
     std::unordered_map<std::string, FollowerSegment> follower_segments_;
     std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,

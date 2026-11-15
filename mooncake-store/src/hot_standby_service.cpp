@@ -20,7 +20,7 @@ namespace mooncake {
 
 HotStandbyService::HotStandbyService(const HotStandbyConfig& config)
     : config_(config) {
-    metadata_store_ = std::make_unique<StandbyMetadataStore>();
+    metadata_store_ = MakeMetadataStore();
     // OpLogApplier is re-created in Start() with the resolved cluster_id.
     oplog_applier_ = std::make_unique<OpLogApplier>(metadata_store_.get());
 
@@ -85,7 +85,7 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
         verification_thread_.join();
     }
     if (!metadata_store_) {
-        metadata_store_ = std::make_unique<StandbyMetadataStore>();
+        metadata_store_ = MakeMetadataStore();
     }
     const bool preserve_baseline = preserve_promotion_baseline_;
     batch_standby_reader_.reset();
@@ -182,7 +182,7 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
         LOG(WARNING)
             << "Discarding local metadata without recoverable sequence "
             << "boundary before standby bootstrap";
-        metadata_store_ = std::make_unique<StandbyMetadataStore>();
+        metadata_store_ = MakeMetadataStore();
     }
 
     oplog_applier_ =
@@ -242,7 +242,7 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
 ErrorCode HotStandbyService::LoadBatchOpLogSnapshotBaselineLocked(
     uint64_t& baseline_seq_id) {
     baseline_seq_id = 0;
-    auto temporary_metadata = std::make_unique<StandbyMetadataStore>();
+    auto temporary_metadata = MakeMetadataStore();
     auto temporary_applier =
         std::make_unique<OpLogApplier>(temporary_metadata.get(), cluster_id_);
     StandbySegmentRegistry temporary_registry;
@@ -457,6 +457,22 @@ StandbySyncStatus HotStandbyService::GetSyncStatus() const {
     status.is_syncing = IsRunning() && IsConnected();
 
     return status;
+}
+
+std::unique_ptr<StandbyMetadataStore> HotStandbyService::MakeMetadataStore()
+    const {
+    if (follower_index_factory_) {
+        return std::make_unique<StandbyMetadataStore>(
+            follower_index_factory_());
+    }
+    return std::make_unique<StandbyMetadataStore>();
+}
+
+void HotStandbyService::SetFollowerIndexFactory(FollowerIndexFactory factory) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    follower_index_factory_ = std::move(factory);
+    metadata_store_ = MakeMetadataStore();
+    oplog_applier_ = std::make_unique<OpLogApplier>(metadata_store_.get());
 }
 
 bool HotStandbyService::IsSnapshotCaptureActive() const {
@@ -1098,7 +1114,7 @@ ErrorCode HotStandbyService::RebootstrapBatchOpLog(uint64_t floor) {
     }
     if (!provider) return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
 
-    auto metadata = std::make_unique<StandbyMetadataStore>();
+    auto metadata = MakeMetadataStore();
     auto applier = std::make_unique<OpLogApplier>(metadata.get(), cluster_id_);
     StandbySegmentRegistry registry;
     auto restored = provider->RestoreBaseline(

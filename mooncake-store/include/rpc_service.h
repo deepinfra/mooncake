@@ -436,6 +436,9 @@ class WrappedMasterService {
     bool KvEventsEnabled() const;
     KvEventPublisher::Stats GetKvEventStats() const;
 
+    // For the standby, which applies the OpLog into a follower-mode service.
+    MasterService& master_service() { return master_service_; }
+
    private:
     MasterService master_service_;
 };

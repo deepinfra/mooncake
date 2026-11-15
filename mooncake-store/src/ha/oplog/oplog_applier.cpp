@@ -531,6 +531,7 @@ void OpLogApplier::ApplySegmentMount(const OpLogEntry& entry) {
     info.is_memory_segment = op.is_memory_segment;
     info.file_path = op.file_path;
     segment_registry_.OnSegmentMount(info);
+    metadata_store_->OnSegmentMount(op);
 }
 
 void OpLogApplier::ApplySegmentUnmount(const OpLogEntry& entry) {
@@ -542,6 +543,7 @@ void OpLogApplier::ApplySegmentUnmount(const OpLogEntry& entry) {
         return;
     }
     segment_registry_.OnSegmentUnmount(op.transport_endpoint);
+    metadata_store_->OnSegmentUnmount(op);
 }
 
 void OpLogApplier::ApplySegmentUpdate(const OpLogEntry& entry) {

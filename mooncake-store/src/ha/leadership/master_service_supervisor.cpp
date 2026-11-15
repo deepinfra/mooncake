@@ -758,9 +758,17 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         // Keep the gate alive until after the service is destroyed because the
         // OpLog writer owned by the service invokes a callback that uses it.
         detail::ServingStateGate serving_state;
-        auto wrapped_master_service = std::make_shared<WrappedMasterService>(
-            wrapped_config, config.http_metadata_server,
-            config.http_metadata_remote_url);
+        // A serving-index standby hands over the index it followed; that
+        // service becomes the leader's, activated rather than restored.
+        const std::shared_ptr<WrappedMasterService> follower_index =
+            promotion_ctx->metadata_store
+                ? promotion_ctx->metadata_store->FollowerIndex()
+                : nullptr;
+        auto wrapped_master_service =
+            follower_index ? follower_index
+                           : std::make_shared<WrappedMasterService>(
+                                 wrapped_config, config.http_metadata_server,
+                                 config.http_metadata_remote_url);
         // Runs the term's handlers once they are registered. It drains before
         // the service goes, so release the service through release_service.
         std::unique_ptr<RpcWorkerPool> worker_pool;
@@ -791,7 +799,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             worker_pool.reset();
             wrapped_master_service.reset();
         };
-        wrapped_master_service->SetBatchOpLogTerminalCallback(
+        const auto on_writer_terminal =
             [&](const OrderedOpLogWriterTerminalState& state) {
                 serving_state.RequestShutdown([&]() {
                     LOG(ERROR) << "Batch OpLog writer terminal: "
@@ -800,7 +808,38 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                     SetRuntimeState(admin_server, MasterRuntimeState::kStandby);
                     server.stop();
                 });
-            });
+            };
+        wrapped_master_service->SetBatchOpLogTerminalCallback(
+            on_writer_terminal);
+
+        if (follower_index) {
+            SetRuntimeState(admin_server, MasterRuntimeState::kRecovering);
+            const auto activate_start = std::chrono::steady_clock::now();
+            auto activated = follower_index->master_service().ActivateFollower(
+                leadership_session->view.view_version,
+                promotion_ctx->applied_cursor, promotion_ctx->segments,
+                promotion_ctx->metadata_store->SnapshotWeightMetadata());
+            if (!activated) {
+                // A half-activated index cannot go back to following: let the
+                // process restart as a cold follower.
+                LOG(ERROR) << "Follower activation failed: "
+                           << toString(activated.error());
+                std::unique_ptr<LeadershipMonitorHandle> no_monitor;
+                stop_term_resources(no_monitor);
+                release_term("activation");
+                return -1;
+            }
+            // The writer exists only now; give it the terminal callback.
+            wrapped_master_service->SetBatchOpLogTerminalCallback(
+                on_writer_terminal);
+            // An activated index never goes back to following: a later
+            // return to standby bootstraps a fresh follower instead.
+            promotion_ctx->metadata_store.reset();
+            LOG(INFO) << "action=activate_follower, elapsed_ms="
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - activate_start)
+                             .count();
+        }
 
         // Restore is the serving gate: do not register or expose a candidate
         // service until the complete promotion context has been applied.
@@ -808,7 +847,8 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         // or a later lease loss can still resume from the applied cursor.
         SetRuntimeState(admin_server, MasterRuntimeState::kRecovering);
         auto restore_result =
-            promotion_ctx->metadata_store
+            follower_index ? tl::expected<void, ErrorCode>{}
+            : promotion_ctx->metadata_store
                 ? wrapped_master_service->RestoreFromBatchOpLogPromotion(
                       *promotion_ctx->metadata_store,
                       promotion_ctx->applied_cursor, promotion_ctx->segments,

@@ -2897,6 +2897,26 @@ TEST_F(MasterServiceHATest, RemountSkipsReplicasRemovedSinceRestore) {
         ReplicaCountForTesting(service, kDefaultTenant, "remount_removed"), 0);
 }
 
+// A follower whose activation takes the OpLog in a fresh SQLite file.
+static MasterServiceConfig SqliteFollowerConfig(const std::string& path) {
+    return MasterServiceConfig::builder()
+        .set_enable_ha(true)
+        .set_enable_oplog(true)
+        .set_cluster_id("follower_activation")
+        .set_ha_backend_type("sqlite")
+        .set_ha_backend_connstring(path)
+        .set_default_kv_lease_ttl(10000)
+        .set_follower_mode(true)
+        .build();
+}
+
+static std::string FreshSqlitePath(const std::string& name) {
+    const auto path = std::filesystem::temp_directory_path() /
+                      (name + "_" + std::to_string(::getpid()) + ".db");
+    std::filesystem::remove(path);
+    return path.string();
+}
+
 // The follower index (config.follower_mode) applies the leader's OpLog.
 class MasterServiceFollowerTest : public MasterServiceHATest {
    protected:
@@ -3064,6 +3084,21 @@ TEST_F(MasterServiceFollowerTest, DISABLED_ApplyRate) {
     }
     rate("follower remove", kObjects, start);
 
+    {
+        MasterService activated(
+            SqliteFollowerConfig(FreshSqlitePath("follower_rate_activation")));
+        for (size_t i = 0; i < kObjects; ++i) {
+            ASSERT_TRUE(activated.FollowerPut("default", key(i), objects[i]));
+        }
+        start = std::chrono::steady_clock::now();
+        ASSERT_TRUE(activated.ActivateFollower(1, DurablePrefix{}, {}, {}));
+        std::cout << "activation with " << kObjects << " objects: "
+                  << std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << " ms" << std::endl;
+    }
+
     // What the follower pays per entry before the store: the batch record
     // decode and the payload decode.
     OpLogBatchRecord batch;
@@ -3170,6 +3205,51 @@ TEST_F(MasterServiceFollowerTest, DISABLED_ApplyRate) {
         ASSERT_TRUE(store.Remove("default", key(i)));
     }
     rate("standby store remove", kObjects, start);
+}
+
+TEST_F(MasterServiceFollowerTest, AnActivatedFollowerServesAfterRemount) {
+    MasterService service(
+        SqliteFollowerConfig(FreshSqlitePath("follower_activation")));
+    const std::string endpoint = "follower_activation_endpoint";
+    service.FollowerSegmentMount(MountOf(endpoint, {1, 1}));
+    ASSERT_TRUE(service
+                    .FollowerPut("default", "key",
+                                 ObjectAt(endpoint, kDefaultSegmentBase + 4096))
+                    .has_value());
+
+    ASSERT_TRUE(service.ActivateFollower(1, DurablePrefix{}, {}, {}));
+    EXPECT_EQ(service.GetRestoreLifecycleState(),
+              MasterService::RestoreLifecycleState::kReady);
+    EXPECT_TRUE(HasOpLogWriter(service));
+    auto before = service.GetReplicaList("key", kDefaultTenant);
+    ASSERT_FALSE(before.has_value());
+    EXPECT_EQ(before.error(), ErrorCode::REPLICA_IS_NOT_READY);
+
+    ASSERT_TRUE(service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid())
+                    .has_value());
+    auto after = service.GetReplicaList("key", kDefaultTenant);
+    ASSERT_TRUE(after.has_value()) << toString(after.error());
+    EXPECT_EQ(after->replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.buffer_address_,
+              kDefaultSegmentBase + 4096);
+    // A reader of the old leader may still hold a lease on these bytes.
+    auto removed = service.Remove("key", kDefaultTenant);
+    ASSERT_FALSE(removed.has_value());
+    EXPECT_EQ(removed.error(), ErrorCode::OBJECT_HAS_LEASE);
+    EXPECT_FALSE(service.FollowerPut("default", "late",
+                                     ObjectAt(endpoint, kDefaultSegmentBase)));
+}
+
+TEST_F(MasterServiceFollowerTest, ActivationRefusesAFollowerBehindTheLog) {
+    MasterService service(
+        SqliteFollowerConfig(FreshSqlitePath("follower_behind")));
+    auto activated = service.ActivateFollower(
+        1, DurablePrefix{.batch_id = 3, .last_seq = 40}, {}, {});
+    ASSERT_FALSE(activated.has_value());
+    EXPECT_EQ(activated.error(), ErrorCode::INCOMPLETE_OPLOG_CATCH_UP);
+    EXPECT_EQ(service.GetRestoreLifecycleState(),
+              MasterService::RestoreLifecycleState::kFailed);
 }
 
 TEST_F(MasterServiceFollowerTest, AServingIndexRefusesFollowerApply) {

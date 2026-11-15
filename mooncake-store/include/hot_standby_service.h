@@ -27,6 +27,7 @@ namespace mooncake {
 
 // Forward declarations
 class MasterService;
+class WrappedMasterService;
 class HaKvBackend;
 class OpLogBatchStandbyReader;
 enum class OpLogBatchStandbyPollDisposition;
@@ -211,6 +212,13 @@ class HotStandbyService {
     void SetBatchOpLogSnapshotProvider(
         std::unique_ptr<BatchOpLogSnapshotProvider> provider);
 
+    // Serving mode: every store the standby makes from now on keeps its
+    // objects in a fresh follower index from `factory`, which promotion
+    // activates instead of copying. Set before Start().
+    using FollowerIndexFactory =
+        std::function<std::shared_ptr<WrappedMasterService>()>;
+    void SetFollowerIndexFactory(FollowerIndexFactory factory);
+
     // Notify callers when standby sync status changes. The callback is invoked
     // from existing standby worker threads; no extra monitor thread is created.
     void SetSyncStatusCallback(SyncStatusCallback callback);
@@ -321,6 +329,9 @@ class HotStandbyService {
     std::condition_variable replication_loop_cv_;
     mutable std::mutex batch_snapshot_cursor_mutex_;
     std::optional<DurablePrefix> last_applied_batch_snapshot_prefix_;
+
+    std::unique_ptr<StandbyMetadataStore> MakeMetadataStore() const;
+    FollowerIndexFactory follower_index_factory_;
 
     std::shared_ptr<BatchOpLogSnapshotCapture::LeaseState>
         snapshot_capture_state_{

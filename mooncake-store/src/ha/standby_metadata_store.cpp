@@ -1,14 +1,39 @@
 #include "ha/standby_metadata_store.h"
 
 #include <algorithm>
+#include <iterator>
 #include <limits>
 #include <unordered_set>
 
+#include "ha/oplog/oplog_types.h"
+#include "rpc_service.h"
+
 namespace mooncake {
+
+StandbyMetadataStore::StandbyMetadataStore(
+    std::shared_ptr<WrappedMasterService> follower)
+    : follower_(std::move(follower)) {}
+
+void StandbyMetadataStore::OnSegmentMount(const SegmentMountOp& op) {
+    if (follower_) {
+        follower_->master_service().FollowerSegmentMount(op);
+    }
+}
+
+void StandbyMetadataStore::OnSegmentUnmount(const SegmentUnmountOp& op) {
+    if (follower_) {
+        follower_->master_service().FollowerSegmentUnmount(op);
+    }
+}
 
 bool StandbyMetadataStore::PutMetadata(const std::string& tenant_id,
                                        const std::string& key,
                                        const StandbyObjectMetadata& metadata) {
+    if (follower_) {
+        return follower_->master_service()
+            .FollowerPut(tenant_id, key, metadata)
+            .has_value();
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     store_[NormalizeTenantId(tenant_id)][key] = metadata;
     return true;
@@ -17,6 +42,12 @@ bool StandbyMetadataStore::PutMetadata(const std::string& tenant_id,
 bool StandbyMetadataStore::RestoreMetadata(
     const std::string& tenant_id, const std::string& key,
     const StandbyObjectMetadata& metadata) {
+    if (follower_) {
+        if (Exists(tenant_id, key)) {
+            return false;
+        }
+        return PutMetadata(tenant_id, key, metadata);
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     return store_[NormalizeTenantId(tenant_id)].emplace(key, metadata).second;
 }
@@ -29,6 +60,9 @@ bool StandbyMetadataStore::Put(const std::string& key,
 
 std::optional<StandbyObjectMetadata> StandbyMetadataStore::GetMetadata(
     const std::string& tenant_id, const std::string& key) const {
+    if (follower_) {
+        return follower_->master_service().FollowerGet(tenant_id, key);
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     auto tenant = store_.find(NormalizeTenantId(tenant_id));
     if (tenant == store_.end()) {
@@ -42,6 +76,13 @@ std::optional<StandbyObjectMetadata> StandbyMetadataStore::GetMetadata(
 
 bool StandbyMetadataStore::Remove(const std::string& tenant_id,
                                   const std::string& key) {
+    if (follower_) {
+        const bool existed = Exists(tenant_id, key);
+        return follower_->master_service()
+                   .FollowerRemove(tenant_id, key)
+                   .has_value() &&
+               existed;
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     auto tenant = store_.find(NormalizeTenantId(tenant_id));
     if (tenant == store_.end() || tenant->second.erase(key) == 0) {
@@ -55,6 +96,11 @@ bool StandbyMetadataStore::Remove(const std::string& tenant_id,
 
 bool StandbyMetadataStore::Exists(const std::string& tenant_id,
                                   const std::string& key) const {
+    if (follower_) {
+        return follower_->master_service()
+            .FollowerGet(tenant_id, key)
+            .has_value();
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     auto tenant = store_.find(NormalizeTenantId(tenant_id));
     return tenant != store_.end() && tenant->second.contains(key);
@@ -62,12 +108,19 @@ bool StandbyMetadataStore::Exists(const std::string& tenant_id,
 
 size_t StandbyMetadataStore::GetKeyCountForTenant(
     const std::string& tenant_id) const {
+    if (follower_) {
+        return follower_->master_service().FollowerKeyCount(
+            NormalizeTenantId(tenant_id));
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     auto tenant = store_.find(NormalizeTenantId(tenant_id));
     return tenant == store_.end() ? 0 : tenant->second.size();
 }
 
 size_t StandbyMetadataStore::GetKeyCount() const {
+    if (follower_) {
+        return follower_->master_service().GetKeyCount();
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     size_t count = 0;
     for (const auto& [tenant_id, objects] : store_) {
@@ -78,6 +131,9 @@ size_t StandbyMetadataStore::GetKeyCount() const {
 }
 
 void StandbyMetadataStore::Clear() {
+    if (follower_) {
+        follower_->master_service().FollowerClear();
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     store_.clear();
     weight_metadata_.clear();
@@ -274,6 +330,17 @@ WeightMetadataSnapshot StandbyMetadataStore::SnapshotWeightMetadata() const {
 
 void StandbyMetadataStore::Snapshot(
     std::vector<StandbyObjectEntry>& out) const {
+    if (follower_) {
+        out.clear();
+        auto& service = follower_->master_service();
+        auto cursor = service.FollowerBeginTraversal();
+        std::vector<StandbyObjectEntry> chunk;
+        do {
+            service.FollowerCopyNextChunk(4096, cursor, chunk);
+            std::move(chunk.begin(), chunk.end(), std::back_inserter(out));
+        } while (!chunk.empty());
+        return;
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     out.clear();
     for (const auto& [tenant_id, objects] : store_) {
@@ -284,6 +351,11 @@ void StandbyMetadataStore::Snapshot(
 }
 
 bool StandbyMetadataStore::ValidateReplicaIds(ReplicaID& max_replica_id) const {
+    if (follower_) {
+        // The follower checked each entry's replica ids as it applied it.
+        max_replica_id = follower_->master_service().FollowerMaxReplicaId();
+        return true;
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     max_replica_id = 0;
     for (const auto& [tenant_id, objects] : store_) {
@@ -307,7 +379,7 @@ bool StandbyMetadataStore::ValidateReplicaIds(ReplicaID& max_replica_id) const {
 bool StandbyMetadataStore::DrainChunk(size_t count,
                                       std::vector<StandbyObjectEntry>& out) {
     out.clear();
-    if (count == 0) {
+    if (count == 0 || follower_) {
         return false;
     }
 
@@ -327,6 +399,10 @@ bool StandbyMetadataStore::DrainChunk(size_t count,
 
 StandbyMetadataStore::SnapshotCursor
 StandbyMetadataStore::BeginSnapshotTraversal() const {
+    if (follower_) {
+        return SnapshotCursor(
+            this, follower_->master_service().FollowerBeginTraversal());
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     auto tenant = store_.cbegin();
     const bool done = tenant == store_.cend();
@@ -341,6 +417,15 @@ bool StandbyMetadataStore::CopyNextSnapshotChunk(
     out.clear();
     if (count == 0 || cursor.store_ != this) {
         return false;
+    }
+    if (cursor.follower_) {
+        if (!follower_ || !follower_->master_service().FollowerCopyNextChunk(
+                              count, *cursor.follower_, out)) {
+            return false;
+        }
+        cursor.done_ =
+            cursor.follower_->tenant >= cursor.follower_->tenants.size();
+        return true;
     }
 
     std::lock_guard<std::mutex> lock(mutex_);

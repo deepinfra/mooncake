@@ -11,6 +11,7 @@
 #include "ha/common/sqlite/sqlite_ha_store.h"
 #include "ha/kv/etcd_ha_kv_backend.h"
 #include "ha/kv/ha_kv_backend_factory.h"
+#include "rpc_service.h"
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_coordinator.h"
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
 #include "ha/snapshot/batch_oplog/metadata.h"
@@ -191,6 +192,16 @@ class CapabilityDrivenStandbyController final : public StandbyController {
             oplog_connstring_ = config_.ha_backend_connstring.empty()
                                     ? config_.etcd_endpoints
                                     : config_.ha_backend_connstring;
+        }
+        if (config_.standby_serving_index &&
+            capabilities_.has_oplog_following && config_.enable_oplog) {
+            // Each standby store follows into a service built from the very
+            // config the leader serves with; promotion activates it.
+            standby_service_->SetFollowerIndexFactory([config = config_] {
+                WrappedMasterServiceConfig follower_config(config, 0);
+                follower_config.follower_mode = true;
+                return std::make_shared<WrappedMasterService>(follower_config);
+            });
         }
 
         standby_service_->SetSyncStatusCallback(

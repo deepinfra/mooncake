@@ -668,8 +668,15 @@ MasterService::MasterService(const MasterServiceConfig& config)
                                std::memory_order_release);
     }
     InitDfsAllocatorFromEnvironment(config);
-    kv_event_publisher_ =
-        std::make_unique<KvEventPublisher>(BuildKvEventConfig(config));
+    if (follower_mode_) {
+        // A follower publishes nothing; it starts publishing on activation.
+        follower_kv_event_config_ = BuildKvEventConfig(config);
+        follower_ha_backend_type_ = config.ha_backend_type;
+        follower_ha_backend_connstring_ = config.ha_backend_connstring;
+    } else {
+        kv_event_publisher_ =
+            std::make_unique<KvEventPublisher>(BuildKvEventConfig(config));
+    }
     kv_track_tenant_epochs_ = KvEventsEnabled();
 
     if (enable_oplog_ && !cluster_id_.empty() && !follower_mode_) {
@@ -1691,7 +1698,7 @@ void MasterService::EvictManagedWeightMembersToCold(
                 return !replica.is_memory_replica() &&
                        IsReplicaReadable(replica);
             });
-        if (!has_cold || !metadata.IsLeaseExpired(now) ||
+        if (!has_cold || !LeaseExpired(metadata, now) ||
             IsSoftPinActive(metadata, now)) {
             continue;
         }
@@ -4427,7 +4434,7 @@ auto MasterService::BatchReplicaClear(
         }
 
         // Safety check: Do not clear an object that has an active lease.
-        if (!metadata.IsLeaseExpired()) {
+        if (!LeaseExpired(metadata)) {
             LOG(WARNING) << "BatchReplicaClear: tenant=" << normalized_tenant
                          << " key=" << key << " has active lease, skipping";
             continue;
@@ -6220,7 +6227,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     }
                 }
 
-                const bool has_read_lease = !metadata.IsLeaseExpired(now);
+                const bool has_read_lease = !LeaseExpired(metadata, now);
                 if (has_read_lease &&
                     metadata.HasReplica([](const Replica& replica) {
                         return !replica.is_memory_replica();
@@ -7479,8 +7486,8 @@ tl::expected<void, ErrorCode> MasterService::MarkRemovedAndPersist(
 
 tl::expected<void, ErrorCode> MasterService::CheckRemovable(
     const ObjectMetadata& metadata, const route::ObjectState& state, bool force,
-    std::chrono::system_clock::time_point now) {
-    if (!force && !metadata.IsLeaseExpired(now)) {
+    std::chrono::system_clock::time_point now) const {
+    if (!force && !LeaseExpired(metadata, now)) {
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
     }
     /**
@@ -7927,7 +7934,7 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
                                replica.is_processing();
                     });
                 if (processing || accessor.InProcessing() ||
-                    metadata.IsHardPinned() || !metadata.IsLeaseExpired(now) ||
+                    metadata.IsHardPinned() || !LeaseExpired(metadata, now) ||
                     (IsSoftPinActive(metadata, now) &&
                      !allow_evict_soft_pinned_objects_)) {
                     all_accepted = false;
@@ -8094,7 +8101,7 @@ void MasterService::RunShardDfsEviction() {
                 accepted[i] = !managed_weight && !candidate_is_processing &&
                               !accessor.InProcessing() &&
                               !metadata.IsHardPinned() &&
-                              metadata.IsLeaseExpired(now) &&
+                              LeaseExpired(metadata, now) &&
                               (!IsSoftPinActive(metadata, now) ||
                                allow_evict_soft_pinned_objects_);
                 if (!accepted[i]) continue;
@@ -9668,8 +9675,9 @@ void MasterService::EvictionThreadFunc() {
 
         const auto now = std::chrono::system_clock::now();
         double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
-        if (used_ratio > eviction_high_watermark_ratio_ ||
-            (need_mem_eviction_ && eviction_ratio_ > 0.0)) {
+        if (!MemoryEvictionPaused() &&
+            (used_ratio > eviction_high_watermark_ratio_ ||
+             (need_mem_eviction_ && eviction_ratio_ > 0.0))) {
             LOG(INFO) << "[EVICT-TRIGGER] memory_ratio=" << used_ratio
                       << " high_watermark=" << eviction_high_watermark_ratio_
                       << " need_mem_eviction=" << need_mem_eviction_
@@ -10001,7 +10009,7 @@ uint64_t MasterService::ReleaseExpiredDiscardedReplicas(
 
 MasterService::NamespaceEvictionResult MasterService::EvictNamespaceMemory(
     const TenantId& tenant_id, uint64_t target_bytes) {
-    if (target_bytes == 0) {
+    if (target_bytes == 0 || MemoryEvictionPaused()) {
         return {};
     }
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
@@ -10027,6 +10035,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
             DiscardExpiredProcessingReplicas(ns, now);
         });
     const uint64_t released_discarded = ReleaseExpiredDiscardedReplicas(now);
+    if (MemoryEvictionPaused()) {
+        if (allocation_pressure) {
+            need_mem_eviction_.store(true, std::memory_order_relaxed);
+        }
+        return;
+    }
     const eviction::Report report = memory_eviction_->evictor.Run(
         eviction::Scope::All(),
         eviction::ObjectGoal{.target_ratio = evict_ratio_target,
@@ -10073,7 +10087,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
     };
     auto may_evict = [&](const ObjectMetadata& metadata) {
         return !weight_manager_.IsManagedGroup(metadata.group_id) &&
-               !metadata.IsHardPinned() && metadata.IsLeaseExpired(now) &&
+               !metadata.IsHardPinned() && LeaseExpired(metadata, now) &&
                !IsSoftPinActive(metadata, now) &&
                metadata.HasReplica(is_evictable_nof_replica);
     };
@@ -11250,7 +11264,7 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
                         continue;
                     }
 
-                    if (metadata.IsHardPinned() || !metadata.IsLeaseExpired() ||
+                    if (metadata.IsHardPinned() || !LeaseExpired(metadata) ||
                         !metadata.AllReplicas(&Replica::fn_is_completed) ||
                         accessor.GetState().replication_task) {
                         blocked_unit_keys.insert(unit_key);

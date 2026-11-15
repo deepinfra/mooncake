@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -12,6 +13,10 @@
 
 namespace mooncake {
 
+class WrappedMasterService;
+
+// The standby's store. In serving mode its objects live in a follower-mode
+// service (the index promotion activates) and it keeps only weights.
 class StandbyMetadataStore final : public MetadataStore {
     using ObjectStore = std::unordered_map<std::string, StandbyObjectMetadata>;
     using TenantStore = std::unordered_map<std::string, ObjectStore>;
@@ -30,6 +35,12 @@ class StandbyMetadataStore final : public MetadataStore {
         friend class StandbyMetadataStore;
 
         SnapshotCursor(const StandbyMetadataStore* store,
+                       FollowerTraversalCursor follower)
+            : store_(store),
+              follower_(std::move(follower)),
+              done_(follower_->tenants.empty()) {}
+
+        SnapshotCursor(const StandbyMetadataStore* store,
                        TenantStore::const_iterator tenant,
                        TenantStore::const_iterator tenant_end,
                        ObjectStore::const_iterator object, bool done)
@@ -40,11 +51,21 @@ class StandbyMetadataStore final : public MetadataStore {
               done_(done) {}
 
         const StandbyMetadataStore* store_;
+        std::optional<FollowerTraversalCursor> follower_;
         TenantStore::const_iterator tenant_;
         TenantStore::const_iterator tenant_end_;
         ObjectStore::const_iterator object_;
         bool done_;
     };
+
+    StandbyMetadataStore() = default;
+    explicit StandbyMetadataStore(
+        std::shared_ptr<WrappedMasterService> follower);
+    const std::shared_ptr<WrappedMasterService>& FollowerIndex() const {
+        return follower_;
+    }
+    void OnSegmentMount(const SegmentMountOp& op) override;
+    void OnSegmentUnmount(const SegmentUnmountOp& op) override;
 
     using MetadataStore::Exists;
     using MetadataStore::GetMetadata;
@@ -99,6 +120,7 @@ class StandbyMetadataStore final : public MetadataStore {
                                std::vector<StandbyObjectEntry>& out) const;
 
    private:
+    std::shared_ptr<WrappedMasterService> follower_;
     mutable std::mutex mutex_;
     TenantStore store_;
     std::map<WeightRevisionIdentity, WeightRevisionMetadata> weight_metadata_;

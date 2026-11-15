@@ -129,6 +129,9 @@ struct MasterConfig {
     bool weight_management_oplog_capability_confirmed = false;
     uint64_t weight_import_idle_timeout_ms = 5 * 60 * 1000;
     bool enable_oplog_snapshot = false;
+    // The standby applies the OpLog into a follower-mode service, which
+    // promotion activates instead of rebuilding an index from a copy.
+    bool standby_serving_index = false;
     uint64_t snapshot_chunk_object_count = 1000000;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
@@ -268,6 +271,9 @@ class MasterServiceSupervisorConfig {
     bool weight_management_oplog_capability_confirmed = false;
     uint64_t weight_import_idle_timeout_ms = 5 * 60 * 1000;
     bool enable_oplog_snapshot = false;
+    // The standby applies the OpLog into a follower-mode service, which
+    // promotion activates instead of rebuilding an index from a copy.
+    bool standby_serving_index = false;
     uint64_t snapshot_chunk_object_count = 1000000;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
@@ -412,6 +418,7 @@ class MasterServiceSupervisorConfig {
             config.weight_management_oplog_capability_confirmed;
         weight_import_idle_timeout_ms = config.weight_import_idle_timeout_ms;
         enable_oplog_snapshot = config.enable_oplog_snapshot;
+        standby_serving_index = config.standby_serving_index;
         snapshot_chunk_object_count = config.snapshot_chunk_object_count;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;

@@ -9,6 +9,10 @@
 #include <shared_mutex>
 
 #include "allocator.h"
+#include "ha/ha_types.h"
+#include "ha/kv/ha_kv_backend_factory.h"
+#include "ha/oplog/oplog_batch_storage.h"
+#include "master_metric_manager.h"
 #include "master_service.h"
 
 namespace mooncake {
@@ -214,6 +218,28 @@ void MasterService::FollowerSegmentUnmount(const SegmentUnmountOp& op) {
     }
 }
 
+void MasterService::FollowerClear() {
+    std::vector<std::pair<TenantId, route::ObjectRef>> objects;
+    VisitNamespaces(
+        [&objects](const TenantId& tenant_id, metadata::Namespace& ns) {
+            for (auto object : ns.objects.ReadCursor()) {
+                objects.emplace_back(tenant_id, object.ref());
+            }
+        });
+    std::unique_lock<std::shared_mutex> exclusive(master_state_mutex_);
+    for (const auto& [tenant_id, ref] : objects) {
+        MetadataAccessorRW accessor(this, tenant_id, ref);
+        if (accessor.IsPublished()) {
+            accessor.Erase();
+        }
+    }
+    std::lock_guard<std::mutex> lock(follower_mutex_);
+    follower_segments_.clear();
+    standby_allocator_keepalive_.clear();
+    follower_owner_records_.clear();
+    follower_max_replica_id_ = 0;
+}
+
 std::vector<StandbySegmentInfo> MasterService::FollowerSegments() const {
     std::lock_guard<std::mutex> lock(follower_mutex_);
     std::vector<StandbySegmentInfo> segments;
@@ -227,6 +253,258 @@ std::vector<StandbySegmentInfo> MasterService::FollowerSegments() const {
 ReplicaID MasterService::FollowerMaxReplicaId() const {
     std::lock_guard<std::mutex> lock(follower_mutex_);
     return follower_max_replica_id_;
+}
+
+namespace {
+
+// A followed object as the standby store would hold it. Orphaned replicas
+// are left out: they own nothing a reader could use.
+StandbyObjectMetadata FollowedObjectMetadata(const ObjectMetadata& metadata) {
+    StandbyObjectMetadata out;
+    out.client_id = metadata.client_id;
+    out.size = metadata.TotalLength();
+    out.group_id = metadata.group_id;
+    out.data_type = metadata.data_type;
+    out.hard_pinned = metadata.IsHardPinned();
+    out.session_id = metadata.session_id;
+    out.object_checksum = metadata.GetPart(0).checksum();
+    for (const auto& replica : metadata.GetAllReplicas()) {
+        if (replica.is_memory_replica() && replica.has_invalid_mem_handle()) {
+            continue;
+        }
+        out.replicas.push_back(replica.get_descriptor());
+    }
+    return out;
+}
+
+}  // namespace
+
+std::optional<StandbyObjectMetadata> MasterService::FollowerGet(
+    const std::string& tenant_id, const std::string& key) {
+    const TenantId tenant(enable_multi_tenants_
+                              ? tenant_id
+                              : std::string(TenantId::kDefaultValue));
+    if (!tenant.IsValid()) {
+        return std::nullopt;
+    }
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    MetadataAccessorRW accessor(this, {tenant, key});
+    if (!accessor.IsPublished()) {
+        return std::nullopt;
+    }
+    return FollowedObjectMetadata(accessor.Get());
+}
+
+size_t MasterService::FollowerKeyCount(const std::string& tenant_id) const {
+    const metadata::Namespace* ns = namespaces_.Lookup(TenantId(tenant_id));
+    return ns == nullptr ? 0 : ns->objects.ObjectCount();
+}
+
+FollowerTraversalCursor MasterService::FollowerBeginTraversal() const {
+    FollowerTraversalCursor cursor;
+    VisitNamespaces(
+        [&cursor](const TenantId& tenant_id, metadata::Namespace& /*ns*/) {
+            cursor.tenants.push_back(tenant_id.value());
+        });
+    return cursor;
+}
+
+bool MasterService::FollowerCopyNextChunk(
+    size_t count, FollowerTraversalCursor& cursor,
+    std::vector<StandbyObjectEntry>& out) const {
+    out.clear();
+    if (count == 0) {
+        return false;
+    }
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    while (cursor.tenant < cursor.tenants.size() && out.size() < count) {
+        const std::string& tenant = cursor.tenants[cursor.tenant];
+        const metadata::Namespace* ns = namespaces_.Lookup(TenantId(tenant));
+        if (ns == nullptr ||
+            cursor.stripe >= route::ObjectRoute::kStripeCount) {
+            ++cursor.tenant;
+            cursor.stripe = 0;
+            cursor.skip = 0;
+            continue;
+        }
+        size_t seen = 0;
+        bool stripe_done = true;
+        for (auto object :
+             ns->objects.ReadCursor(cursor.stripe, cursor.stripe + 1)) {
+            if (seen++ < cursor.skip) {
+                continue;
+            }
+            if (out.size() == count) {
+                stripe_done = false;
+                break;
+            }
+            out.push_back(
+                StandbyObjectEntry{tenant, object.key(),
+                                   FollowedObjectMetadata(object.metadata())});
+        }
+        if (stripe_done) {
+            ++cursor.stripe;
+            cursor.skip = 0;
+        } else {
+            // The object at seen - 1 was not taken; resume there.
+            cursor.skip = seen - 1;
+        }
+    }
+    return true;
+}
+
+namespace {
+int64_t SystemNowMs(std::chrono::system_clock::time_point now) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               now.time_since_epoch())
+        .count();
+}
+}  // namespace
+
+bool MasterService::InheritedLeaseHeld(
+    std::chrono::system_clock::time_point now) const {
+    return SystemNowMs(now) <
+           inherited_lease_floor_ms_.load(std::memory_order_relaxed);
+}
+
+bool MasterService::LeaseExpired(
+    const ObjectMetadata& metadata,
+    std::chrono::system_clock::time_point now) const {
+    return metadata.IsLeaseExpired(now) && !InheritedLeaseHeld(now);
+}
+
+bool MasterService::LeaseExpired(const ObjectMetadata& metadata) const {
+    return LeaseExpired(metadata, std::chrono::system_clock::now());
+}
+
+bool MasterService::MemoryEvictionPaused() const {
+    return InheritedLeaseHeld(std::chrono::system_clock::now());
+}
+
+tl::expected<void, ErrorCode> MasterService::ActivateFollower(
+    ViewVersionId view_version, const DurablePrefix& applied,
+    const std::vector<StandbySegmentInfo>& segments,
+    const WeightMetadataSnapshot& weights) {
+    RestoreLifecycleState expected = RestoreLifecycleState::kFollowing;
+    if (!lifecycle_state_.compare_exchange_strong(
+            expected, RestoreLifecycleState::kRecovering,
+            std::memory_order_acq_rel)) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    const auto fail = [this](ErrorCode error) {
+        lifecycle_state_.store(RestoreLifecycleState::kFailed,
+                               std::memory_order_release);
+        LOG(ERROR) << "action=activate_follower, error=" << toString(error);
+        return tl::make_unexpected(error);
+    };
+    view_version_ = view_version;
+    if (enable_oplog_) {
+        const auto backend_type =
+            ha::ParseHABackendType(follower_ha_backend_type_);
+        if (!backend_type || follower_ha_backend_connstring_.empty()) {
+            return fail(ErrorCode::INVALID_PARAMS);
+        }
+        auto backend = CreateHaKvBackend(ha::HABackendSpec{
+            .type = *backend_type,
+            .connstring = follower_ha_backend_connstring_,
+            .cluster_namespace = cluster_id_,
+        });
+        if (!backend) {
+            return fail(backend.error());
+        }
+        // The writer goes on from the durable prefix, so apply must have
+        // reached it: nothing the old leader logged may be missing here.
+        DurablePrefix durable;
+        OpLogBatchStorage storage(cluster_id_, **backend);
+        if (const ErrorCode err = storage.ReadDurablePrefix(durable);
+            err != ErrorCode::OK && err != ErrorCode::ETCD_KEY_NOT_EXIST) {
+            return fail(err);
+        }
+        if (durable.last_seq != applied.last_seq ||
+            durable.batch_id != applied.batch_id) {
+            LOG(ERROR) << "action=activate_follower, durable_seq="
+                       << durable.last_seq
+                       << ", applied_seq=" << applied.last_seq;
+            return fail(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP);
+        }
+        if (const ErrorCode err = InitializeBatchOpLogWriter(
+                std::move(*backend),
+                /*require_fenced_writer=*/view_version_ > 0);
+            err != ErrorCode::OK) {
+            return fail(err);
+        }
+    }
+
+    {
+        std::unique_lock<std::shared_mutex> exclusive(master_state_mutex_);
+        std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+        std::lock_guard<std::mutex> lock(follower_mutex_);
+        std::unordered_map<std::string, StandbySegmentInfo> memory_segments;
+        for (const auto& [endpoint, segment] : follower_segments_) {
+            memory_segments.emplace(endpoint, segment.info);
+        }
+        for (const auto& segment : segments) {
+            if (segment.is_memory_segment) {
+                memory_segments.try_emplace(segment.transport_endpoint,
+                                            segment);
+            }
+        }
+        standby_memory_segments_.clear();
+        standby_accounted_memory_bytes_.clear();
+        for (const auto& [endpoint, info] : memory_segments) {
+            standby_memory_segments_.push_back(info);
+            auto kept = standby_allocator_keepalive_.find(endpoint);
+            if (kept == standby_allocator_keepalive_.end()) {
+                continue;
+            }
+            auto placeholder =
+                std::dynamic_pointer_cast<DummyBufferAllocator>(kept->second);
+            if (placeholder && placeholder->TrackedBytes() > 0) {
+                standby_accounted_memory_bytes_[info.segment_name] +=
+                    placeholder->TrackedBytes();
+            }
+        }
+        invalid_replica_endpoints_.clear();
+        for (const auto& [alias, allocator] : standby_allocator_keepalive_) {
+            invalid_replica_endpoints_.insert(alias);
+        }
+        standby_restored_at_ = std::chrono::steady_clock::now();
+        for (auto& [client_id, record] : follower_owner_records_) {
+            if (client_liveness_records_.emplace(client_id, record).second) {
+                MasterMetricManager::instance()
+                    .client_liveness_record_created();
+            }
+        }
+        const ReplicaID desired_next_id = follower_max_replica_id_ + 1;
+        ReplicaID current_next_id = Replica::next_id_.load();
+        while (current_next_id < desired_next_id &&
+               !Replica::next_id_.compare_exchange_weak(current_next_id,
+                                                        desired_next_id)) {
+        }
+    }
+    NotifyPolicyRestored();
+    if (!weight_manager_.RestoreSnapshot(weights)) {
+        return fail(ErrorCode::INVALID_PARAMS);
+    }
+    for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
+        MasterMetricManager::instance().inc_allocated_mem_size(
+            segment, static_cast<int64_t>(bytes));
+    }
+    if (follower_kv_event_config_) {
+        kv_event_publisher_ =
+            std::make_unique<KvEventPublisher>(*follower_kv_event_config_);
+        kv_track_tenant_epochs_ = KvEventsEnabled();
+    }
+    inherited_lease_floor_ms_.store(
+        SystemNowMs(std::chrono::system_clock::now()) +
+            static_cast<int64_t>(default_kv_lease_ttl_),
+        std::memory_order_relaxed);
+    lifecycle_state_.store(RestoreLifecycleState::kReady,
+                           std::memory_order_release);
+    LOG(INFO) << "action=activate_follower, objects=" << GetKeyCount()
+              << ", segments=" << standby_memory_segments_.size()
+              << ", applied_seq=" << applied.last_seq;
+    return {};
 }
 
 uint64_t MasterService::FollowerOrphanedReplicas() const {

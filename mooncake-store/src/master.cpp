@@ -396,6 +396,9 @@ DEFINE_bool(weight_management_oplog_capability_confirmed, false,
             "and lease entry types before enabling weight mutations");
 DEFINE_bool(enable_oplog_snapshot, false,
             "Enable standby batch OpLog snapshot production");
+DEFINE_bool(standby_serving_index, false,
+            "Standby applies the OpLog into a serving index, so promotion "
+            "activates it instead of rebuilding one (needs a batch OpLog)");
 DEFINE_uint64(weight_import_idle_timeout_ms, 5 * 60 * 1000,
               "Abort managed weight imports after this many milliseconds "
               "without accepted member writes");
@@ -709,6 +712,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("enable_oplog_snapshot",
                            &master_config.enable_oplog_snapshot,
                            FLAGS_enable_oplog_snapshot);
+    default_config.GetBool("standby_serving_index",
+                           &master_config.standby_serving_index,
+                           FLAGS_standby_serving_index);
     default_config.GetUInt64("weight_import_idle_timeout_ms",
                              &master_config.weight_import_idle_timeout_ms,
                              FLAGS_weight_import_idle_timeout_ms);
@@ -1197,6 +1203,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.enable_oplog_snapshot = FLAGS_enable_oplog_snapshot;
+    }
+    if ((google::GetCommandLineFlagInfo("standby_serving_index", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.standby_serving_index = FLAGS_standby_serving_index;
     }
     if ((google::GetCommandLineFlagInfo("weight_import_idle_timeout_ms",
                                         &info) &&

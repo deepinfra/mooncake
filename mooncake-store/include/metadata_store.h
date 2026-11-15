@@ -156,6 +156,18 @@ class StandbySegmentRegistry {
     std::unordered_map<std::string, StandbySegmentInfo> segments_by_endpoint_;
 };
 
+struct SegmentMountOp;
+struct SegmentUnmountOp;
+
+// Where a walk over a follower index stands: tenants, then the route's
+// stripes, then objects within a stripe.
+struct FollowerTraversalCursor {
+    std::vector<std::string> tenants;
+    size_t tenant{0};
+    size_t stripe{0};
+    size_t skip{0};
+};
+
 /**
  * @brief Abstract interface for metadata storage on Standby
  *
@@ -227,6 +239,10 @@ class MetadataStore {
         const WeightResidencyOperation& operation) = 0;
     virtual std::optional<WeightResidencyOperation> GetWeightOperation(
         uint64_t operation_id) const = 0;
+
+    // Segment entries, for a store that keeps segments with its objects.
+    virtual void OnSegmentMount(const SegmentMountOp&) {}
+    virtual void OnSegmentUnmount(const SegmentUnmountOp&) {}
 };
 
 }  // namespace mooncake
