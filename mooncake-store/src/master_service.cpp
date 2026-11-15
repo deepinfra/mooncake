@@ -58,6 +58,7 @@
 #include "eviction/evictor.h"
 #include "eviction/offloading_reclaimer.h"
 #include "eviction/report_observers.h"
+#include "ha/ha_progress.h"
 
 namespace mooncake {
 
@@ -4103,6 +4104,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
             if (objects.empty()) {
                 break;
             }
+            ha::NoteProgress();
             auto restored = restore_chunk(objects);
             if (!restored) {
                 return restored;

@@ -1,5 +1,7 @@
 #include "hot_standby_service.h"
 
+#include "ha/ha_progress.h"
+
 #include <glog/logging.h>
 
 #include <algorithm>
@@ -455,6 +457,12 @@ StandbySyncStatus HotStandbyService::GetSyncStatus() const {
     status.is_syncing = IsRunning() && IsConnected();
 
     return status;
+}
+
+bool HotStandbyService::IsSnapshotCaptureActive() const {
+    auto state = snapshot_capture_state_;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    return state->active;
 }
 
 bool HotStandbyService::IsReadyForPromotion() const {
@@ -1253,6 +1261,9 @@ void HotStandbyService::ReplicationLoop() {
             if (expected_after > 0) {
                 applied_seq_id_.store(expected_after - 1);
             }
+            if (expected_after > expected_before) {
+                ha::NoteProgress();
+            }
             if (result.error != ErrorCode::OK) {
                 last_error_.store(result.error, std::memory_order_release);
                 const bool made_progress = expected_after > expected_before;
@@ -1302,6 +1313,9 @@ void HotStandbyService::ReplicationLoop() {
             uint64_t expected = oplog_applier_->GetExpectedSequenceId();
             uint64_t current_applied = (expected > 0) ? (expected - 1) : 0;
             if (current_applied > 0) {
+                if (current_applied > applied_seq_id_.load()) {
+                    ha::NoteProgress();
+                }
                 applied_seq_id_.store(current_applied);
             }
         }

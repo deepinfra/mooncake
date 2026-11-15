@@ -146,6 +146,15 @@ struct ViewChangeResult {
     std::optional<MasterView> current_view;
 };
 
+// What /standby_status reports about a running standby.
+struct StandbyStatusReport {
+    bool follower_ready{false};
+    uint64_t applied_seq{0};
+    uint64_t durable_seq{0};
+    uint64_t lag_entries{0};
+    bool capture_active{false};
+};
+
 enum class MasterRuntimeState {
     kStarting,
     kStandby,

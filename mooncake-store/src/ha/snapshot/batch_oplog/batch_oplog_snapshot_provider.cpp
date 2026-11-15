@@ -1,5 +1,7 @@
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
 
+#include "ha/ha_progress.h"
+
 #include <algorithm>
 #include <memory>
 #include <string_view>
@@ -148,6 +150,7 @@ AttemptResult ReplaySuffix(const std::string& cluster_id, HaKvBackend& backend,
         if (cancelled && cancelled()) {
             return Invalid(ErrorCode::ETCD_CTX_CANCELLED);
         }
+        ha::NoteProgress();
         auto poll = reader.PollOnce();
         HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
             metrics.suffix_batches += poll.applied_batches;
@@ -284,6 +287,7 @@ AttemptResult RestorePointer(
         if (cancelled && cancelled()) {
             return Invalid(ErrorCode::ETCD_CTX_CANCELLED);
         }
+        ha::NoteProgress();
         const auto& chunk = manifest.object_chunks[i];
         const std::string expected_key =
             ha::BuildBatchOpLogSnapshotObjectChunkKey(

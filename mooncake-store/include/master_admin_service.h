@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -42,6 +43,12 @@ class MasterAdminServer {
 
     void SetServiceAvailable(bool available);
 
+    using StandbyStatusProvider =
+        std::function<std::optional<ha::StandbyStatusReport>()>;
+    // Feeds /standby_status. Clearing it waits out a call in progress, so
+    // the provider's owner may go right after.
+    void SetStandbyStatusProvider(StandbyStatusProvider provider);
+
    private:
     struct RuntimeSnapshot {
         ha::MasterRuntimeState state = ha::MasterRuntimeState::kStarting;
@@ -72,6 +79,10 @@ class MasterAdminServer {
                       coro_http::coro_http_response& resp);
     void HandleVersion(coro_http::coro_http_request& req,
                        coro_http::coro_http_response& resp);
+    void HandleReady(coro_http::coro_http_request& req,
+                     coro_http::coro_http_response& resp);
+    void HandleStandbyStatus(coro_http::coro_http_request& req,
+                             coro_http::coro_http_response& resp);
     void HandleRole(coro_http::coro_http_request& req,
                     coro_http::coro_http_response& resp);
     void HandleHaStatus(coro_http::coro_http_request& req,
@@ -143,6 +154,8 @@ class MasterAdminServer {
     std::optional<ha::MasterView> leader_view_;
     std::shared_ptr<WrappedMasterService> service_;
     bool service_available_ = false;
+    mutable std::mutex standby_status_mutex_;
+    StandbyStatusProvider standby_status_provider_;
 };
 
 }  // namespace mooncake

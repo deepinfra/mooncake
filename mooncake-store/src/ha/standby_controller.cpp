@@ -425,6 +425,23 @@ class CapabilityDrivenStandbyController final : public StandbyController {
                                       observed_leader, capabilities_);
     }
 
+    std::optional<StandbyStatusReport> GetStandbyStatusReport() const override {
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            if (!standby_running_) {
+                return std::nullopt;
+            }
+        }
+        const StandbySyncStatus status = standby_service_->GetSyncStatus();
+        return StandbyStatusReport{
+            .follower_ready = standby_service_->IsReadyForPromotion(),
+            .applied_seq = status.applied_seq_id,
+            .durable_seq = status.primary_seq_id,
+            .lag_entries = status.lag_entries,
+            .capture_active = standby_service_->IsSnapshotCaptureActive(),
+        };
+    }
+
     ErrorCode RestorePromotionBaseline(PromotionContext context) override {
         if (!context.metadata_store) {
             return ErrorCode::OK;

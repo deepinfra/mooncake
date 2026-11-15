@@ -547,6 +547,66 @@ TEST_F(MasterAdminServerTest, RoleEndpointReturnsCorrectRoleForRecovering) {
     admin.Stop();
 }
 
+TEST_F(MasterAdminServerTest, ReadyOnlyWhileServingAndAvailable) {
+    WrappedMasterServiceConfig config;
+    config.default_kv_lease_ttl = 5000;
+    config.enable_metric_reporting = false;
+    config.client_active_ttl_sec = 3600;
+    auto service = std::make_shared<WrappedMasterService>(config);
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetServiceDelegate(service);
+
+    admin.SetRuntimeState(ha::MasterRuntimeState::kStandby);
+    EXPECT_EQ(HttpGet(port, "/ready").http_status, 503);
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    EXPECT_EQ(HttpGet(port, "/ready").http_status, 503);
+    admin.SetServiceAvailable(true);
+    EXPECT_EQ(HttpGet(port, "/ready").http_status, 200);
+    admin.SetServiceAvailable(false);
+    EXPECT_EQ(HttpGet(port, "/ready").http_status, 503);
+
+    admin.Stop();
+}
+
+TEST_F(MasterAdminServerTest, StandbyStatusReportsTheProvidersView) {
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kStandby);
+
+    auto without_provider = HttpGet(port, "/standby_status");
+    EXPECT_EQ(without_provider.http_status, 200);
+    EXPECT_NE(without_provider.body.find("\"follower_ready\":false"),
+              std::string::npos);
+
+    admin.SetStandbyStatusProvider([] {
+        return std::optional<ha::StandbyStatusReport>(ha::StandbyStatusReport{
+            .follower_ready = true,
+            .applied_seq = 41,
+            .durable_seq = 42,
+            .lag_entries = 1,
+            .capture_active = false,
+        });
+    });
+    auto resp = HttpGet(port, "/standby_status");
+    EXPECT_EQ(resp.http_status, 200);
+    for (const char* field :
+         {"\"role\":\"standby\"", "\"follower_ready\":true",
+          "\"applied_seq\":41", "\"durable_seq\":42", "\"lag_entries\":1",
+          "\"capture_active\":false", "\"progress_ms\":"}) {
+        EXPECT_NE(resp.body.find(field), std::string::npos)
+            << field << " in " << resp.body;
+    }
+
+    admin.SetStandbyStatusProvider({});
+    EXPECT_NE(
+        HttpGet(port, "/standby_status").body.find("\"follower_ready\":false"),
+        std::string::npos);
+    admin.Stop();
+}
+
 TEST_F(MasterAdminServerTest, HaStatusEndpointReturnsCorrectState) {
     int port = getFreeTcpPort();
     MasterAdminServer admin(static_cast<uint16_t>(port), false);

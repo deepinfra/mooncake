@@ -75,6 +75,11 @@ class StandbyController {
     virtual ErrorCode RestorePromotionBaseline(PromotionContext) {
         return ErrorCode::OK;
     }
+
+    // Empty while no standby runs.
+    virtual std::optional<StandbyStatusReport> GetStandbyStatusReport() const {
+        return std::nullopt;
+    }
 };
 
 std::unique_ptr<StandbyController> CreateStandbyController(

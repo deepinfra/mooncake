@@ -33,6 +33,7 @@
 #include "rpc_service.h"
 #include "types.h"
 #include "version.h"
+#include "ha/ha_progress.h"
 
 namespace mooncake {
 
@@ -592,6 +593,62 @@ void MasterAdminServer::HandleMetricsSummary(
     resp.add_header("Content-Type", "text/plain; version=0.0.4");
     resp.set_status_and_content(coro_http::status_type::ok,
                                 BuildMetricsSummaryText());
+}
+
+void MasterAdminServer::SetStandbyStatusProvider(
+    StandbyStatusProvider provider) {
+    std::lock_guard<std::mutex> lock(standby_status_mutex_);
+    standby_status_provider_ = std::move(provider);
+}
+
+void MasterAdminServer::HandleReady(coro_http::coro_http_request&,
+                                    coro_http::coro_http_response& resp) {
+    const auto snapshot = SnapshotState();
+    const bool ready = snapshot.state == ha::MasterRuntimeState::kServing &&
+                       snapshot.service_available;
+    resp.add_header("Content-Type", "text/plain; charset=utf-8");
+    resp.set_status_and_content(
+        ready ? coro_http::status_type::ok
+              : coro_http::status_type::service_unavailable,
+        ready ? "ready" : "not ready");
+}
+
+struct HttpStandbyStatusResponse {
+    std::string role;
+    bool follower_ready{false};
+    uint64_t applied_seq{0};
+    uint64_t durable_seq{0};
+    uint64_t lag_entries{0};
+    bool capture_active{false};
+    uint64_t progress_ms{0};
+    std::string build;
+};
+YLT_REFL(HttpStandbyStatusResponse, role, follower_ready, applied_seq,
+         durable_seq, lag_entries, capture_active, progress_ms, build);
+
+void MasterAdminServer::HandleStandbyStatus(
+    coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
+    const auto snapshot = SnapshotState();
+    HttpStandbyStatusResponse payload;
+    payload.role = ha::MasterRuntimeRoleToString(snapshot.state);
+    payload.build = GetMooncakeStoreVersion();
+    // A serving leader advances its index with every write it takes.
+    payload.progress_ms = snapshot.state == ha::MasterRuntimeState::kServing
+                              ? 0
+                              : ha::MillisSinceProgress();
+    {
+        std::lock_guard<std::mutex> lock(standby_status_mutex_);
+        if (standby_status_provider_) {
+            if (const auto report = standby_status_provider_()) {
+                payload.follower_ready = report->follower_ready;
+                payload.applied_seq = report->applied_seq;
+                payload.durable_seq = report->durable_seq;
+                payload.lag_entries = report->lag_entries;
+                payload.capture_active = report->capture_active;
+            }
+        }
+    }
+    WriteJsonResponse(resp, coro_http::status_type::ok, payload);
 }
 
 void MasterAdminServer::HandleRole(coro_http::coro_http_request&,
@@ -1573,6 +1630,15 @@ void MasterAdminServer::RegisterHandler() {
     http_server_.set_http_handler<GET>(
         "/role", [this](coro_http_request& req, coro_http_response& resp) {
             HandleRole(req, resp);
+        });
+    http_server_.set_http_handler<GET>(
+        "/ready", [this](coro_http_request& req, coro_http_response& resp) {
+            HandleReady(req, resp);
+        });
+    http_server_.set_http_handler<GET>(
+        "/standby_status",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleStandbyStatus(req, resp);
         });
     http_server_.set_http_handler<GET>(
         "/ha_status", [this](coro_http_request& req, coro_http_response& resp) {

@@ -118,6 +118,8 @@ class HotStandbyService {
      * @return true if replication lag is within threshold
      */
     bool IsReadyForPromotion() const;
+    // Whether a snapshot capture holds OpLog apply paused right now.
+    bool IsSnapshotCaptureActive() const;
 
     /**
      * @brief Promote this standby to Primary

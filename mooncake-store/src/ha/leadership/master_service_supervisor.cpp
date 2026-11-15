@@ -445,6 +445,14 @@ void EnterStandbyMode(MasterAdminServer& admin_server,
     SetRuntimeState(admin_server, standby_controller.GetStandbyRuntimeState());
 }
 
+namespace {
+// Detaches /standby_status from the controller before the controller goes.
+struct StandbyStatusProviderScope {
+    mooncake::MasterAdminServer& admin_server;
+    ~StandbyStatusProviderScope() { admin_server.SetStandbyStatusProvider({}); }
+};
+}  // namespace
+
 int RunSupervisorLoop(const HABackendSpec& spec,
                       const MasterServiceSupervisorConfig& config,
                       MasterAdminServer& admin_server,
@@ -453,6 +461,11 @@ int RunSupervisorLoop(const HABackendSpec& spec,
     auto label_reconciler = MakeLeaderLabelReconciler(config);
     label_reconciler.SetLeader(false);
     SetRuntimeState(admin_server, MasterRuntimeState::kStarting);
+    admin_server.SetStandbyStatusProvider(
+        [controller = standby_controller.get()] {
+            return controller->GetStandbyStatusReport();
+        });
+    StandbyStatusProviderScope standby_status_scope{admin_server};
     std::atomic<bool> accept_standby_runtime_updates{false};
     standby_controller->SetStandbyRuntimeStateCallback(
         [&](MasterRuntimeState state) {
