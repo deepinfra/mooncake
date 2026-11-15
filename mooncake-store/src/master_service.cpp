@@ -661,12 +661,18 @@ MasterService::MasterService(const MasterServiceConfig& config)
                   << ")";
     }
 
+    follower_mode_ = config.follower_mode;
+    if (follower_mode_) {
+        // Before any worker thread starts, so none runs business work.
+        lifecycle_state_.store(RestoreLifecycleState::kFollowing,
+                               std::memory_order_release);
+    }
     InitDfsAllocatorFromEnvironment(config);
     kv_event_publisher_ =
         std::make_unique<KvEventPublisher>(BuildKvEventConfig(config));
     kv_track_tenant_epochs_ = KvEventsEnabled();
 
-    if (enable_oplog_ && !cluster_id_.empty()) {
+    if (enable_oplog_ && !cluster_id_.empty() && !follower_mode_) {
         if (config.ha_backend_connstring.empty()) {
             LOG(INFO) << "Skipping automatic batch-record OpLog writer "
                          "initialization; no HA backend connstring configured";
@@ -2714,6 +2720,9 @@ void MasterService::WeightReconciliationThreadFunc() {
         if (!weight_reconciliation_running_) {
             break;
         }
+        if (!AdmitsBusinessWorkers()) {
+            continue;
+        }
         const auto now_ms = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch())
@@ -3606,6 +3615,8 @@ const char* RestoreLifecycleStateToString(
             return "Constructed";
         case MasterService::RestoreLifecycleState::kRecovering:
             return "Recovering";
+        case MasterService::RestoreLifecycleState::kFollowing:
+            return "Following";
         case MasterService::RestoreLifecycleState::kReady:
             return "Ready";
         case MasterService::RestoreLifecycleState::kServing:
@@ -3651,6 +3662,11 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     if (expected == RestoreLifecycleState::kRecovering) {
         LOG(ERROR) << "RestoreFromStandbyState: refusing a second restore "
                       "while one is already in flight";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    if (expected == RestoreLifecycleState::kFollowing) {
+        LOG(ERROR) << "RestoreFromStandbyState: a follower is activated, "
+                      "not restored";
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     if (!lifecycle_state_.compare_exchange_strong(
@@ -3712,6 +3728,7 @@ bool MasterService::AdmitsBusinessWorkers() const {
     // (drain or epoch) instead of relying on this predicate.
     switch (lifecycle_state_.load(std::memory_order_acquire)) {
         case RestoreLifecycleState::kRecovering:
+        case RestoreLifecycleState::kFollowing:
         case RestoreLifecycleState::kFailed:
             return false;
         case RestoreLifecycleState::kConstructed:

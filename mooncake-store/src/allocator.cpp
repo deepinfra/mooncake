@@ -77,8 +77,26 @@ void AllocatedBuffer::UntrackStandby() {
         return;
     }
     std::lock_guard<std::mutex> lock(StandbyTrackingMutex());
-    standby_hook_.unlink();
+    if (standby_hook_.is_linked()) {
+        if (auto owner = allocator_.lock()) {
+            static_cast<DummyBufferAllocator*>(owner.get())->tracked_bytes_ -=
+                size_;
+        }
+        standby_hook_.unlink();
+    }
     standby_tracked_ = false;
+}
+
+void AllocatedBuffer::OrphanLocked() {
+    if (standby_hook_.is_linked()) {
+        if (auto owner = allocator_.lock()) {
+            static_cast<DummyBufferAllocator*>(owner.get())->tracked_bytes_ -=
+                size_;
+        }
+        standby_hook_.unlink();
+    }
+    standby_tracked_ = false;
+    allocator_.reset();
 }
 
 void AllocatedBuffer::AdoptFrom(AllocatedBuffer&& imported) {
@@ -99,12 +117,49 @@ DummyBufferAllocator::~DummyBufferAllocator() {
     tracked_.clear();
 }
 
-void DummyBufferAllocator::Track(AllocatedBuffer& buffer) {
+size_t DummyBufferAllocator::Track(AllocatedBuffer& buffer) {
     std::lock_guard<std::mutex> lock(StandbyTrackingMutex());
-    if (!buffer.standby_hook_.is_linked()) {
-        tracked_.push_back(buffer);
+    if (buffer.standby_hook_.is_linked()) {
+        return 0;
     }
+    const auto start = reinterpret_cast<uintptr_t>(buffer.data());
+    const uintptr_t end = start + buffer.size();
+    size_t orphaned = 0;
+    auto it = tracked_.lower_bound(buffer, ByAddress{});
+    if (it != tracked_.begin()) {
+        auto before = std::prev(it);
+        if (reinterpret_cast<uintptr_t>(before->data()) + before->size() >
+            start) {
+            before->OrphanLocked();
+            ++orphaned;
+        }
+    }
+    while (it != tracked_.end() &&
+           reinterpret_cast<uintptr_t>(it->data()) < end) {
+        auto& overlapped = *it++;
+        overlapped.OrphanLocked();
+        ++orphaned;
+    }
+    tracked_.insert(buffer);
+    tracked_bytes_ += buffer.size();
     buffer.standby_tracked_ = true;
+    return orphaned;
+}
+
+size_t DummyBufferAllocator::OrphanAll() {
+    std::lock_guard<std::mutex> lock(StandbyTrackingMutex());
+    size_t orphaned = 0;
+    while (!tracked_.empty()) {
+        tracked_.begin()->OrphanLocked();
+        ++orphaned;
+    }
+    tracked_bytes_ = 0;
+    return orphaned;
+}
+
+uint64_t DummyBufferAllocator::TrackedBytes() const {
+    std::lock_guard<std::mutex> lock(StandbyTrackingMutex());
+    return tracked_bytes_;
 }
 
 std::vector<AllocatedBuffer*> DummyBufferAllocator::Tracked() const {

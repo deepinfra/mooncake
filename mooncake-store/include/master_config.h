@@ -593,6 +593,9 @@ class WrappedMasterServiceConfig {
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     // OpLog store configuration
+    // The standby's index: applies the leader's OpLog and runs no
+    // business workers until promotion activates it.
+    bool follower_mode = false;
     bool enable_oplog = false;
     bool weight_management_oplog_capability_confirmed = false;
     uint64_t weight_import_idle_timeout_ms = 5 * 60 * 1000;
@@ -896,6 +899,7 @@ class MasterServiceConfigBuilder {
     uint64_t snapshot_chunk_object_count_ = 1000000;
     int oplog_poll_interval_ms_ = 1000;
     uint32_t oplog_batch_max_entries_ = 1024;
+    bool follower_mode_ = false;
     uint64_t restore_repair_durable_timeout_ms_ =
         DEFAULT_RESTORE_REPAIR_DURABLE_TIMEOUT_MS;
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
@@ -1072,6 +1076,11 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_oplog_batch_max_entries(uint32_t entries) {
         oplog_batch_max_entries_ = entries;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_follower_mode(bool follower_mode) {
+        follower_mode_ = follower_mode;
         return *this;
     }
 
@@ -1268,6 +1277,7 @@ class MasterServiceConfig {
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     // OpLog store configuration
+    bool follower_mode = false;
     bool enable_oplog = false;
     bool weight_management_oplog_capability_confirmed = false;
     uint64_t weight_import_idle_timeout_ms = 5 * 60 * 1000;
@@ -1310,6 +1320,7 @@ class MasterServiceConfig {
     // From WrappedMasterServiceConfig
     MasterServiceConfig(const WrappedMasterServiceConfig& config) {
         auto cxl_allocator_type = BufferAllocatorType::CACHELIB;
+        follower_mode = config.follower_mode;
 
         default_kv_lease_ttl = config.default_kv_lease_ttl;
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
@@ -1447,6 +1458,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.snapshot_chunk_object_count = snapshot_chunk_object_count_;
     config.oplog_poll_interval_ms = oplog_poll_interval_ms_;
     config.oplog_batch_max_entries = oplog_batch_max_entries_;
+    config.follower_mode = follower_mode_;
     config.restore_repair_durable_timeout_ms =
         restore_repair_durable_timeout_ms_;
     config.cluster_id = cluster_id_;

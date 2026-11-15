@@ -30,6 +30,7 @@
 #include "ha/oplog/mock_metadata_store.h"
 #include "ha/oplog/oplog_batch_codec.h"
 #include "ha/oplog/oplog_batch_storage.h"
+#include "ha/standby_metadata_store.h"
 #include "ha/oplog/oplog_batch_standby_reader.h"
 #include "ha/oplog/oplog_batch_types.h"
 #include "ha/oplog/oplog_applier.h"
@@ -2894,6 +2895,290 @@ TEST_F(MasterServiceHATest, RemountSkipsReplicasRemovedSinceRestore) {
         service.GetReplicaList("remount_kept", kDefaultTenant).has_value());
     EXPECT_EQ(
         ReplicaCountForTesting(service, kDefaultTenant, "remount_removed"), 0);
+}
+
+// The follower index (config.follower_mode) applies the leader's OpLog.
+class MasterServiceFollowerTest : public MasterServiceHATest {
+   protected:
+    static MasterServiceConfig FollowerConfig() {
+        return MasterServiceConfig::builder()
+            .set_enable_ha(true)
+            .set_enable_oplog(true)
+            .set_cluster_id("follower_test")
+            .set_follower_mode(true)
+            .build();
+    }
+
+    StandbyObjectMetadata ObjectAt(const std::string& endpoint,
+                                   uintptr_t address, size_t size = 1024) {
+        auto entry = MakeStandbyObject("unused", endpoint, size);
+        entry.metadata.replicas.front()
+            .get_memory_descriptor()
+            .buffer_descriptor.buffer_address_ = address;
+        return entry.metadata;
+    }
+
+    static SegmentMountOp MountOf(const std::string& endpoint, UUID id) {
+        SegmentMountOp op;
+        op.segment_name = endpoint;
+        op.transport_endpoint = endpoint;
+        op.capacity = kDefaultSegmentSize;
+        op.is_memory_segment = true;
+        op.segment_id = id;
+        op.base = kDefaultSegmentBase;
+        return op;
+    }
+};
+
+TEST_F(MasterServiceFollowerTest, FollowerAppliesEntriesWithoutServing) {
+    MasterService service(FollowerConfig());
+    EXPECT_EQ(service.GetRestoreLifecycleState(),
+              MasterService::RestoreLifecycleState::kFollowing);
+    EXPECT_FALSE(HasOpLogWriter(service));
+    const std::string endpoint = "follower_endpoint";
+    service.FollowerSegmentMount(MountOf(endpoint, {1, 1}));
+    ASSERT_TRUE(service
+                    .FollowerPut("default", "kept",
+                                 ObjectAt(endpoint, kDefaultSegmentBase))
+                    .has_value());
+    ASSERT_TRUE(service
+                    .FollowerPut("default", "removed",
+                                 ObjectAt(endpoint, kDefaultSegmentBase + 8192))
+                    .has_value());
+    ASSERT_TRUE(service.FollowerRemove("default", "removed").has_value());
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, "kept"), 1);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, "removed"), 0);
+    auto segments = service.FollowerSegments();
+    ASSERT_EQ(segments.size(), 1);
+    EXPECT_EQ(segments[0].transport_endpoint, endpoint);
+}
+
+TEST_F(MasterServiceFollowerTest, ALaterPutOrphansTheReplicaWhoseBytesItTook) {
+    MasterService service(FollowerConfig());
+    const std::string endpoint = "follower_overlap";
+    ASSERT_TRUE(service
+                    .FollowerPut("default", "stale",
+                                 ObjectAt(endpoint, kDefaultSegmentBase))
+                    .has_value());
+    // The REMOVE for "stale" never arrived; "fresh" was allocated over it.
+    ASSERT_TRUE(service
+                    .FollowerPut("default", "fresh",
+                                 ObjectAt(endpoint, kDefaultSegmentBase + 512))
+                    .has_value());
+    EXPECT_EQ(service.FollowerOrphanedReplicas(), 1);
+}
+
+TEST_F(MasterServiceFollowerTest, ARestartedClientOrphansTheOldIncarnation) {
+    MasterService service(FollowerConfig());
+    const std::string endpoint = "follower_restart";
+    service.FollowerSegmentMount(MountOf(endpoint, {1, 1}));
+    ASSERT_TRUE(service
+                    .FollowerPut("default", "old",
+                                 ObjectAt(endpoint, kDefaultSegmentBase))
+                    .has_value());
+    service.FollowerSegmentMount(MountOf(endpoint, {1, 1}));
+    EXPECT_EQ(service.FollowerOrphanedReplicas(), 0);
+    service.FollowerSegmentMount(MountOf(endpoint, {2, 2}));
+    EXPECT_EQ(service.FollowerOrphanedReplicas(), 1);
+}
+
+TEST_F(MasterServiceFollowerTest, UnmountOrphansTheSegmentsReplicas) {
+    MasterService service(FollowerConfig());
+    const std::string endpoint = "follower_unmount";
+    service.FollowerSegmentMount(MountOf(endpoint, {1, 1}));
+    for (int i = 0; i < 3; ++i) {
+        ASSERT_TRUE(
+            service
+                .FollowerPut("default", "k" + std::to_string(i),
+                             ObjectAt(endpoint, kDefaultSegmentBase + i * 4096))
+                .has_value());
+    }
+    SegmentUnmountOp older{endpoint};
+    older.segment_id = UUID{9, 9};
+    service.FollowerSegmentUnmount(older);
+    EXPECT_EQ(service.FollowerOrphanedReplicas(), 0);
+    SegmentUnmountOp current{endpoint};
+    current.segment_id = UUID{1, 1};
+    service.FollowerSegmentUnmount(current);
+    EXPECT_EQ(service.FollowerOrphanedReplicas(), 3);
+    EXPECT_TRUE(service.FollowerSegments().empty());
+}
+
+TEST_F(MasterServiceFollowerTest, AMalformedEntryLeavesTheKeyAbsent) {
+    MasterService service(FollowerConfig());
+    const std::string endpoint = "follower_malformed";
+    ASSERT_TRUE(service
+                    .FollowerPut("default", "key",
+                                 ObjectAt(endpoint, kDefaultSegmentBase))
+                    .has_value());
+    auto bad = ObjectAt(endpoint, kDefaultSegmentBase);
+    bad.size = 7;
+    EXPECT_TRUE(service.FollowerPut("default", "key", bad).has_value());
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, "key"), 0);
+    EXPECT_EQ(service.FollowerRejectedEntries(), 1);
+}
+
+// Not a correctness test: prints apply rates for a prod-shaped workload.
+// Run with --gtest_also_run_disabled_tests.
+TEST_F(MasterServiceFollowerTest, DISABLED_ApplyRate) {
+    constexpr size_t kObjects = 400000;
+    constexpr size_t kSegments = 56;
+    constexpr size_t kValue = 126720;
+    const std::string prefix =
+        "deepseek-ai/DeepSeek-V4.1-Flash-1017@tp_rank:0@pcp0@dcp0@pp_rank:0@"
+        "group:0@";
+    std::vector<StandbyObjectMetadata> objects;
+    objects.reserve(kObjects);
+    for (size_t i = 0; i < kObjects; ++i) {
+        const std::string endpoint =
+            "10.0.0." + std::to_string(i % kSegments) + ":17000";
+        objects.push_back(ObjectAt(
+            endpoint, kDefaultSegmentBase + (i / kSegments) * kValue, kValue));
+    }
+    auto key = [&](size_t i) {
+        return prefix + std::to_string(i * 2654435761u);
+    };
+    auto rate = [](const char* what, size_t n, auto start) {
+        const double secs = std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - start)
+                                .count();
+        std::cout << what << ": " << static_cast<uint64_t>(n / secs)
+                  << " entries/s (" << secs << " s for " << n << ")"
+                  << std::endl;
+    };
+
+    MasterService follower(FollowerConfig());
+    auto start = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < kObjects; ++i) {
+        ASSERT_TRUE(follower.FollowerPut("default", key(i), objects[i]));
+    }
+    rate("follower put (new keys)", kObjects, start);
+    start = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < kObjects; ++i) {
+        ASSERT_TRUE(follower.FollowerPut("default", key(i), objects[i]));
+    }
+    rate("follower put (replacing)", kObjects, start);
+    start = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < kObjects; ++i) {
+        ASSERT_TRUE(follower.FollowerRemove("default", key(i)));
+    }
+    rate("follower remove", kObjects, start);
+
+    // What the follower pays per entry before the store: the batch record
+    // decode and the payload decode.
+    OpLogBatchRecord batch;
+    batch.batch_id = 1;
+    batch.first_seq = 1;
+    for (size_t i = 0; i < 1024; ++i) {
+        MetadataPayload payload;
+        payload.client_id = objects[i].client_id;
+        payload.size = objects[i].size;
+        payload.replicas = objects[i].replicas;
+        OpLogEntry entry;
+        entry.sequence_id = i + 1;
+        entry.op_type = OpType::PUT_END;
+        entry.object_key = key(i);
+        auto bytes = struct_pack::serialize<std::string>(payload);
+        entry.payload = bytes;
+        entry.checksum = ComputeOpLogChecksum(entry.payload);
+        batch.entries.push_back(std::move(entry));
+    }
+    batch.last_seq = 1024;
+    const std::string encoded = EncodeOpLogBatchRecord(batch);
+    constexpr size_t kBatches = 200;
+    start = std::chrono::steady_clock::now();
+    for (size_t round = 0; round < kBatches; ++round) {
+        OpLogBatchRecord decoded;
+        ASSERT_TRUE(DecodeOpLogBatchRecord(encoded, &decoded));
+        for (const auto& entry : decoded.entries) {
+            MetadataPayload payload;
+            ASSERT_EQ(struct_pack::deserialize_to(payload, entry.payload),
+                      struct_pack::errc::ok);
+            auto standby = payload.ToStandbyMetadata();
+            ASSERT_EQ(standby.size, kValue);
+        }
+    }
+    rate("record + payload decode", kBatches * 1024, start);
+    start = std::chrono::steady_clock::now();
+    for (size_t round = 0; round < kBatches; ++round) {
+        OpLogBatchRecord decoded;
+        ASSERT_TRUE(DecodeOpLogBatchRecord(encoded, &decoded));
+    }
+    rate("record decode alone", kBatches * 1024, start);
+    start = std::chrono::steady_clock::now();
+    for (size_t round = 0; round < kBatches / 4; ++round) {
+        ASSERT_FALSE(EncodeOpLogBatchRecord(batch).empty());
+    }
+    rate("record encode (the writer's cost)", kBatches / 4 * 1024, start);
+
+    // The follower's whole path: read records from storage (decoded on
+    // several threads), decode each payload, apply it.
+    {
+        auto backend = std::make_shared<FakeBatchHaKvBackend>();
+        OpLogBatchStorage storage("follower_rate", *backend);
+        DurablePrefix prefix;
+        ASSERT_EQ(storage.InitDurablePrefix(prefix), ErrorCode::OK);
+        constexpr size_t kRecords = 300;
+        for (size_t r = 0; r < kRecords; ++r) {
+            OpLogBatchRecord record = batch;
+            record.batch_id = r + 1;
+            record.first_seq = r * 1024 + 1;
+            record.last_seq = (r + 1) * 1024;
+            for (size_t i = 0; i < record.entries.size(); ++i) {
+                record.entries[i].sequence_id = r * 1024 + i + 1;
+                record.entries[i].object_key = key(r * 1024 + i);
+            }
+            ASSERT_EQ(storage.WriteBatchAndAdvancePrefix(record, prefix),
+                      ErrorCode::OK);
+            prefix = {.batch_id = record.batch_id, .last_seq = record.last_seq};
+        }
+        MasterService pipeline(FollowerConfig());
+        start = std::chrono::steady_clock::now();
+        uint64_t after = 0;
+        size_t applied = 0;
+        for (;;) {
+            std::vector<OpLogBatchRecord> page;
+            ASSERT_EQ(storage.ReadBatchesAfter(after, 64, page), ErrorCode::OK);
+            if (page.empty()) {
+                break;
+            }
+            for (const auto& record : page) {
+                for (const auto& entry : record.entries) {
+                    MetadataPayload payload;
+                    ASSERT_EQ(
+                        struct_pack::deserialize_to(payload, entry.payload),
+                        struct_pack::errc::ok);
+                    ASSERT_TRUE(
+                        pipeline.FollowerPut("default", entry.object_key,
+                                             payload.ToStandbyMetadata()));
+                    ++applied;
+                }
+                after = record.batch_id;
+            }
+        }
+        rate("follower pipeline (read + decode + apply)", applied, start);
+    }
+
+    StandbyMetadataStore store;
+    start = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < kObjects; ++i) {
+        ASSERT_TRUE(store.PutMetadata("default", key(i), objects[i]));
+    }
+    rate("standby store put (new keys)", kObjects, start);
+    start = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < kObjects; ++i) {
+        ASSERT_TRUE(store.Remove("default", key(i)));
+    }
+    rate("standby store remove", kObjects, start);
+}
+
+TEST_F(MasterServiceFollowerTest, AServingIndexRefusesFollowerApply) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    EXPECT_FALSE(
+        service
+            .FollowerPut("default", "key", ObjectAt("e", kDefaultSegmentBase))
+            .has_value());
 }
 
 class UnboundedFakeBatchHaKvBackend : public FakeBatchHaKvBackend {

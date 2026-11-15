@@ -1037,6 +1037,7 @@ class MasterService {
     enum class RestoreLifecycleState {
         kConstructed,  // components built; workers admitted (see below)
         kRecovering,   // HA promotion restore in flight; workers paused
+        kFollowing,    // standby index applying the leader's OpLog; paused
         kReady,        // restore + durable repair done; serving not activated
         kServing,      // committed to normal operation; restore refused
         kFailed,       // restore failed; the candidate must be destroyed
@@ -1061,6 +1062,25 @@ class MasterService {
      * activated on a service whose restore did not succeed.
      */
     void ActivateServing();
+
+    // Follower mode (config.follower_mode). The standby applies the leader's
+    // OpLog straight into this index, so promotion turns it into the serving
+    // one instead of rebuilding it. Until ActivateFollower the OpLog applier
+    // is the only mutator: no RPC is served, no business worker runs, and
+    // there is no OpLog writer. Each call takes one entry's full state.
+    tl::expected<void, ErrorCode> FollowerPut(
+        const std::string& tenant_id, const std::string& key,
+        const StandbyObjectMetadata& metadata);
+    tl::expected<void, ErrorCode> FollowerRemove(const std::string& tenant_id,
+                                                 const std::string& key);
+    void FollowerSegmentMount(const SegmentMountOp& op);
+    void FollowerSegmentUnmount(const SegmentUnmountOp& op);
+    std::vector<StandbySegmentInfo> FollowerSegments() const;
+    ReplicaID FollowerMaxReplicaId() const;
+    // Restored replicas dropped because a later entry claimed their bytes,
+    // and entries dropped as malformed.
+    uint64_t FollowerOrphanedReplicas() const;
+    uint64_t FollowerRejectedEntries() const;
 
     /**
      * @brief Query the status of a task
@@ -2436,6 +2456,26 @@ class MasterService {
     // Key: transport_endpoint, Value: allocator.
     std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
         standby_allocator_keepalive_;
+
+    // Follower mode state, guarded by follower_mutex_. Segments are keyed by
+    // transport endpoint; owners are the clients restored objects name.
+    struct FollowerSegment {
+        StandbySegmentInfo info;
+        std::optional<UUID> segment_id;
+    };
+    bool follower_mode_{false};
+    mutable std::mutex follower_mutex_;
+    std::unordered_map<std::string, FollowerSegment> follower_segments_;
+    std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
+                       boost::hash<UUID>>
+        follower_owner_records_;
+    ReplicaID follower_max_replica_id_{0};
+    std::atomic<uint64_t> follower_orphaned_replicas_{0};
+    std::atomic<uint64_t> follower_rejected_entries_{0};
+    tl::expected<std::vector<Replica>, ErrorCode> BuildFollowerReplicas(
+        const StandbyObjectMetadata& metadata);
+    std::shared_ptr<DummyBufferAllocator> FollowerPlaceholderLocked(
+        const std::string& endpoint, const std::string& segment_name);
     std::vector<StandbySegmentInfo> standby_memory_segments_;
     std::unordered_map<std::string, uint64_t> standby_accounted_memory_bytes_;
 

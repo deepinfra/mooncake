@@ -93,6 +93,79 @@ TEST_F(BufferAllocatorTest, DescriptorFollowsPublishedAndClearedLocality) {
 }
 
 // Test basic allocation and deallocation functionality
+namespace {
+std::unique_ptr<AllocatedBuffer> RestoredBuffer(
+    const std::shared_ptr<DummyBufferAllocator>& placeholder, uintptr_t address,
+    uint64_t size) {
+    AllocatedBuffer::Descriptor descriptor{size, address, "tcp",
+                                           placeholder->getTransportEndpoint()};
+    return std::make_unique<AllocatedBuffer>(placeholder, descriptor);
+}
+}  // namespace
+
+TEST(DummyBufferAllocatorTest, TracksBuffersByAddressAndUntracksOnDestroy) {
+    auto placeholder =
+        std::make_shared<DummyBufferAllocator>("seg", "10.0.0.1:1");
+    auto high = RestoredBuffer(placeholder, 0x3000, 0x1000);
+    auto low = RestoredBuffer(placeholder, 0x1000, 0x1000);
+    EXPECT_EQ(placeholder->Track(*high), 0u);
+    EXPECT_EQ(placeholder->Track(*low), 0u);
+    auto tracked = placeholder->Tracked();
+    ASSERT_EQ(tracked.size(), 2u);
+    EXPECT_EQ(tracked[0], low.get());
+    EXPECT_EQ(tracked[1], high.get());
+    EXPECT_EQ(placeholder->TrackedBytes(), 0x2000u);
+
+    low.reset();
+    EXPECT_EQ(placeholder->Tracked().size(), 1u);
+    EXPECT_EQ(placeholder->TrackedBytes(), 0x1000u);
+}
+
+TEST(DummyBufferAllocatorTest, ALaterOverlappingBufferOrphansTheOlderOnes) {
+    auto placeholder =
+        std::make_shared<DummyBufferAllocator>("seg", "10.0.0.1:1");
+    auto left = RestoredBuffer(placeholder, 0x1000, 0x1000);
+    auto right = RestoredBuffer(placeholder, 0x2000, 0x1000);
+    auto apart = RestoredBuffer(placeholder, 0x5000, 0x1000);
+    placeholder->Track(*left);
+    placeholder->Track(*right);
+    placeholder->Track(*apart);
+
+    auto spanning = RestoredBuffer(placeholder, 0x1800, 0x1000);
+    EXPECT_EQ(placeholder->Track(*spanning), 2u);
+    EXPECT_FALSE(left->isAllocatorValid());
+    EXPECT_FALSE(right->isAllocatorValid());
+    EXPECT_TRUE(apart->isAllocatorValid());
+    EXPECT_TRUE(spanning->isAllocatorValid());
+    auto tracked = placeholder->Tracked();
+    ASSERT_EQ(tracked.size(), 2u);
+    EXPECT_EQ(tracked[0], spanning.get());
+    EXPECT_EQ(tracked[1], apart.get());
+    EXPECT_EQ(placeholder->TrackedBytes(), 0x2000u);
+
+    // Destroying an orphan touches nothing it no longer holds.
+    left.reset();
+    EXPECT_EQ(placeholder->Tracked().size(), 2u);
+}
+
+TEST(DummyBufferAllocatorTest, OrphanAllAndDestroyLeaveBuffersSafe) {
+    auto placeholder =
+        std::make_shared<DummyBufferAllocator>("seg", "10.0.0.1:1");
+    auto first = RestoredBuffer(placeholder, 0x1000, 0x1000);
+    auto second = RestoredBuffer(placeholder, 0x2000, 0x1000);
+    placeholder->Track(*first);
+    placeholder->Track(*second);
+    EXPECT_EQ(placeholder->OrphanAll(), 2u);
+    EXPECT_FALSE(first->isAllocatorValid());
+    EXPECT_TRUE(placeholder->Tracked().empty());
+    EXPECT_EQ(placeholder->TrackedBytes(), 0u);
+
+    auto third = RestoredBuffer(placeholder, 0x3000, 0x1000);
+    placeholder->Track(*third);
+    placeholder.reset();
+    third.reset();
+}
+
 TEST_F(BufferAllocatorTest, AllocateAndDeallocate) {
     for (const auto& allocator_type : allocator_types_) {
         std::string segment_name = "1";

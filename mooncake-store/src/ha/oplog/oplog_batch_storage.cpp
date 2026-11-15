@@ -4,6 +4,9 @@
 #include <array>
 #include <charconv>
 #include <string_view>
+#include <thread>
+#include <utility>
+#include <vector>
 
 #include <glog/logging.h>
 
@@ -476,24 +479,54 @@ ErrorCode OpLogBatchStorage::ReadBatchesAfter(
         if (err != ErrorCode::OK) {
             return err;
         }
+        std::vector<std::pair<const KvPair*, uint64_t>> records;
+        records.reserve(kvs.size());
         for (const auto& kv : kvs) {
             uint64_t key_batch_id = 0;
-            if (!TryParseBatchIdFromKey(kv.key, key_batch_id)) {
-                continue;
+            if (TryParseBatchIdFromKey(kv.key, key_batch_id)) {
+                records.emplace_back(&kv, key_batch_id);
             }
-            OpLogBatchRecord batch;
-            std::string reason;
-            if (!DecodeOpLogBatchRecord(kv.value, &batch, &reason)) {
+        }
+        // Decoding is as costly as the leader's encode, so a follower that
+        // decoded on one thread could not keep up with a busy writer.
+        std::vector<OpLogBatchRecord> decoded(records.size());
+        std::vector<std::string> reasons(records.size());
+        std::vector<char> ok(records.size(), 0);
+        const auto decode_range = [&](size_t begin, size_t end) {
+            for (size_t i = begin; i < end; ++i) {
+                ok[i] = DecodeOpLogBatchRecord(records[i].first->value,
+                                               &decoded[i], &reasons[i]);
+            }
+        };
+        constexpr size_t kDecodeWorkers = 4;
+        const size_t workers = std::min(kDecodeWorkers, records.size());
+        if (workers <= 1) {
+            decode_range(0, records.size());
+        } else {
+            std::vector<std::thread> threads;
+            const size_t per = (records.size() + workers - 1) / workers;
+            for (size_t w = 1; w < workers; ++w) {
+                threads.emplace_back(decode_range,
+                                     std::min(w * per, records.size()),
+                                     std::min((w + 1) * per, records.size()));
+            }
+            decode_range(0, std::min(per, records.size()));
+            for (auto& thread : threads) {
+                thread.join();
+            }
+        }
+        for (size_t i = 0; i < records.size(); ++i) {
+            if (!ok[i]) {
                 LOG(ERROR) << "Failed to decode OpLog batch record at key="
-                           << kv.key << ": " << reason;
+                           << records[i].first->key << ": " << reasons[i];
                 return ErrorCode::INTERNAL_ERROR;
             }
-            if (batch.batch_id != key_batch_id) {
+            if (decoded[i].batch_id != records[i].second) {
                 LOG(ERROR) << "OpLog batch id does not match key at key="
-                           << kv.key;
+                           << records[i].first->key;
                 return ErrorCode::INTERNAL_ERROR;
             }
-            batches.push_back(std::move(batch));
+            batches.push_back(std::move(decoded[i]));
         }
         if (limit == 0 || batches.size() >= limit || kvs.size() < remaining) {
             break;

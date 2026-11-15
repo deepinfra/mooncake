@@ -2,7 +2,7 @@
 #define BUFFER_ALLOCATOR_H
 
 #include <atomic>
-#include <boost/intrusive/list.hpp>
+#include <boost/intrusive/set.hpp>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -160,15 +160,19 @@ class AllocatedBuffer {
     // buffer's transfer protocol, so a restored replica goes live in place.
     void AdoptFrom(AllocatedBuffer&& imported);
 
-    using StandbyHook = boost::intrusive::list_member_hook<
+    using StandbyHook = boost::intrusive::set_member_hook<
         boost::intrusive::link_mode<boost::intrusive::auto_unlink>>;
 
    private:
     bool copyTransferProtocolFrom(const AllocatedBuffer& source);
     void UntrackStandby();
+    // Called with the tracking mutex held: drops the allocator and the link,
+    // so the replica holding this buffer is unreadable and frees nothing.
+    void OrphanLocked();
 
     // Links a buffer restored onto a not-yet-remounted endpoint into that
-    // endpoint's DummyBufferAllocator. Guarded by the tracking mutex.
+    // endpoint's DummyBufferAllocator, ordered by address. Guarded by the
+    // tracking mutex.
     StandbyHook standby_hook_;
     bool standby_tracked_{false};
 
@@ -280,10 +284,15 @@ class DummyBufferAllocator final : public BufferAllocatorBase {
     ~DummyBufferAllocator() override;
 
     // Records a buffer restored onto this endpoint, so a remount finds it
-    // without walking the index.
-    void Track(AllocatedBuffer& buffer);
-    // The buffers still restored onto this endpoint.
+    // without walking the index. A tracked buffer the new one overlaps is
+    // older, so stale: it is orphaned. Returns how many were.
+    size_t Track(AllocatedBuffer& buffer);
+    // The buffers still restored onto this endpoint, by address.
     std::vector<AllocatedBuffer*> Tracked() const;
+    // Orphans every tracked buffer, as when the endpoint's segment goes.
+    size_t OrphanAll();
+    // Bytes of the tracked buffers.
+    uint64_t TrackedBytes() const;
 
     std::unique_ptr<AllocatedBuffer> allocate(size_t size) override {
         return nullptr;
@@ -301,14 +310,24 @@ class DummyBufferAllocator final : public BufferAllocatorBase {
     }
 
    private:
+    friend class AllocatedBuffer;
+    struct ByAddress {
+        bool operator()(const AllocatedBuffer& lhs,
+                        const AllocatedBuffer& rhs) const {
+            return lhs.data() < rhs.data();
+        }
+    };
+
     std::string segment_name_;
     std::string transport_endpoint_;
-    boost::intrusive::list<AllocatedBuffer,
-                           boost::intrusive::member_hook<
-                               AllocatedBuffer, AllocatedBuffer::StandbyHook,
-                               &AllocatedBuffer::standby_hook_>,
-                           boost::intrusive::constant_time_size<false>>
+    boost::intrusive::set<AllocatedBuffer,
+                          boost::intrusive::member_hook<
+                              AllocatedBuffer, AllocatedBuffer::StandbyHook,
+                              &AllocatedBuffer::standby_hook_>,
+                          boost::intrusive::compare<ByAddress>,
+                          boost::intrusive::constant_time_size<false>>
         tracked_;
+    uint64_t tracked_bytes_{0};
 };
 
 /**
