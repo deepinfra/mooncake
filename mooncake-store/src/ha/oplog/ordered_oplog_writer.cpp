@@ -55,6 +55,35 @@ struct OrderedOpLogWriter::Impl {
         next_sequence_id = this->config.initial_durable_prefix.last_seq + 1;
     }
 
+    // Called with mutex held. Empty when `entry_count` slots are free now.
+    std::optional<ErrorCode> AdmissionErrorLocked(
+        size_t entry_count, OpLogAdmission admission) const {
+        if (terminal_state.has_value()) {
+            return terminal_state->error;
+        }
+        if (!accepting || draining || stop_requested) {
+            return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+        }
+        if (entry_count == 0) {
+            return ErrorCode::INVALID_PARAMS;
+        }
+        const size_t max = config.max_entries_per_batch;
+        if (entry_count > max) {
+            if (config.admit_oversized_groups && open_waiting_slots == 0) {
+                return std::nullopt;
+            }
+            return ErrorCode::TASK_PENDING_LIMIT_EXCEEDED;
+        }
+        const size_t limit =
+            admission == OpLogAdmission::kBackground
+                ? max - std::min(config.background_headroom, max - 1)
+                : max;
+        if (open_waiting_slots + entry_count > limit) {
+            return ErrorCode::TASK_PENDING_LIMIT_EXCEEDED;
+        }
+        return std::nullopt;
+    }
+
     void PublishRuntime(bool activate = false) {
         if (!activate && runtime_owner == 0) return;
         HAMetricManager::WriterRuntimeSnapshot snapshot;
@@ -175,6 +204,8 @@ struct OrderedOpLogWriter::Impl {
     bool accepting{true};
     bool running{false};
     bool stop_requested{false};
+    bool draining{false};
+    size_t reserve_waiters{0};
     bool callback_stop_requested{false};
     ErrorCode last_error{ErrorCode::OK};
     uint64_t retry_count{0};
@@ -265,32 +296,58 @@ void OrderedOpLogWriter::ActivateRuntimeMetrics() {
 OrderedOpLogWriter::~OrderedOpLogWriter() { Stop(); }
 
 tl::expected<OrderedOpLogWriter::Reservation, ErrorCode>
-OrderedOpLogWriter::Reserve() {
-    return ReserveBatch(1);
+OrderedOpLogWriter::Reserve(OpLogAdmission admission) {
+    return ReserveBatch(1, admission);
 }
 
-tl::expected<OrderedOpLogWriter::Reservation, ErrorCode>
-OrderedOpLogWriter::ReserveBatch(size_t entry_count) {
-    std::lock_guard<std::mutex> lock(impl_->mutex);
-    if (impl_->terminal_state.has_value()) {
-        return tl::make_unexpected(impl_->terminal_state->error);
-    }
-    if (!impl_->accepting) {
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-    }
-    if (entry_count == 0) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    if (entry_count > impl_->config.max_entries_per_batch ||
-        impl_->open_waiting_slots >
-            impl_->config.max_entries_per_batch - entry_count) {
-        return tl::make_unexpected(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
-    }
+OrderedOpLogWriter::Reservation OrderedOpLogWriter::TakeReservationLocked(
+    size_t entry_count) {
     const uint64_t id = impl_->next_reservation_id++;
     impl_->active_reservations.insert(id);
     impl_->open_waiting_slots += entry_count;
     impl_->PublishRuntime();
     return Reservation(this, id, entry_count);
+}
+
+tl::expected<OrderedOpLogWriter::Reservation, ErrorCode>
+OrderedOpLogWriter::ReserveBatch(size_t entry_count, OpLogAdmission admission) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (auto error = impl_->AdmissionErrorLocked(entry_count, admission)) {
+        return tl::make_unexpected(*error);
+    }
+    return TakeReservationLocked(entry_count);
+}
+
+tl::expected<OrderedOpLogWriter::Reservation, ErrorCode>
+OrderedOpLogWriter::ReserveWait(
+    size_t entry_count, OpLogAdmission admission,
+    std::chrono::steady_clock::time_point deadline) {
+    std::unique_lock<std::mutex> lock(impl_->mutex);
+    auto error = impl_->AdmissionErrorLocked(entry_count, admission);
+    const auto queue_full = [&error] {
+        return error == ErrorCode::TASK_PENDING_LIMIT_EXCEEDED;
+    };
+    const bool can_fit = entry_count <= impl_->config.max_entries_per_batch ||
+                         impl_->config.admit_oversized_groups;
+    if (queue_full() && can_fit &&
+        impl_->reserve_waiters < impl_->config.max_reserve_waiters) {
+        ++impl_->reserve_waiters;
+        while (queue_full()) {
+            const bool timed_out =
+                impl_->cv.wait_until(lock, deadline) == std::cv_status::timeout;
+            error = impl_->AdmissionErrorLocked(entry_count, admission);
+            if (timed_out) {
+                break;
+            }
+        }
+        if (--impl_->reserve_waiters == 0) {
+            impl_->cv.notify_all();
+        }
+    }
+    if (error) {
+        return tl::make_unexpected(*error);
+    }
+    return TakeReservationLocked(entry_count);
 }
 
 tl::expected<OrderedOpLogWriter::PendingHandle, ErrorCode>
@@ -308,6 +365,7 @@ OrderedOpLogWriter::Commit(Reservation&& reservation, OpLogEntry entry,
         reservation.id_ = 0;
         reservation.slots_ = 0;
         impl_->PublishRuntime();
+        impl_->cv.notify_all();
         return tl::make_unexpected(error);
     };
     if (impl_->terminal_state.has_value()) {
@@ -360,6 +418,7 @@ OrderedOpLogWriter::CommitBatch(Reservation&& reservation,
         reservation.id_ = 0;
         reservation.slots_ = 0;
         impl_->PublishRuntime();
+        impl_->cv.notify_all();
         return tl::make_unexpected(error);
     };
     if (entries.empty() || entries.size() != reservation.slots_) {
@@ -408,15 +467,18 @@ OrderedOpLogWriter::CommitBatch(Reservation&& reservation,
 }
 
 void OrderedOpLogWriter::Abort(Reservation&& reservation) {
-    std::lock_guard<std::mutex> lock(impl_->mutex);
-    if (reservation.writer_ == this &&
-        impl_->active_reservations.erase(reservation.id_) != 0) {
-        impl_->open_waiting_slots -= reservation.slots_;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (reservation.writer_ == this &&
+            impl_->active_reservations.erase(reservation.id_) != 0) {
+            impl_->open_waiting_slots -= reservation.slots_;
+        }
+        reservation.writer_ = nullptr;
+        reservation.id_ = 0;
+        reservation.slots_ = 0;
+        impl_->PublishRuntime();
     }
-    reservation.writer_ = nullptr;
-    reservation.id_ = 0;
-    reservation.slots_ = 0;
-    impl_->PublishRuntime();
+    impl_->cv.notify_all();
 }
 
 async_simple::Future<ErrorCode> OrderedOpLogWriter::AwaitDurable(
@@ -700,6 +762,11 @@ void OrderedOpLogWriter::Stop() {
     }
     impl_->cv.notify_all();
     Impl::CompleteWaiters(std::move(waiters), waiter_error);
+    {
+        // A thread parked in ReserveWait still touches impl_ once it wakes.
+        std::unique_lock<std::mutex> lock(impl_->mutex);
+        impl_->cv.wait(lock, [this] { return impl_->reserve_waiters == 0; });
+    }
     if (!running) {
         return;
     }
@@ -716,6 +783,27 @@ void OrderedOpLogWriter::Stop() {
     }
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->running = false;
+}
+
+bool OrderedOpLogWriter::FlushAndStop(std::chrono::milliseconds timeout) {
+    bool flushed;
+    {
+        std::unique_lock<std::mutex> lock(impl_->mutex);
+        impl_->draining = true;
+        impl_->cv.notify_all();
+        const auto all_durable = [this] {
+            return impl_->active_reservations.empty() &&
+                   impl_->durable_prefix.last_seq + 1 ==
+                       impl_->next_sequence_id;
+        };
+        impl_->cv.wait_for(lock, timeout, [&] {
+            return all_durable() || impl_->terminal_state.has_value() ||
+                   impl_->stop_requested || !impl_->running;
+        });
+        flushed = all_durable();
+    }
+    Stop();
+    return flushed;
 }
 
 }  // namespace mooncake

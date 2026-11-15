@@ -129,6 +129,12 @@ HAMetricManager::HAMetricManager()
                                    "Total number of dropped PUT_END operations "
                                    "due to late arrival after "
                                    "skip"),
+      oplog_append_dropped_total_(
+          "ha_oplog_append_dropped_total",
+          "OpLog entries a caller meant to log that were refused or failed"),
+      oplog_reserve_timeouts_total_(
+          "ha_oplog_reserve_timeouts_total",
+          "OpLog slot waits that ended with the queue still full"),
       oplog_batch_commits_total_(
           "ha_oplog_batch_commits_total",
           "Total number of Group Commit batches flushed to etcd"),
@@ -327,6 +333,18 @@ int64_t HAMetricManager::get_oplog_dropped_put_end_total() {
     return static_cast<int64_t>(oplog_dropped_put_end_total_.value());
 }
 
+void HAMetricManager::inc_oplog_append_dropped(int64_t val) {
+    oplog_append_dropped_total_.inc(val);
+}
+
+int64_t HAMetricManager::get_oplog_append_dropped_total() {
+    return static_cast<int64_t>(oplog_append_dropped_total_.value());
+}
+
+void HAMetricManager::inc_oplog_reserve_timeouts(int64_t val) {
+    oplog_reserve_timeouts_total_.inc(val);
+}
+
 void HAMetricManager::inc_oplog_batch_commits(int64_t val) {
     oplog_batch_commits_total_.inc(val);
 }
@@ -485,6 +503,8 @@ std::string HAMetricManager::serialize_metrics() {
     serialize_metric(oplog_watch_disconnections_total_);
     serialize_metric(oplog_applied_entries_total_);
     serialize_metric(oplog_dropped_put_end_total_);
+    serialize_metric(oplog_append_dropped_total_);
+    serialize_metric(oplog_reserve_timeouts_total_);
     serialize_metric(oplog_batch_commits_total_);
     serialize_metric(oplog_sync_batch_commits_total_);
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS

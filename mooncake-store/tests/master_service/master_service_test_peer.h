@@ -384,8 +384,8 @@ class MasterServiceTestPeer {
     tl::expected<uint64_t, ErrorCode> AppendOpLogVisibleBeforeDurable(
         OpType type, const std::string& tenant_id, const std::string& key,
         const std::string& payload) {
-        return service_.AppendOpLogVisibleBeforeDurable(type, tenant_id, key,
-                                                        payload);
+        return service_.AppendOpLogVisibleBeforeDurable(
+            OpLogAdmission::kForeground, type, tenant_id, key, payload);
     }
 
     tl::expected<OpLogEntry, ErrorCode> AppendOpLogWithDurableFinalize(
@@ -393,7 +393,8 @@ class MasterServiceTestPeer {
         const std::string& payload,
         MasterService::DurableFinalizeCallback callback) {
         return service_.AppendOpLogWithDurableFinalize(
-            type, tenant_id, key, payload, std::move(callback));
+            OpLogAdmission::kForeground, type, tenant_id, key, payload,
+            std::move(callback));
     }
 
     void CleanupExpiredDynamicReplicationState() {

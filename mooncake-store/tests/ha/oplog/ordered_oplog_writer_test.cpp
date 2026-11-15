@@ -1853,4 +1853,191 @@ TEST(OrderedOpLogWriterAdmissionTest, CommitBatchRejectsSlotMismatch) {
     writer.Abort(std::move(*next));
 }
 
+TEST_F(OrderedOpLogWriterAwaitTest, BackgroundReservesLeaveForegroundHeadroom) {
+    CreateWriter({.max_entries_per_batch = 4, .background_headroom = 1});
+    std::vector<OrderedOpLogWriter::Reservation> held;
+    for (int i = 0; i < 3; ++i) {
+        auto reservation = writer_->Reserve(OpLogAdmission::kBackground);
+        ASSERT_TRUE(reservation.has_value());
+        held.push_back(std::move(*reservation));
+    }
+    auto refused = writer_->Reserve(OpLogAdmission::kBackground);
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error(), ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
+
+    auto foreground = writer_->Reserve(OpLogAdmission::kForeground);
+    ASSERT_TRUE(foreground.has_value());
+    auto full = writer_->Reserve(OpLogAdmission::kForeground);
+    ASSERT_FALSE(full.has_value());
+    EXPECT_EQ(full.error(), ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, ReserveWaitWakesWhenASlotFrees) {
+    CreateWriter({.max_entries_per_batch = 1});
+    auto held = writer_->Reserve();
+    ASSERT_TRUE(held.has_value());
+    std::thread releaser([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        writer_->Abort(std::move(*held));
+    });
+    const auto started = std::chrono::steady_clock::now();
+    auto reservation = writer_->ReserveWait(1, OpLogAdmission::kForeground,
+                                            started + std::chrono::seconds(5));
+    releaser.join();
+    EXPECT_TRUE(reservation.has_value());
+    EXPECT_LT(std::chrono::steady_clock::now() - started,
+              std::chrono::seconds(4));
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, ReserveWaitTimesOutWhileQueueStaysFull) {
+    CreateWriter({.max_entries_per_batch = 1});
+    auto held = writer_->Reserve();
+    ASSERT_TRUE(held.has_value());
+    const auto started = std::chrono::steady_clock::now();
+    auto reservation =
+        writer_->ReserveWait(1, OpLogAdmission::kForeground,
+                             started + std::chrono::milliseconds(50));
+    ASSERT_FALSE(reservation.has_value());
+    EXPECT_EQ(reservation.error(), ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
+    EXPECT_GE(std::chrono::steady_clock::now() - started,
+              std::chrono::milliseconds(50));
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, ReserveWaitReturnsWhenStopped) {
+    CreateWriter({.max_entries_per_batch = 1});
+    auto held = writer_->Reserve();
+    ASSERT_TRUE(held.has_value());
+    const auto started = std::chrono::steady_clock::now();
+    tl::expected<OrderedOpLogWriter::Reservation, ErrorCode> reservation;
+    std::thread waiter([&] {
+        reservation = writer_->ReserveWait(1, OpLogAdmission::kForeground,
+                                           started + std::chrono::seconds(10));
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    writer_->Stop();
+    waiter.join();
+    ASSERT_FALSE(reservation.has_value());
+    EXPECT_EQ(reservation.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    EXPECT_LT(std::chrono::steady_clock::now() - started,
+              std::chrono::seconds(5));
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, ReserveWaitFailsAtOnceBeyondWaiterCap) {
+    CreateWriter({.max_entries_per_batch = 1, .max_reserve_waiters = 0});
+    auto held = writer_->Reserve();
+    ASSERT_TRUE(held.has_value());
+    const auto started = std::chrono::steady_clock::now();
+    auto reservation = writer_->ReserveWait(1, OpLogAdmission::kForeground,
+                                            started + std::chrono::seconds(5));
+    ASSERT_FALSE(reservation.has_value());
+    EXPECT_EQ(reservation.error(), ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
+    EXPECT_LT(std::chrono::steady_clock::now() - started,
+              std::chrono::seconds(1));
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, FlushAndStopWaitsForQueuedEntries) {
+    storage_.BlockWrites();
+    CreateWriter();
+    writer_->Start();
+    uint64_t last_sequence = 0;
+    for (int i = 0; i < 3; ++i) {
+        auto reservation = writer_->Reserve();
+        ASSERT_TRUE(reservation.has_value());
+        auto pending = writer_->Commit(
+            std::move(*reservation), MakeEntry("key" + std::to_string(i)), {});
+        ASSERT_TRUE(pending.has_value());
+        last_sequence = pending->sequence_id();
+    }
+    ASSERT_TRUE(storage_.WaitForBlockedWrite());
+    auto& last = Await(last_sequence);
+    std::thread unblocker([this] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        storage_.UnblockWrites();
+    });
+    EXPECT_TRUE(writer_->FlushAndStop(std::chrono::seconds(5)));
+    unblocker.join();
+    ExpectReadyResult(last, ErrorCode::OK);
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, FlushAndStopReportsEntriesLeftBehind) {
+    storage_.BlockWrites();
+    CreateWriter();
+    writer_->Start();
+    auto reservation = writer_->Reserve();
+    ASSERT_TRUE(reservation.has_value());
+    ASSERT_TRUE(
+        writer_->Commit(std::move(*reservation), MakeEntry(), {}).has_value());
+    ASSERT_TRUE(storage_.WaitForBlockedWrite());
+    std::thread unblocker([this] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        storage_.UnblockWrites();
+    });
+    EXPECT_FALSE(writer_->FlushAndStop(std::chrono::milliseconds(20)));
+    unblocker.join();
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, FlushAndStopRefusesNewReservations) {
+    storage_.BlockWrites();
+    CreateWriter();
+    writer_->Start();
+    auto reservation = writer_->Reserve();
+    ASSERT_TRUE(reservation.has_value());
+    ASSERT_TRUE(
+        writer_->Commit(std::move(*reservation), MakeEntry(), {}).has_value());
+    ASSERT_TRUE(storage_.WaitForBlockedWrite());
+    std::thread flusher(
+        [this] { writer_->FlushAndStop(std::chrono::seconds(5)); });
+    bool refused = false;
+    for (int i = 0; i < 100 && !refused; ++i) {
+        auto attempt = writer_->Reserve();
+        refused = !attempt.has_value() &&
+                  attempt.error() == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+        if (!refused) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    EXPECT_TRUE(refused);
+    storage_.UnblockWrites();
+    flusher.join();
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, OversizedGroupNeedsOptInAndAnEmptyQueue) {
+    CreateWriter({.max_entries_per_batch = 2});
+    auto refused = writer_->ReserveBatch(3);
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error(), ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
+    writer_->Stop();
+
+    CreateWriter({.max_entries_per_batch = 2, .admit_oversized_groups = true});
+    auto held = writer_->Reserve();
+    ASSERT_TRUE(held.has_value());
+    auto behind = writer_->ReserveBatch(3);
+    ASSERT_FALSE(behind.has_value());
+    EXPECT_EQ(behind.error(), ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
+
+    std::thread releaser([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        writer_->Abort(std::move(*held));
+    });
+    auto group = writer_->ReserveWait(
+        3, OpLogAdmission::kForeground,
+        std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    releaser.join();
+    ASSERT_TRUE(group.has_value());
+    auto single = writer_->Reserve();
+    ASSERT_FALSE(single.has_value());
+    EXPECT_EQ(single.error(), ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
+
+    writer_->Start();
+    std::vector<OpLogEntry> entries{MakeEntry("a"), MakeEntry("b"),
+                                    MakeEntry("c")};
+    ASSERT_TRUE(writer_->CommitBatch(std::move(*group), std::move(entries), {})
+                    .has_value());
+    ASSERT_TRUE(storage_.WaitForWrites(1));
+    const auto batches = storage_.Batches();
+    ASSERT_EQ(batches.size(), 1);
+    EXPECT_EQ(batches[0].entries.size(), 3);
+    EXPECT_TRUE(writer_->Reserve().has_value());
+}
+
 }  // namespace mooncake::test

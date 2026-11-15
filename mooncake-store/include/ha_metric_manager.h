@@ -241,6 +241,10 @@ class HAMetricManager {
     void inc_oplog_dropped_put_end(int64_t val = 1);
     int64_t get_oplog_dropped_put_end_total();
 
+    void inc_oplog_append_dropped(int64_t val = 1);
+    int64_t get_oplog_append_dropped_total();
+    void inc_oplog_reserve_timeouts(int64_t val = 1);
+
     /**
      * @brief Increase the total number of OpLog batch commits (Group Commit)
      */
@@ -343,6 +347,8 @@ class HAMetricManager {
     ylt::metric::counter_t oplog_watch_disconnections_total_;
     ylt::metric::counter_t oplog_applied_entries_total_;
     ylt::metric::counter_t oplog_dropped_put_end_total_;
+    ylt::metric::counter_t oplog_append_dropped_total_;
+    ylt::metric::counter_t oplog_reserve_timeouts_total_;
     ylt::metric::counter_t oplog_batch_commits_total_;
     ylt::metric::counter_t oplog_sync_batch_commits_total_;
 

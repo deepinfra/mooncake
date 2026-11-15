@@ -51,7 +51,7 @@ MasterStoreBackend::AppendOpLogWithDurableFinalize(OpType type,
                                                    const std::string& payload,
                                                    DurableFinalize finalize) {
     auto appended = master_.AppendOpLogWithDurableFinalize(
-        type, tenant_id, key, payload,
+        OpLogAdmission::kForeground, type, tenant_id, key, payload,
         [finalize](const OpLogEntry& entry) { finalize(entry); });
     if (appended) {
         // Durability success precedes callback completion; only failures may

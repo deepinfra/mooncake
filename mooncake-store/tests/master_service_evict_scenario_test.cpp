@@ -3,9 +3,11 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -241,6 +243,42 @@ class MasterServiceEvictScenarioTest : public ::testing::Test {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         ASSERT_EQ(error, ErrorCode::OK);
+    }
+
+    // Reads batches from the first until `done` holds over every entry read so
+    // far, or no further batch shows up within a second.
+    std::vector<OpLogEntry> ReadEntriesUntil(
+        OpLogBatchStorage& storage,
+        const std::function<bool(const std::vector<OpLogEntry>&)>& done) {
+        std::vector<OpLogEntry> entries;
+        for (uint64_t batch_id = 1;; ++batch_id) {
+            OpLogBatchRecord batch;
+            ErrorCode error = storage.ReadBatch(batch_id, batch);
+            for (int attempt = 0; attempt < 100 && error != ErrorCode::OK;
+                 ++attempt) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                error = storage.ReadBatch(batch_id, batch);
+            }
+            if (error != ErrorCode::OK) {
+                return entries;
+            }
+            entries.insert(entries.end(), batch.entries.begin(),
+                           batch.entries.end());
+            if (done(entries)) {
+                return entries;
+            }
+        }
+    }
+
+    static size_t CountEntries(const std::vector<OpLogEntry>& entries,
+                               OpType op, const std::string& key) {
+        size_t count = 0;
+        for (const auto& entry : entries) {
+            if (entry.op_type == op && entry.object_key == key) {
+                ++count;
+            }
+        }
+        return count;
     }
 
    private:
@@ -578,6 +616,79 @@ TEST_F(MasterServiceEvictScenarioTest,
     scenario.When(WaitForOpLogFailure())
         .When(EvictMemory(1.0))
         .Then(Object("cold").IsReadable());
+}
+
+TEST_F(MasterServiceEvictScenarioTest, EvictionLeavesOpLogSlotsForPutEnd) {
+    const std::string cluster_id = "evict_scenario_putend_slots";
+    auto backend = std::make_shared<EvictBlockingBatchHaKvBackend>();
+    auto config = HaConfig(cluster_id);
+    config.oplog_batch_max_entries = 4;
+    MasterScenario scenario("eviction leaves oplog slots for PutEnd", config,
+                            backend);
+    scenario.Given(MemoryNode("memory"))
+        .Given(IndexedObjects(0, 16)
+                   .Size(kObjectSize)
+                   .CompleteOn("memory")
+                   .ExpiresAt(ExpiredBase()))
+        .When(PutStart("hot", kObjectSize).OnNode("memory"));
+    OpLogBatchStorage storage(cluster_id, *backend);
+    ReadEntriesUntil(storage, [](const auto& seen) {
+        for (size_t i = 0; i < 16; ++i) {
+            if (CountEntries(seen, OpType::PUT_END, Key(i)) == 0) {
+                return false;
+            }
+        }
+        return true;
+    });
+
+    backend->BlockTxn();
+    scenario.When(EvictMemory(1.0)).When(PutEnd("hot"));
+    backend->AllowTxn();
+
+    const auto entries = ReadEntriesUntil(storage, [](const auto& seen) {
+        return CountEntries(seen, OpType::PUT_END, "hot") > 0;
+    });
+    EXPECT_EQ(CountEntries(entries, OpType::PUT_END, "hot"), 1);
+}
+
+TEST_F(MasterServiceEvictScenarioTest,
+       PutEndWithoutOpLogSlotFailsAndLeavesWriteOpen) {
+    const std::string cluster_id = "evict_scenario_putend_full";
+    auto backend = std::make_shared<EvictBlockingBatchHaKvBackend>();
+    auto config = HaConfig(cluster_id);
+    config.oplog_batch_max_entries = 4;
+    MasterScenario scenario("PutEnd without an oplog slot changes nothing",
+                            config, backend);
+    scenario.Given(MemoryNode("memory"));
+    for (size_t i = 0; i < 6; ++i) {
+        scenario.When(PutStart(Key(i), kObjectSize).OnNode("memory"));
+    }
+    OpLogBatchStorage storage(cluster_id, *backend);
+    ReadEntriesUntil(storage, [](const auto& seen) {
+        return std::any_of(seen.begin(), seen.end(), [](const auto& entry) {
+            return entry.op_type == OpType::SEGMENT_MOUNT;
+        });
+    });
+
+    // The first entry is sealed into the parked batch; the next four fill
+    // the queue.
+    backend->BlockTxn();
+    for (size_t i = 0; i < 5; ++i) {
+        scenario.When(PutEnd(Key(i)));
+    }
+    scenario
+        .When(
+            PutEnd(Key(5)).ExpectError(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED))
+        .Then(Object(Key(5)).IsNotReady());
+    backend->AllowTxn();
+
+    scenario.When(PutEnd(Key(5))).Then(Object(Key(5)).IsReadable());
+    const auto entries = ReadEntriesUntil(storage, [](const auto& seen) {
+        return CountEntries(seen, OpType::PUT_END, Key(5)) > 0;
+    });
+    for (size_t i = 0; i < 6; ++i) {
+        EXPECT_EQ(CountEntries(entries, OpType::PUT_END, Key(i)), 1) << Key(i);
+    }
 }
 
 TEST_F(MasterServiceEvictScenarioTest,

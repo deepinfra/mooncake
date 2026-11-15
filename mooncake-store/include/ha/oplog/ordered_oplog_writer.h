@@ -21,6 +21,20 @@ struct OrderedOpLogWriterConfig {
     size_t max_entries_per_batch{1024};
     DurablePrefix initial_durable_prefix{};
     std::chrono::milliseconds retry_timeout{0};
+    // Pending-queue slots background producers may not take, so a bulk job
+    // such as eviction never leaves a client write without a slot.
+    size_t background_headroom{0};
+    // Threads that may wait in ReserveWait at once; past it a reserve fails
+    // at once instead of parking another handler.
+    size_t max_reserve_waiters{64};
+    // Admit a group larger than max_entries_per_batch into an empty queue,
+    // where it is sealed whole as one record.
+    bool admit_oversized_groups{false};
+};
+
+enum class OpLogAdmission {
+    kForeground,
+    kBackground,
 };
 
 enum class OrderedOpLogWriterTerminalReason {
@@ -79,12 +93,20 @@ class OrderedOpLogWriter {
                        TerminalCallback terminal_callback = {});
     virtual ~OrderedOpLogWriter();
 
-    tl::expected<Reservation, ErrorCode> Reserve();
+    tl::expected<Reservation, ErrorCode> Reserve(
+        OpLogAdmission admission = OpLogAdmission::kForeground);
     // Reserve slots for one indivisible group of entries, to be committed
-    // together via CommitBatch. The same admission cap applies, so a group
-    // larger than max_entries_per_batch is rejected up front instead of
-    // producing an oversized record the backend might refuse.
-    tl::expected<Reservation, ErrorCode> ReserveBatch(size_t entry_count);
+    // together via CommitBatch. A group larger than max_entries_per_batch is
+    // rejected unless admit_oversized_groups is set and the queue is empty.
+    tl::expected<Reservation, ErrorCode> ReserveBatch(
+        size_t entry_count,
+        OpLogAdmission admission = OpLogAdmission::kForeground);
+    // ReserveBatch that waits until `deadline` while the pending queue is
+    // full. Any other refusal (retrying, draining, stopped, failed) returns
+    // at once.
+    tl::expected<Reservation, ErrorCode> ReserveWait(
+        size_t entry_count, OpLogAdmission admission,
+        std::chrono::steady_clock::time_point deadline);
     virtual tl::expected<PendingHandle, ErrorCode> Commit(
         Reservation&& reservation, OpLogEntry entry, DurableCallback callback);
     // Commit all entries as one indivisible group: they are sealed into a
@@ -116,9 +138,14 @@ class OrderedOpLogWriter {
     void ActivateRuntimeMetrics();
     void Start();
     virtual void Stop();
+    // Refuses new reservations, waits up to `timeout` for every reserved and
+    // committed entry to become durable, then stops. Returns whether all of
+    // them did.
+    bool FlushAndStop(std::chrono::milliseconds timeout);
 
    private:
     struct Impl;
+    Reservation TakeReservationLocked(size_t entry_count);
     std::unique_ptr<Impl> impl_;
 };
 

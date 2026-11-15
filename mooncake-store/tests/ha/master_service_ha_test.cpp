@@ -829,6 +829,33 @@ class MasterServiceHATest : public ::testing::Test {
         return segment;
     }
 
+    // Restores one overlapping pair, whose repair set is two entries.
+    tl::expected<void, ErrorCode> RestoreOverlappingPair(
+        MasterService& service) const {
+        const std::string endpoint = "standby_repair_oversized_segment";
+        auto survivor =
+            MakeStandbyObject("standby_oversized_survivor", endpoint);
+        auto lost = MakeStandbyObject("standby_oversized_lost", endpoint);
+        survivor.metadata.replicas.push_back(
+            MakeStandbyMemoryReplica(endpoint));
+        survivor.metadata.replicas[1].id = 2;
+        survivor.metadata.replicas[0]
+            .get_memory_descriptor()
+            .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+        survivor.metadata.replicas[1]
+            .get_memory_descriptor()
+            .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 8192;
+        lost.metadata.replicas.front()
+            .get_memory_descriptor()
+            .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+        auto restored = service.RestoreFromStandbySnapshot(
+            {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
+        if (!restored) {
+            return tl::make_unexpected(restored.error());
+        }
+        return {};
+    }
+
     // Use the test peer to seed an in-flight PromotionTask for a
     // given (tenant, key) so NotifyPromotionSuccess can proceed without
     // going through the on-hit admission gate (which is currently
@@ -2806,6 +2833,55 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairWritesDurableRecords) {
     ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
     EXPECT_EQ(1u, prefix.batch_id);
     EXPECT_EQ(2u, prefix.last_seq);
+}
+
+class UnboundedFakeBatchHaKvBackend : public FakeBatchHaKvBackend {
+   public:
+    bool AcceptsUnboundedRecords() const override { return true; }
+};
+
+TEST_F(MasterServiceHATest, RestoreRepairLargerThanABatchIsOneRecord) {
+    const std::string cluster_id = "test_restore_repair_oversized";
+    auto backend = std::make_shared<UnboundedFakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+
+    ASSERT_TRUE(RestoreOverlappingPair(service).has_value());
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord repair_batch;
+    ReadBatchEventually(storage, 1, repair_batch);
+    ASSERT_EQ(2u, repair_batch.entries.size());
+    EXPECT_EQ("standby_oversized_lost", repair_batch.entries[0].object_key);
+    EXPECT_EQ("standby_oversized_survivor", repair_batch.entries[1].object_key);
+}
+
+TEST_F(MasterServiceHATest, RestoreRepairLargerThanABatchFailsOnBoundedStore) {
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id("test_restore_repair_bounded")
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+
+    auto restored = RestoreOverlappingPair(service);
+    ASSERT_FALSE(restored.has_value());
+    EXPECT_EQ(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, restored.error());
 }
 
 TEST_F(MasterServiceHATest, RestoreDiscardRepairFailureFailsRestore) {

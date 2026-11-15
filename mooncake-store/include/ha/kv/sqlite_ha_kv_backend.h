@@ -25,6 +25,7 @@ class SqliteHaKvBackend : public HaKvBackend {
     ErrorCode DeleteRange(std::string_view begin_key,
                           std::string_view end_key) override;
     bool SupportsTxn() const override { return true; }
+    bool AcceptsUnboundedRecords() const override { return true; }
     ErrorCode Txn(const KvTxn& txn) override;
 
    private:

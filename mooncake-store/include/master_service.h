@@ -1427,15 +1427,15 @@ class MasterService {
         const ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& is_stale) const;
     tl::expected<void, ErrorCode> PersistStaleHandleCleanupForHA(
-        const std::string& why, const TenantId& tenant_id,
-        const std::string& key, ObjectMetadata& metadata,
-        const StaleHandleCleanupPlan& plan);
+        OpLogAdmission admission, const std::string& why,
+        const TenantId& tenant_id, const std::string& key,
+        ObjectMetadata& metadata, const StaleHandleCleanupPlan& plan);
     // Removes the object under HA with the oplog on: marks its completed
     // replicas removed and queues a REMOVE whose durable callback drops them,
     // and the object with them.
     tl::expected<void, ErrorCode> MarkRemovedAndPersist(
-        const TenantId& tenant_id, const std::string& key,
-        ObjectMetadata& metadata);
+        OpLogAdmission admission, const TenantId& tenant_id,
+        const std::string& key, ObjectMetadata& metadata);
     // Returns why a remove may not take the object, or nothing if it may: its
     // lease is still held (unless `force`), a replica is incomplete, or a
     // replication task reads it.
@@ -1696,6 +1696,12 @@ class MasterService {
     // Eviction thread related members
     std::thread eviction_thread_;
     std::atomic<bool> eviction_running_{false};
+    static constexpr auto kOpLogForegroundReserveWait =
+        std::chrono::milliseconds(100);
+    static constexpr auto kOpLogBackgroundReserveWait =
+        std::chrono::milliseconds(200);
+    static constexpr auto kOpLogFlushOnStopTimeout = std::chrono::seconds(2);
+    static constexpr auto kOpLogRepairReserveWait = std::chrono::seconds(5);
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
 
@@ -2389,18 +2395,34 @@ class MasterService {
     ErrorCode InitializeBatchOpLogWriter(std::shared_ptr<HaKvBackend> backend,
                                          bool require_fenced_writer);
     tl::expected<uint64_t, ErrorCode> AppendOpLogVisibleBeforeDurable(
-        OpType type, const std::string& tenant_id, const std::string& key,
+        OpLogAdmission admission, OpType type, const std::string& tenant_id,
+        const std::string& key, const std::string& payload);
+    tl::expected<uint64_t, ErrorCode> CommitOpLogVisibleBeforeDurable(
+        OrderedOpLogWriter::Reservation&& reservation, OpType type,
+        const std::string& tenant_id, const std::string& key,
         const std::string& payload);
     tl::expected<OpLogEntry, ErrorCode> AppendOpLogWithDurableFinalize(
-        OpType type, const std::string& tenant_id, const std::string& key,
-        const std::string& payload, DurableFinalizeCallback callback);
+        OpLogAdmission admission, OpType type, const std::string& tenant_id,
+        const std::string& key, const std::string& payload,
+        DurableFinalizeCallback callback);
     // Commit a set of entries as one indivisible batch record, so a durable
     // prefix either covers the whole set or none of it. Returns the last
     // assigned sequence id on success.
     tl::expected<uint64_t, ErrorCode> AppendOpLogBatchWithDurableFinalize(
         std::vector<OpLogEntry> entries, DurableFinalizeCallback callback);
+    // Waits briefly for a slot while the writer's queue is full, so a burst
+    // is paced by the writer instead of losing entries.
     tl::expected<OrderedOpLogWriter::Reservation, ErrorCode>
-    ReserveBatchOpLogSlot();
+    ReserveBatchOpLogSlot(OpLogAdmission admission);
+    tl::expected<OrderedOpLogWriter::Reservation, ErrorCode>
+    ReserveBatchOpLogSlot(OpLogAdmission admission,
+                          std::chrono::steady_clock::time_point deadline);
+    // PutEnd whose OpLog slot wait ends at `oplog_deadline`, so one batch
+    // shares a single wait.
+    auto PutEndBefore(const UUID& client_id, const ObjectMeta& object_meta,
+                      const TenantId& tenant_id, ReplicaType replica_type,
+                      std::chrono::steady_clock::time_point oplog_deadline)
+        -> tl::expected<void, ErrorCode>;
     tl::expected<OpLogEntry, ErrorCode> AppendReservedOpLogWithDurableFinalize(
         OrderedOpLogWriter::Reservation&& reservation, OpType type,
         const std::string& tenant_id, const std::string& key,
@@ -2464,9 +2486,8 @@ class MasterService {
      * Helper to persist REMOVE OpLog for a key with strong-consistency.
      * @return OK on success, error on persist failure (caller must skip erase)
      */
-    tl::expected<void, ErrorCode> PersistRemoveForHA(const char* why,
-                                                     const std::string& key);
-    tl::expected<void, ErrorCode> PersistRemoveForHA(const char* why,
+    tl::expected<void, ErrorCode> PersistRemoveForHA(OpLogAdmission admission,
+                                                     const char* why,
                                                      const TenantId& tenant_id,
                                                      const std::string& key);
 

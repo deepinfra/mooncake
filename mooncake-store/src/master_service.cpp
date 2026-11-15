@@ -250,7 +250,8 @@ struct MasterService::MemoryEviction {
 
             // Keep the removed IDs local until submission succeeds so a
             // consumed reservation cannot strand REMOVED replicas.
-            auto reservation = service_.ReserveBatchOpLogSlot();
+            auto reservation =
+                service_.ReserveBatchOpLogSlot(OpLogAdmission::kBackground);
             if (!reservation) {
                 LOG(WARNING)
                     << "Eviction: OpLog reservation failed for key=" << key
@@ -911,7 +912,11 @@ void MasterService::SetBatchOpLogTerminalCallback(
 }
 
 void MasterService::StopBatchOpLogWriter() {
-    if (ordered_oplog_writer_) ordered_oplog_writer_->Stop();
+    if (ordered_oplog_writer_ &&
+        !ordered_oplog_writer_->FlushAndStop(kOpLogFlushOnStopTimeout)) {
+        LOG(WARNING) << "action=stop_batch_oplog_writer"
+                     << ", error=entries_not_durable_before_stop";
+    }
 }
 
 TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
@@ -1983,8 +1988,9 @@ MasterService::BuildStaleHandleCleanupPlan(
 }
 
 tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
-    const std::string& why, const TenantId& tenant_id, const std::string& key,
-    ObjectMetadata& metadata, const StaleHandleCleanupPlan& plan) {
+    OpLogAdmission admission, const std::string& why, const TenantId& tenant_id,
+    const std::string& key, ObjectMetadata& metadata,
+    const StaleHandleCleanupPlan& plan) {
     if (plan.removed_ids.empty() || !enable_oplog_) {
         return {};
     }
@@ -1996,7 +2002,7 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
                               : SerializeMetadataForOpLogFromReplicaDescriptors(
                                     metadata, plan.remaining);
 
-    auto reservation = ReserveBatchOpLogSlot();
+    auto reservation = ReserveBatchOpLogSlot(admission);
     if (!reservation) {
         return tl::make_unexpected(reservation.error());
     }
@@ -2423,8 +2429,8 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                 if (enable_ha_ && enable_oplog_) {
                     // The erase runs from the durable-finalize callback.
                     auto persist_result = PersistStaleHandleCleanupForHA(
-                        "ClearStaleHandles", tenant_id, object.key, metadata,
-                        cleanup_plan);
+                        OpLogAdmission::kBackground, "ClearStaleHandles",
+                        tenant_id, object.key, metadata, cleanup_plan);
                     if (!persist_result && !first_persist_error) {
                         first_persist_error = persist_result.error();
                     }
@@ -2439,7 +2445,8 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
             } else if (enable_ha_) {
                 if (enable_oplog_) {
                     auto persist_result = AppendOpLogWithDurableFinalize(
-                        OpType::REMOVE, tenant_id.value(), object.key, {},
+                        OpLogAdmission::kBackground, OpType::REMOVE,
+                        tenant_id.value(), object.key, {},
                         [this, object](const OpLogEntry& durable_entry) {
                             FinalizeMetadataEraseAfterDurable(
                                 object, TenantId(durable_entry.tenant_id));
@@ -2593,8 +2600,8 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                 SegmentUnmountOp op{it->transport_endpoint};
                 auto bytes = struct_pack::serialize(op);
                 auto persist_result = AppendOpLogVisibleBeforeDurable(
-                    OpType::SEGMENT_UNMOUNT, TenantId::Default().value(),
-                    it->transport_endpoint,
+                    OpLogAdmission::kForeground, OpType::SEGMENT_UNMOUNT,
+                    TenantId::Default().value(), it->transport_endpoint,
                     std::string(bytes.begin(), bytes.end()));
                 if (!persist_result) {
                     LOG(ERROR)
@@ -4387,7 +4394,8 @@ auto MasterService::BatchReplicaClear(
 
             if (enable_ha_) {
                 if (enable_oplog_) {
-                    auto reservation = ReserveBatchOpLogSlot();
+                    auto reservation =
+                        ReserveBatchOpLogSlot(OpLogAdmission::kBackground);
                     if (!reservation) {
                         continue;
                     }
@@ -4453,7 +4461,8 @@ auto MasterService::BatchReplicaClear(
 
             if (enable_ha_) {
                 if (enable_oplog_) {
-                    auto reservation = ReserveBatchOpLogSlot();
+                    auto reservation =
+                        ReserveBatchOpLogSlot(OpLogAdmission::kBackground);
                     if (!reservation) {
                         continue;
                     }
@@ -5298,8 +5307,9 @@ auto MasterService::CleanupStaleBeforeWrite(
     if (cleanup_plan.removed_ids.empty()) {
         return {};
     }
-    auto persist_result = PersistStaleHandleCleanupForHA(
-        why, tenant_id, key, metadata, cleanup_plan);
+    auto persist_result =
+        PersistStaleHandleCleanupForHA(OpLogAdmission::kForeground, why,
+                                       tenant_id, key, metadata, cleanup_plan);
     if (!persist_result) {
         return tl::make_unexpected(persist_result.error());
     }
@@ -5391,7 +5401,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                 return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
             }
             if (enable_oplog_ && ordered_oplog_writer_) {
-                auto err = PersistRemoveForHA("PutStart(stale cleanup REMOVE)",
+                auto err = PersistRemoveForHA(OpLogAdmission::kForeground,
+                                              "PutStart(stale cleanup REMOVE)",
                                               object_id.tenant_id, key);
                 if (!err) {
                     return tl::make_unexpected(err.error());
@@ -5426,6 +5437,16 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 
 auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                            const TenantId& tenant_id, ReplicaType replica_type)
+    -> tl::expected<void, ErrorCode> {
+    return PutEndBefore(
+        client_id, object_meta, tenant_id, replica_type,
+        std::chrono::steady_clock::now() + kOpLogForegroundReserveWait);
+}
+
+auto MasterService::PutEndBefore(
+    const UUID& client_id, const ObjectMeta& object_meta,
+    const TenantId& tenant_id, ReplicaType replica_type,
+    std::chrono::steady_clock::time_point oplog_deadline)
     -> tl::expected<void, ErrorCode> {
     const auto& key = object_meta.key;
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
@@ -5492,6 +5513,20 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                                                          metadata.group_id);
     if (!import_write) {
         return tl::make_unexpected(import_write.error());
+    }
+
+    // Taken before the first change, so a PutEnd the log cannot record
+    // fails with the write still open instead of completing unlogged.
+    std::optional<OrderedOpLogWriter::Reservation> oplog_reservation;
+    if (enable_oplog_ && ordered_oplog_writer_) {
+        auto reservation =
+            ReserveBatchOpLogSlot(OpLogAdmission::kForeground, oplog_deadline);
+        if (!reservation) {
+            LOG(WARNING) << "PutEnd: no OpLog slot for key=" << key
+                         << ", err=" << static_cast<int>(reservation.error());
+            return tl::make_unexpected(reservation.error());
+        }
+        oplog_reservation = std::move(reservation.value());
     }
 
     if (bucket_allocator_ != nullptr && (replica_type == ReplicaType::ALL ||
@@ -5591,13 +5626,14 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     metadata.GrantReadLease(std::chrono::milliseconds::zero());
     PublishKvStored(key, metadata, object_id.tenant_id);
 
-    if (enable_oplog_ && ordered_oplog_writer_) {
+    if (oplog_reservation) {
         std::string payload = SerializeMetadataForOpLog(metadata);
-        auto result = AppendOpLogVisibleBeforeDurable(
-            OpType::PUT_END, object_id.tenant_id.value(), key, payload);
+        auto result = CommitOpLogVisibleBeforeDurable(
+            std::move(*oplog_reservation), OpType::PUT_END,
+            object_id.tenant_id.value(), key, payload);
         if (!result) {
-            LOG(WARNING) << "PutEnd: OpLog queue failed for key=" << key
-                         << ", err=" << static_cast<int>(result.error());
+            LOG(ERROR) << "PutEnd: OpLog commit failed for key=" << key
+                       << ", err=" << static_cast<int>(result.error());
         }
     }
     if (advanced_primary_write) {
@@ -5701,7 +5737,8 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
         }
 
         auto persist_result = AppendOpLogVisibleBeforeDurable(
-            OpType::PUT_END, object_id.tenant_id.value(), key,
+            OpLogAdmission::kForeground, OpType::PUT_END,
+            object_id.tenant_id.value(), key,
             SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post));
         if (!persist_result) {
             return tl::make_unexpected(persist_result.error());
@@ -5793,7 +5830,7 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         auto remaining =
             BuildRemainingReplicaDescriptors(metadata, target_pred);
         std::vector<ReplicaID> removed_ids;
-        auto reservation = ReserveBatchOpLogSlot();
+        auto reservation = ReserveBatchOpLogSlot(OpLogAdmission::kForeground);
         if (!reservation) {
             return tl::make_unexpected(reservation.error());
         }
@@ -5864,9 +5901,11 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
     assert(tenant_id.IsValid());
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(object_metas.size());
+    const auto oplog_deadline =
+        std::chrono::steady_clock::now() + kOpLogForegroundReserveWait;
     for (const auto& object_meta : object_metas) {
-        results.emplace_back(
-            PutEnd(client_id, object_meta, tenant_id, replica_type));
+        results.emplace_back(PutEndBefore(client_id, object_meta, tenant_id,
+                                          replica_type, oplog_deadline));
     }
     return results;
 }
@@ -6413,7 +6452,8 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
         auto remaining =
             BuildRemainingReplicaDescriptors(metadata, target_pred);
         if (enable_oplog_) {
-            auto reservation = ReserveBatchOpLogSlot();
+            auto reservation =
+                ReserveBatchOpLogSlot(OpLogAdmission::kForeground);
             if (!reservation) {
                 return tl::make_unexpected(reservation.error());
             }
@@ -6455,10 +6495,12 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
         tl::expected<OpLogEntry, ErrorCode> persist_result;
         if (remaining.empty()) {
             persist_result = AppendOpLogWithDurableFinalize(
-                OpType::REMOVE, metadata.tenant_id.value(), key, {}, nullptr);
+                OpLogAdmission::kForeground, OpType::REMOVE,
+                metadata.tenant_id.value(), key, {}, nullptr);
         } else {
             persist_result = AppendOpLogWithDurableFinalize(
-                OpType::PUT_END, metadata.tenant_id.value(), key,
+                OpLogAdmission::kForeground, OpType::PUT_END,
+                metadata.tenant_id.value(), key,
                 SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
                                                                 remaining),
                 nullptr);
@@ -6806,7 +6848,7 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
 
     std::optional<OrderedOpLogWriter::Reservation> batch_reservation;
     if (enable_ha_ && enable_oplog_) {
-        auto reservation = ReserveBatchOpLogSlot();
+        auto reservation = ReserveBatchOpLogSlot(OpLogAdmission::kForeground);
         if (!reservation) {
             return tl::make_unexpected(reservation.error());
         }
@@ -6854,7 +6896,8 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
             }
         } else {
             auto persist_result = AppendOpLogVisibleBeforeDurable(
-                OpType::PUT_END, tenant_id.value(), key, payload);
+                OpLogAdmission::kForeground, OpType::PUT_END, tenant_id.value(),
+                key, payload);
             if (!persist_result) {
                 LOG(WARNING)
                     << "CopyEnd: PUT_END persist failed for key=" << key
@@ -7183,7 +7226,8 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
 
         tl::expected<OpLogEntry, ErrorCode> persist_result;
         if (enable_oplog_) {
-            auto reservation = ReserveBatchOpLogSlot();
+            auto reservation =
+                ReserveBatchOpLogSlot(OpLogAdmission::kForeground);
             if (!reservation) {
                 return tl::make_unexpected(reservation.error());
             }
@@ -7199,7 +7243,8 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
                 });
         } else {
             persist_result = AppendOpLogWithDurableFinalize(
-                OpType::PUT_END, metadata.tenant_id.value(), key,
+                OpLogAdmission::kForeground, OpType::PUT_END,
+                metadata.tenant_id.value(), key,
                 SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post),
                 nullptr);
         }
@@ -7343,16 +7388,17 @@ auto MasterService::RemoveObject(const std::string& key,
     }
 
     if (enable_ha_ && enable_oplog_) {
-        return MarkRemovedAndPersist(object_id.tenant_id, key, metadata);
+        return MarkRemovedAndPersist(OpLogAdmission::kForeground,
+                                     object_id.tenant_id, key, metadata);
     }
     accessor.Erase();
     return {};
 }
 
 tl::expected<void, ErrorCode> MasterService::MarkRemovedAndPersist(
-    const TenantId& tenant_id, const std::string& key,
+    OpLogAdmission admission, const TenantId& tenant_id, const std::string& key,
     ObjectMetadata& metadata) {
-    auto reservation = ReserveBatchOpLogSlot();
+    auto reservation = ReserveBatchOpLogSlot(admission);
     if (!reservation) {
         return tl::make_unexpected(reservation.error());
     }
@@ -7451,7 +7497,8 @@ MasterService::RemoveResult MasterService::RemoveTenantObjects(
             metadata.TotalLength() *
             metadata.CountReplicas(&Replica::fn_is_memory_replica);
         if (enable_ha_ && enable_oplog_) {
-            if (!MarkRemovedAndPersist(tenant_id, candidate.key, metadata)) {
+            if (!MarkRemovedAndPersist(OpLogAdmission::kBackground, tenant_id,
+                                       candidate.key, metadata)) {
                 result.skipped_object = true;
                 continue;
             }
@@ -7616,8 +7663,8 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
             BuildStaleHandleCleanupPlan(accessor.Get(), retaining_clients);
         if (!cleanup_plan.removed_ids.empty()) {
             auto persist_result = PersistStaleHandleCleanupForHA(
-                "BatchRemove(stale cleanup)", normalized_tenant, key,
-                accessor.Get(), cleanup_plan);
+                OpLogAdmission::kForeground, "BatchRemove(stale cleanup)",
+                normalized_tenant, key, accessor.Get(), cleanup_plan);
             if (!persist_result) {
                 results[original_idx] =
                     tl::make_unexpected(persist_result.error());
@@ -7654,8 +7701,8 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
         }
 
         if (enable_ha_ && enable_oplog_) {
-            results[original_idx] =
-                MarkRemovedAndPersist(normalized_tenant, key, metadata);
+            results[original_idx] = MarkRemovedAndPersist(
+                OpLogAdmission::kForeground, normalized_tenant, key, metadata);
             continue;
         }
         accessor.Erase();
@@ -9368,7 +9415,8 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
         staged->is_processing()) {
         std::optional<OrderedOpLogWriter::Reservation> batch_reservation;
         if (enable_ha_ && enable_oplog_) {
-            auto reservation = ReserveBatchOpLogSlot();
+            auto reservation =
+                ReserveBatchOpLogSlot(OpLogAdmission::kForeground);
             if (!reservation) {
                 return tl::make_unexpected(reservation.error());
             }
@@ -9397,7 +9445,8 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
                 }
             } else {
                 auto persist_result = AppendOpLogVisibleBeforeDurable(
-                    OpType::PUT_END, tenant_id.value(), key, payload);
+                    OpLogAdmission::kForeground, OpType::PUT_END,
+                    tenant_id.value(), key, payload);
                 if (!persist_result) {
                     LOG(WARNING)
                         << "NotifyPromotionSuccess: PUT_END persist failed "
@@ -9690,6 +9739,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 ordered_oplog_writer_) {
                 // The discard is applied once it is durable.
                 auto persist_result = AppendOpLogWithDurableFinalize(
+                    OpLogAdmission::kBackground,
                     would_invalidate ? OpType::REMOVE : OpType::PUT_END,
                     tenant_id.value(), key,
                     would_invalidate
@@ -9760,6 +9810,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
             // The discard is applied once it is durable.
             task->durable_cleanup_pending = true;
             auto persist_result = AppendOpLogWithDurableFinalize(
+                OpLogAdmission::kBackground,
                 would_invalidate ? OpType::REMOVE : OpType::PUT_END,
                 tenant_id.value(), key,
                 would_invalidate
@@ -10017,7 +10068,8 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
         if (enable_oplog_ && ordered_oplog_writer_) {
             auto remaining = BuildRemainingReplicaDescriptors(
                 metadata, is_evictable_nof_replica);
-            auto reservation = ReserveBatchOpLogSlot();
+            auto reservation =
+                ReserveBatchOpLogSlot(OpLogAdmission::kBackground);
             if (!reservation) {
                 LOG(WARNING)
                     << "NoFBatchEvict: OpLog reservation failed "
@@ -11830,6 +11882,8 @@ ErrorCode MasterService::InitializeBatchOpLogWriter(
 
     OrderedOpLogWriterConfig writer_config;
     writer_config.max_entries_per_batch = oplog_batch_max_entries_;
+    writer_config.background_headroom = oplog_batch_max_entries_ / 4;
+    writer_config.admit_oversized_groups = backend->AcceptsUnboundedRecords();
     writer_config.initial_durable_prefix = durable_prefix;
     OpLogBatchStorage* storage_ptr = storage.get();
     const ViewVersionId producer_view_version = view_version_;
@@ -11865,36 +11919,49 @@ ErrorCode MasterService::InitializeBatchOpLogWriter(
 }
 
 tl::expected<uint64_t, ErrorCode>
-MasterService::AppendOpLogVisibleBeforeDurable(OpType type,
+MasterService::AppendOpLogVisibleBeforeDurable(OpLogAdmission admission,
+                                               OpType type,
                                                const std::string& tenant_id,
                                                const std::string& key,
                                                const std::string& payload) {
-    if (!enable_oplog_) {
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    const TenantId resolved_tenant(enable_multi_tenants_
+                                       ? tenant_id
+                                       : std::string(TenantId::kDefaultValue));
+    if (enable_oplog_ && !resolved_tenant.IsValid()) {
+        return tl::unexpected(ErrorCode::TENANT_NOT_REGISTERED);
     }
-    if (!ordered_oplog_writer_) {
-        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    auto reservation = ReserveBatchOpLogSlot(admission);
+    if (!reservation) {
+        if (enable_oplog_) {
+            HAMetricManager::instance().inc_oplog_append_dropped();
+        }
+        return tl::unexpected(reservation.error());
     }
+    return CommitOpLogVisibleBeforeDurable(std::move(reservation.value()), type,
+                                           tenant_id, key, payload);
+}
 
+tl::expected<uint64_t, ErrorCode>
+MasterService::CommitOpLogVisibleBeforeDurable(
+    OrderedOpLogWriter::Reservation&& reservation, OpType type,
+    const std::string& tenant_id, const std::string& key,
+    const std::string& payload) {
     const TenantId resolved_tenant(enable_multi_tenants_
                                        ? tenant_id
                                        : std::string(TenantId::kDefaultValue));
     if (!resolved_tenant.IsValid()) {
+        HAMetricManager::instance().inc_oplog_append_dropped();
         return tl::unexpected(ErrorCode::TENANT_NOT_REGISTERED);
-    }
-
-    auto reservation = ordered_oplog_writer_->Reserve();
-    if (!reservation) {
-        return tl::unexpected(reservation.error());
     }
     OpLogEntry entry;
     entry.op_type = type;
     entry.tenant_id = resolved_tenant.value();
     entry.object_key = key;
     entry.payload = payload;
-    auto pending = ordered_oplog_writer_->Commit(std::move(reservation.value()),
+    auto pending = ordered_oplog_writer_->Commit(std::move(reservation),
                                                  std::move(entry), nullptr);
     if (!pending) {
+        HAMetricManager::instance().inc_oplog_append_dropped();
         return tl::unexpected(pending.error());
     }
     return pending.value().sequence_id();
@@ -11902,13 +11969,14 @@ MasterService::AppendOpLogVisibleBeforeDurable(OpType type,
 
 tl::expected<OpLogEntry, ErrorCode>
 MasterService::AppendOpLogWithDurableFinalize(
-    OpType type, const std::string& tenant_id, const std::string& key,
-    const std::string& payload, DurableFinalizeCallback callback) {
+    OpLogAdmission admission, OpType type, const std::string& tenant_id,
+    const std::string& key, const std::string& payload,
+    DurableFinalizeCallback callback) {
     if (!enable_oplog_) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto reservation = ReserveBatchOpLogSlot();
+    auto reservation = ReserveBatchOpLogSlot(admission);
     if (!reservation) {
         return tl::unexpected(reservation.error());
     }
@@ -11918,14 +11986,36 @@ MasterService::AppendOpLogWithDurableFinalize(
 }
 
 tl::expected<OrderedOpLogWriter::Reservation, ErrorCode>
-MasterService::ReserveBatchOpLogSlot() {
+MasterService::ReserveBatchOpLogSlot(OpLogAdmission admission) {
     if (!enable_oplog_) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (!ordered_oplog_writer_) {
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    return ordered_oplog_writer_->Reserve();
+    const auto wait = admission == OpLogAdmission::kForeground
+                          ? kOpLogForegroundReserveWait
+                          : kOpLogBackgroundReserveWait;
+    return ReserveBatchOpLogSlot(admission,
+                                 std::chrono::steady_clock::now() + wait);
+}
+
+tl::expected<OrderedOpLogWriter::Reservation, ErrorCode>
+MasterService::ReserveBatchOpLogSlot(
+    OpLogAdmission admission, std::chrono::steady_clock::time_point deadline) {
+    if (!enable_oplog_) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!ordered_oplog_writer_) {
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    auto reservation =
+        ordered_oplog_writer_->ReserveWait(1, admission, deadline);
+    if (!reservation &&
+        reservation.error() == ErrorCode::TASK_PENDING_LIMIT_EXCEEDED) {
+        HAMetricManager::instance().inc_oplog_reserve_timeouts();
+    }
+    return reservation;
 }
 
 tl::expected<uint64_t, ErrorCode>
@@ -11949,7 +12039,9 @@ MasterService::AppendOpLogBatchWithDurableFinalize(
         }
         entry.tenant_id = resolved_tenant.value();
     }
-    auto reservation = ordered_oplog_writer_->ReserveBatch(entries.size());
+    auto reservation = ordered_oplog_writer_->ReserveWait(
+        entries.size(), OpLogAdmission::kForeground,
+        std::chrono::steady_clock::now() + kOpLogRepairReserveWait);
     if (!reservation) {
         return tl::unexpected(reservation.error());
     }
@@ -11991,14 +12083,10 @@ MasterService::AppendReservedOpLogWithDurableFinalize(
 }
 
 tl::expected<void, ErrorCode> MasterService::PersistRemoveForHA(
-    const char* why, const std::string& key) {
-    return PersistRemoveForHA(why, TenantId::Default(), key);
-}
-
-tl::expected<void, ErrorCode> MasterService::PersistRemoveForHA(
-    const char* why, const TenantId& tenant_id, const std::string& key) {
+    OpLogAdmission admission, const char* why, const TenantId& tenant_id,
+    const std::string& key) {
     auto result = AppendOpLogWithDurableFinalize(
-        OpType::REMOVE, tenant_id.value(), key, {}, nullptr);
+        admission, OpType::REMOVE, tenant_id.value(), key, {}, nullptr);
     if (!result) {
         LOG(WARNING) << why << ": REMOVE persist failed for key=" << key
                      << ", err=" << static_cast<int>(result.error());
@@ -12018,12 +12106,12 @@ void MasterService::PersistSegmentOpForHAOrEnqueue(const char* why, OpType type,
                                                    const TenantId& tenant_id,
                                                    const std::string& key,
                                                    const std::string& payload) {
-    auto result =
-        AppendOpLogVisibleBeforeDurable(type, tenant_id.value(), key, payload);
+    auto result = AppendOpLogVisibleBeforeDurable(
+        OpLogAdmission::kForeground, type, tenant_id.value(), key, payload);
     if (!result) {
-        LOG(WARNING) << why << ": segment OpLog queue failed for key=" << key
-                     << ", type=" << static_cast<int>(type)
-                     << ", err=" << static_cast<int>(result.error());
+        LOG(ERROR) << why << ": segment OpLog queue failed for key=" << key
+                   << ", type=" << static_cast<int>(type)
+                   << ", err=" << static_cast<int>(result.error());
     }
 }
 

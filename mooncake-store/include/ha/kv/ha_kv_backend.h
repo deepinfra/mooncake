@@ -47,6 +47,9 @@ class HaKvBackend {
     virtual ErrorCode DeleteRange(std::string_view begin_key,
                                   std::string_view end_key) = 0;
     virtual bool SupportsTxn() const = 0;
+    // Whether one transaction may carry a record of any size. etcd caps a
+    // request, so a record past the batch cap may be refused there.
+    virtual bool AcceptsUnboundedRecords() const { return false; }
     virtual ErrorCode Txn(const KvTxn& txn) = 0;
 };
 
