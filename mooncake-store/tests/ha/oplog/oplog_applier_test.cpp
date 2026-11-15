@@ -155,6 +155,79 @@ class OpLogApplierTest : public ::testing::Test {
     std::string cluster_id_;
 };
 
+// The segment op shapes as builds before the identity fields wrote them.
+struct LegacySegmentMountOp {
+    std::string segment_name;
+    std::string transport_endpoint;
+    uint64_t capacity{0};
+    bool is_memory_segment{false};
+    std::string file_path;
+
+    YLT_REFL(LegacySegmentMountOp, segment_name, transport_endpoint, capacity,
+             is_memory_segment, file_path);
+};
+
+struct LegacySegmentUnmountOp {
+    std::string transport_endpoint;
+
+    YLT_REFL(LegacySegmentUnmountOp, transport_endpoint);
+};
+
+TEST(SegmentOpCompatibilityTest, OldAndNewBuildsReadEachOthersMountOps) {
+    SegmentMountOp current;
+    current.segment_name = "seg";
+    current.transport_endpoint = "10.0.0.1:1234";
+    current.capacity = 4096;
+    current.is_memory_segment = true;
+    current.segment_id = UUID{7, 8};
+    current.base = 0x10000;
+    current.client_id = UUID{9, 10};
+    const auto current_bytes = struct_pack::serialize<std::string>(current);
+
+    LegacySegmentMountOp read_by_old;
+    ASSERT_EQ(struct_pack::deserialize_to(read_by_old, current_bytes),
+              struct_pack::errc::ok);
+    EXPECT_EQ(read_by_old.segment_name, "seg");
+    EXPECT_EQ(read_by_old.transport_endpoint, "10.0.0.1:1234");
+    EXPECT_EQ(read_by_old.capacity, 4096);
+    EXPECT_TRUE(read_by_old.is_memory_segment);
+
+    LegacySegmentMountOp legacy{"seg", "10.0.0.1:1234", 4096, true, ""};
+    const auto legacy_bytes = struct_pack::serialize<std::string>(legacy);
+    SegmentMountOp read_by_new;
+    ASSERT_EQ(struct_pack::deserialize_to(read_by_new, legacy_bytes),
+              struct_pack::errc::ok);
+    EXPECT_EQ(read_by_new.transport_endpoint, "10.0.0.1:1234");
+    EXPECT_FALSE(read_by_new.segment_id.has_value());
+    EXPECT_FALSE(read_by_new.base.has_value());
+    EXPECT_FALSE(read_by_new.client_id.has_value());
+
+    SegmentMountOp round_trip;
+    ASSERT_EQ(struct_pack::deserialize_to(round_trip, current_bytes),
+              struct_pack::errc::ok);
+    EXPECT_EQ(round_trip.segment_id.value(), (UUID{7, 8}));
+    EXPECT_EQ(round_trip.base.value(), 0x10000u);
+    EXPECT_EQ(round_trip.client_id.value(), (UUID{9, 10}));
+}
+
+TEST(SegmentOpCompatibilityTest, OldAndNewBuildsReadEachOthersUnmountOps) {
+    SegmentUnmountOp current{"10.0.0.1:1234"};
+    current.segment_id = UUID{7, 8};
+    LegacySegmentUnmountOp read_by_old;
+    ASSERT_EQ(struct_pack::deserialize_to(
+                  read_by_old, struct_pack::serialize<std::string>(current)),
+              struct_pack::errc::ok);
+    EXPECT_EQ(read_by_old.transport_endpoint, "10.0.0.1:1234");
+
+    SegmentUnmountOp read_by_new;
+    ASSERT_EQ(struct_pack::deserialize_to(
+                  read_by_new, struct_pack::serialize<std::string>(
+                                   LegacySegmentUnmountOp{"10.0.0.1:1234"})),
+              struct_pack::errc::ok);
+    EXPECT_EQ(read_by_new.transport_endpoint, "10.0.0.1:1234");
+    EXPECT_FALSE(read_by_new.segment_id.has_value());
+}
+
 TEST_F(OpLogApplierTest, AppliesWeightMetadataAndRejectsStaleGeneration) {
     auto generation_one = MakeWeightMetadata(1);
     const auto key = MakeWeightRevisionMetadataKey(generation_one.identity);

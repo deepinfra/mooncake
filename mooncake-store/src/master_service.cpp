@@ -1008,6 +1008,9 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         op.capacity = segment.size;
         op.is_memory_segment = true;
         op.file_path.clear();
+        op.segment_id = segment.id;
+        op.base = segment.base;
+        op.client_id = client_id;
         auto bytes = struct_pack::serialize(op);
         PersistSegmentOpForHAOrEnqueue("MountSegment", OpType::SEGMENT_MOUNT,
                                        segment.te_endpoint,
@@ -1407,6 +1410,9 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             op.capacity = seg.size;
             op.is_memory_segment = true;
             op.file_path.clear();
+            op.segment_id = seg.id;
+            op.base = seg.base;
+            op.client_id = client_id;
             auto bytes = struct_pack::serialize(op);
             PersistSegmentOpForHAOrEnqueue(
                 "ReMountSegment", OpType::SEGMENT_MOUNT, seg.name,
@@ -2616,6 +2622,7 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
             if (enable_oplog_ && ordered_oplog_writer_ &&
                 !it->transport_endpoint.empty()) {
                 SegmentUnmountOp op{it->transport_endpoint};
+                op.segment_id = it->segment_id;
                 auto bytes = struct_pack::serialize(op);
                 auto persist_result = AppendOpLogVisibleBeforeDurable(
                     OpLogAdmission::kForeground, OpType::SEGMENT_UNMOUNT,
@@ -2770,6 +2777,7 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
 
     if (enable_oplog_ && ordered_oplog_writer_ && !te_endpoint.empty()) {
         SegmentUnmountOp op{te_endpoint};
+        op.segment_id = segment_id;
         auto bytes = struct_pack::serialize(op);
         PersistSegmentOpForHAOrEnqueue("UnmountSegment",
                                        OpType::SEGMENT_UNMOUNT, te_endpoint,

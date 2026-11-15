@@ -54,21 +54,28 @@ struct WeightLeaseDeleteOp {
 };
 YLT_REFL(WeightLeaseDeleteOp, lease_id, identity, fenced_metadata_generation);
 
+// The identity fields let a reader tell a remount of the same memory from a
+// restarted client that reuses the endpoint. They are compatible fields, so
+// builds without them read these entries and are read by this one.
 struct SegmentMountOp {
     std::string segment_name;
     std::string transport_endpoint;
     uint64_t capacity{0};
     bool is_memory_segment{false};
     std::string file_path;
+    struct_pack::compatible<UUID, 1> segment_id;
+    struct_pack::compatible<uint64_t, 1> base;
+    struct_pack::compatible<UUID, 1> client_id;
 
     YLT_REFL(SegmentMountOp, segment_name, transport_endpoint, capacity,
-             is_memory_segment, file_path);
+             is_memory_segment, file_path, segment_id, base, client_id);
 };
 
 struct SegmentUnmountOp {
     std::string transport_endpoint;
+    struct_pack::compatible<UUID, 1> segment_id;
 
-    YLT_REFL(SegmentUnmountOp, transport_endpoint);
+    YLT_REFL(SegmentUnmountOp, transport_endpoint, segment_id);
 };
 
 struct SegmentUpdateOp {
