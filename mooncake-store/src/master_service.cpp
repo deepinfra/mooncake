@@ -11909,7 +11909,7 @@ ErrorCode MasterService::InitializeBatchOpLogWriter(
 
     OrderedOpLogWriterConfig writer_config;
     writer_config.max_entries_per_batch = oplog_batch_max_entries_;
-    writer_config.background_headroom = oplog_batch_max_entries_ / 4;
+    writer_config.background_headroom = oplog_batch_max_entries_ / 2;
     writer_config.admit_oversized_groups = backend->AcceptsUnboundedRecords();
     writer_config.initial_durable_prefix = durable_prefix;
     OpLogBatchStorage* storage_ptr = storage.get();

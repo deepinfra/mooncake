@@ -1872,6 +1872,26 @@ TEST_F(OrderedOpLogWriterAwaitTest, BackgroundReservesLeaveForegroundHeadroom) {
     EXPECT_EQ(full.error(), ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
 }
 
+TEST_F(OrderedOpLogWriterAwaitTest, BackgroundIsRefusedWhileForegroundWaits) {
+    CreateWriter({.max_entries_per_batch = 2, .background_headroom = 0});
+    auto first = writer_->Reserve(OpLogAdmission::kForeground);
+    auto second = writer_->Reserve(OpLogAdmission::kForeground);
+    ASSERT_TRUE(first.has_value() && second.has_value());
+    std::thread foreground([&] {
+        (void)writer_->ReserveWait(
+            1, OpLogAdmission::kForeground,
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(300));
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    writer_->Abort(std::move(*first));
+    // The freed slot goes to the waiting foreground reserve, never to a
+    // background one racing it: either the waiter is still parked, or it
+    // has taken the slot and the queue is full again.
+    auto background = writer_->Reserve(OpLogAdmission::kBackground);
+    foreground.join();
+    EXPECT_FALSE(background.has_value());
+}
+
 TEST_F(OrderedOpLogWriterAwaitTest, ReserveWaitWakesWhenASlotFrees) {
     CreateWriter({.max_entries_per_batch = 1});
     auto held = writer_->Reserve();

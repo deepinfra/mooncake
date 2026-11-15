@@ -74,6 +74,10 @@ struct OrderedOpLogWriter::Impl {
             }
             return ErrorCode::TASK_PENDING_LIMIT_EXCEEDED;
         }
+        if (admission == OpLogAdmission::kBackground &&
+            foreground_waiters > 0) {
+            return ErrorCode::TASK_PENDING_LIMIT_EXCEEDED;
+        }
         const size_t limit =
             admission == OpLogAdmission::kBackground
                 ? max - std::min(config.background_headroom, max - 1)
@@ -206,6 +210,9 @@ struct OrderedOpLogWriter::Impl {
     bool stop_requested{false};
     bool draining{false};
     size_t reserve_waiters{0};
+    // Foreground reserves parked in ReserveWait; background ones yield to
+    // them, so a bulk job never takes the slots a client write is waiting on.
+    size_t foreground_waiters{0};
     bool callback_stop_requested{false};
     ErrorCode last_error{ErrorCode::OK};
     uint64_t retry_count{0};
@@ -332,6 +339,10 @@ OrderedOpLogWriter::ReserveWait(
     if (queue_full() && can_fit &&
         impl_->reserve_waiters < impl_->config.max_reserve_waiters) {
         ++impl_->reserve_waiters;
+        const bool foreground = admission == OpLogAdmission::kForeground;
+        if (foreground) {
+            ++impl_->foreground_waiters;
+        }
         while (queue_full()) {
             const bool timed_out =
                 impl_->cv.wait_until(lock, deadline) == std::cv_status::timeout;
@@ -339,6 +350,9 @@ OrderedOpLogWriter::ReserveWait(
             if (timed_out) {
                 break;
             }
+        }
+        if (foreground) {
+            --impl_->foreground_waiters;
         }
         if (--impl_->reserve_waiters == 0) {
             impl_->cv.notify_all();
