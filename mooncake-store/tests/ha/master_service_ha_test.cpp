@@ -2077,7 +2077,7 @@ TEST_F(MasterServiceHATest, UnreadableRestoredMemoryReplicaIsNotEvictable) {
     EXPECT_EQ(get.error(), ErrorCode::REPLICA_IS_NOT_READY);
 }
 
-TEST_F(MasterServiceHATest, SuccessfulRemountGrantsEvictionLease) {
+TEST_F(MasterServiceHATest, RestoredObjectKeepsItsEvictionLeaseThroughRemount) {
     MasterService service(MasterServiceConfig::builder()
                               .set_enable_ha(false)
                               .set_default_kv_lease_ttl(10000)
@@ -2092,8 +2092,8 @@ TEST_F(MasterServiceHATest, SuccessfulRemountGrantsEvictionLease) {
                     .RestoreFromStandbySnapshot(
                         {object}, 7, {MakeStandbyMemorySegment(endpoint)})
                     .has_value());
-    SetLeaseDeadlineForTesting(service, kDefaultTenant, key,
-                               std::chrono::system_clock::time_point{});
+    EXPECT_GT(LeaseDeadlineForTesting(service, kDefaultTenant, key),
+              std::chrono::system_clock::now());
 
     ASSERT_TRUE(service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid())
                     .has_value());
@@ -2113,7 +2113,7 @@ TEST_F(MasterServiceHATest, SuccessfulRemountGrantsEvictionLease) {
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 0);
 }
 
-TEST_F(MasterServiceHATest, RemountRefreshesLeaseWhenAnotherReplicaIsReadable) {
+TEST_F(MasterServiceHATest, RestoreLeasesAnObjectWhoseOtherReplicaIsReadable) {
     MasterService service(MasterServiceConfig::builder()
                               .set_enable_ha(false)
                               .set_default_kv_lease_ttl(10000)
@@ -2142,8 +2142,8 @@ TEST_F(MasterServiceHATest, RemountRefreshesLeaseWhenAnotherReplicaIsReadable) {
                          MakeStandbyMemorySegment(readable_endpoint)})
                     .has_value());
     ASSERT_TRUE(HasReadableReplicaForTesting(service, kDefaultTenant, key));
-    SetLeaseDeadlineForTesting(service, kDefaultTenant, key,
-                               std::chrono::system_clock::time_point{});
+    EXPECT_GT(LeaseDeadlineForTesting(service, kDefaultTenant, key),
+              std::chrono::system_clock::now());
 
     ASSERT_TRUE(
         service
@@ -2835,6 +2835,67 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairWritesDurableRecords) {
     EXPECT_EQ(2u, prefix.last_seq);
 }
 
+TEST_F(MasterServiceHATest, RemountAdoptsOnlyItsOwnEndpointsReplicas) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    auto on_a = MakeStandbyObject("own_endpoint_a", "remount_own_a");
+    auto on_b = MakeStandbyObject("own_endpoint_b", "remount_own_b");
+    for (auto* object : {&on_a, &on_b}) {
+        object->metadata.replicas.front()
+            .get_memory_descriptor()
+            .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    }
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {on_a, on_b}, 7,
+                        {MakeStandbyMemorySegment("remount_own_a"),
+                         MakeStandbyMemorySegment("remount_own_b")})
+                    .has_value());
+
+    ASSERT_TRUE(
+        service.ReMountSegment({MakeSegment("remount_own_a")}, generate_uuid())
+            .has_value());
+    EXPECT_TRUE(
+        service.GetReplicaList("own_endpoint_a", kDefaultTenant).has_value());
+    auto before = service.GetReplicaList("own_endpoint_b", kDefaultTenant);
+    ASSERT_FALSE(before.has_value());
+    EXPECT_EQ(before.error(), ErrorCode::REPLICA_IS_NOT_READY);
+
+    ASSERT_TRUE(
+        service.ReMountSegment({MakeSegment("remount_own_b")}, generate_uuid())
+            .has_value());
+    EXPECT_TRUE(
+        service.GetReplicaList("own_endpoint_b", kDefaultTenant).has_value());
+}
+
+TEST_F(MasterServiceHATest, RemountSkipsReplicasRemovedSinceRestore) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string endpoint = "remount_after_remove";
+    auto kept = MakeStandbyObject("remount_kept", endpoint);
+    auto removed = MakeStandbyObject("remount_removed", endpoint);
+    kept.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    removed.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 8192;
+    ASSERT_TRUE(
+        service
+            .RestoreFromStandbySnapshot({kept, removed}, 7,
+                                        {MakeStandbyMemorySegment(endpoint)})
+            .has_value());
+    ASSERT_TRUE(
+        service.Remove("remount_removed", kDefaultTenant, true).has_value());
+
+    ASSERT_TRUE(service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid())
+                    .has_value());
+    EXPECT_TRUE(
+        service.GetReplicaList("remount_kept", kDefaultTenant).has_value());
+    EXPECT_EQ(
+        ReplicaCountForTesting(service, kDefaultTenant, "remount_removed"), 0);
+}
+
 class UnboundedFakeBatchHaKvBackend : public FakeBatchHaKvBackend {
    public:
     bool AcceptsUnboundedRecords() const override { return true; }
@@ -3487,8 +3548,6 @@ TEST_F(MasterServiceHATest, FailedRemountKeepsReplicaInvalidAndCanBeRetried) {
             .RestoreFromStandbySnapshot({first, out_of_range}, 7,
                                         {MakeStandbyMemorySegment(endpoint)})
             .has_value());
-    SetLeaseDeadlineForTesting(service, kDefaultTenant, "standby_retry_first",
-                               std::chrono::system_clock::time_point{});
 
     Segment segment = MakeSegment(endpoint);
     auto failed = service.ReMountSegment({segment}, generate_uuid());
@@ -3503,9 +3562,6 @@ TEST_F(MasterServiceHATest, FailedRemountKeepsReplicaInvalidAndCanBeRetried) {
     ASSERT_EQ(batch_after_failure.size(), 1);
     ASSERT_FALSE(batch_after_failure[0].has_value());
     EXPECT_EQ(batch_after_failure[0].error(), ErrorCode::REPLICA_IS_NOT_READY);
-    EXPECT_EQ(
-        LeaseDeadlineForTesting(service, kDefaultTenant, "standby_retry_first"),
-        std::chrono::system_clock::time_point{});
     ReplicateConfig config;
     config.replica_num = 1;
     config.preferred_segments = {endpoint};

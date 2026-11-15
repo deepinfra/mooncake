@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <stdexcept>
 
@@ -63,7 +64,60 @@ std::string AllocatedBuffer::getSegmentName() const noexcept {
     return std::string();
 }
 
+namespace {
+// Guards every DummyBufferAllocator's tracked list and the hooks in it.
+std::mutex& StandbyTrackingMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+}  // namespace
+
+void AllocatedBuffer::UntrackStandby() {
+    if (!standby_tracked_) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(StandbyTrackingMutex());
+    standby_hook_.unlink();
+    standby_tracked_ = false;
+}
+
+void AllocatedBuffer::AdoptFrom(AllocatedBuffer&& imported) {
+    UntrackStandby();
+    allocator_ = std::move(imported.allocator_);
+    imported.allocator_.reset();
+    segment_lifetime_ = std::move(imported.segment_lifetime_);
+    client_liveness_ = std::move(imported.client_liveness_);
+    segment_name_ = std::move(imported.segment_name_);
+    buffer_ptr_ = imported.buffer_ptr_;
+    size_ = imported.size_;
+    offset_handle_ = std::move(imported.offset_handle_);
+    imported.offset_handle_.reset();
+}
+
+DummyBufferAllocator::~DummyBufferAllocator() {
+    std::lock_guard<std::mutex> lock(StandbyTrackingMutex());
+    tracked_.clear();
+}
+
+void DummyBufferAllocator::Track(AllocatedBuffer& buffer) {
+    std::lock_guard<std::mutex> lock(StandbyTrackingMutex());
+    if (!buffer.standby_hook_.is_linked()) {
+        tracked_.push_back(buffer);
+    }
+    buffer.standby_tracked_ = true;
+}
+
+std::vector<AllocatedBuffer*> DummyBufferAllocator::Tracked() const {
+    std::lock_guard<std::mutex> lock(StandbyTrackingMutex());
+    std::vector<AllocatedBuffer*> buffers;
+    for (const auto& buffer : tracked_) {
+        buffers.push_back(const_cast<AllocatedBuffer*>(&buffer));
+    }
+    return buffers;
+}
+
 AllocatedBuffer::~AllocatedBuffer() {
+    UntrackStandby();
     // Note: This is an edge case. If the 'weak_ptr' is released, the segment
     // has already been deallocated at this point, and its memory usage details
     // (capacity/allocated) no longer need to be maintained.

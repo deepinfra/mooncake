@@ -2,6 +2,7 @@
 #define BUFFER_ALLOCATOR_H
 
 #include <atomic>
+#include <boost/intrusive/list.hpp>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -44,6 +45,7 @@ static constexpr size_t kAllocatorUnknownFreeSpace =
 
 // Forward declarations
 class BufferAllocatorBase;
+class DummyBufferAllocator;
 class Replica;
 class SegmentAllocatorRegistration;
 
@@ -154,8 +156,21 @@ class AllocatedBuffer {
     void change_to_cxl(std::string client_segment_name);
     void* get_vaddr_from_cxl();
 
+    // Takes over `imported`'s allocation and bindings and keeps this
+    // buffer's transfer protocol, so a restored replica goes live in place.
+    void AdoptFrom(AllocatedBuffer&& imported);
+
+    using StandbyHook = boost::intrusive::list_member_hook<
+        boost::intrusive::link_mode<boost::intrusive::auto_unlink>>;
+
    private:
     bool copyTransferProtocolFrom(const AllocatedBuffer& source);
+    void UntrackStandby();
+
+    // Links a buffer restored onto a not-yet-remounted endpoint into that
+    // endpoint's DummyBufferAllocator. Guarded by the tracking mutex.
+    StandbyHook standby_hook_;
+    bool standby_tracked_{false};
 
     std::weak_ptr<BufferAllocatorBase> allocator_;
     // Both bindings are set before the buffer is published to readers and not
@@ -175,6 +190,7 @@ class AllocatedBuffer {
 
     friend class Replica;
     friend class SegmentAllocatorRegistration;
+    friend class DummyBufferAllocator;
 };
 
 /**
@@ -261,6 +277,13 @@ class DummyBufferAllocator final : public BufferAllocatorBase {
                                   std::string transport_endpoint)
         : segment_name_(std::move(segment_name)),
           transport_endpoint_(std::move(transport_endpoint)) {}
+    ~DummyBufferAllocator() override;
+
+    // Records a buffer restored onto this endpoint, so a remount finds it
+    // without walking the index.
+    void Track(AllocatedBuffer& buffer);
+    // The buffers still restored onto this endpoint.
+    std::vector<AllocatedBuffer*> Tracked() const;
 
     std::unique_ptr<AllocatedBuffer> allocate(size_t size) override {
         return nullptr;
@@ -280,6 +303,12 @@ class DummyBufferAllocator final : public BufferAllocatorBase {
    private:
     std::string segment_name_;
     std::string transport_endpoint_;
+    boost::intrusive::list<AllocatedBuffer,
+                           boost::intrusive::member_hook<
+                               AllocatedBuffer, AllocatedBuffer::StandbyHook,
+                               &AllocatedBuffer::standby_hook_>,
+                           boost::intrusive::constant_time_size<false>>
+        tracked_;
 };
 
 /**

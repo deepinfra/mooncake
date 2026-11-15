@@ -63,6 +63,21 @@ namespace mooncake {
 
 namespace {
 
+// Registers a restored memory buffer with its endpoint's placeholder
+// allocator, so that endpoint's remount adopts it without walking the index.
+// Replicas restored as removed or failed are not accounted, so not adopted.
+void TrackRestoredMemoryBuffer(
+    const std::shared_ptr<BufferAllocatorBase>& allocator,
+    AllocatedBuffer& buffer, ReplicaStatus status) {
+    if (status == ReplicaStatus::REMOVED || status == ReplicaStatus::FAILED) {
+        return;
+    }
+    if (auto* placeholder =
+            dynamic_cast<DummyBufferAllocator*>(allocator.get())) {
+        placeholder->Track(buffer);
+    }
+}
+
 uint64_t SaturatingAdd(uint64_t lhs, uint64_t rhs) {
     if (lhs > std::numeric_limits<uint64_t>::max() - rhs) {
         return std::numeric_limits<uint64_t>::max();
@@ -1114,7 +1129,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             Segment segment;
             std::shared_ptr<BufferAllocatorBase> old_allocator;
             std::shared_ptr<BufferAllocatorBase> restored_allocator;
-            std::vector<Replica*> replicas;
+            std::vector<AllocatedBuffer*> restored;
             std::vector<AllocatedBuffer::Descriptor> descriptors;
             std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
             uint64_t imported_size{0};
@@ -1189,72 +1204,82 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         bool ambiguous_endpoint = false;
         bool unsupported_cxl = false;
         // master_state_mutex_ is held exclusively, so no object operation runs
-        // until the repair below: the replicas this walk collects stay put,
-        // and each object it touched is locked again there by its publication.
-        std::vector<std::pair<TenantId, route::ObjectRef>> affected_objects;
+        // until the adoption below and the buffers collected here stay put.
         bool any_standby_kept_alive = std::any_of(
             segments.begin(), segments.end(), [this](const Segment& segment) {
                 return standby_accounted_memory_bytes_.contains(segment.name);
             });
         if (any_standby_kept_alive) {
-            VisitNamespaces([&](const TenantId& tenant_id,
-                                metadata::Namespace& ns) {
-                for (auto object : ns.objects.WriteCursor()) {
-                    bool affected = false;
-                    object.metadata().VisitReplicas(
-                        [](const Replica& replica) {
-                            return replica.is_memory_replica() &&
-                                   replica.status() != ReplicaStatus::REMOVED &&
-                                   replica.status() != ReplicaStatus::FAILED;
-                        },
-                        [&](Replica& replica) {
-                            auto descriptor = replica.get_descriptor()
-                                                  .get_memory_descriptor()
-                                                  .buffer_descriptor;
-                            SegmentRestore* match = nullptr;
-                            bool endpoint_match = false;
-                            for (auto& restore : restores) {
-                                if (descriptor.transport_endpoint_ ==
-                                        restore.segment.te_endpoint ||
-                                    descriptor.transport_endpoint_ ==
-                                        restore.segment.name) {
-                                    endpoint_match = true;
-                                    // Reject CXL via the existing check below.
-                                    if (descriptor.protocol_ != "cxl" &&
-                                        (descriptor.buffer_address_ <
-                                             restore.segment.base ||
-                                         descriptor.buffer_address_ -
-                                                 restore.segment.base >=
-                                             restore.segment.size))
-                                        continue;
-                                    if (match != nullptr) {
-                                        ambiguous_endpoint = true;
-                                        return;
-                                    }
-                                    match = &restore;
-                                }
-                            }
-                            if (endpoint_match && match == nullptr) {
+            // Every buffer a restore put on these segments' endpoints is
+            // tracked by the endpoint's placeholder allocator.
+            std::vector<DummyBufferAllocator*> placeholders;
+            for (const auto& restore : restores) {
+                for (const std::string* alias :
+                     {&restore.segment.te_endpoint, &restore.segment.name}) {
+                    auto kept = standby_allocator_keepalive_.find(*alias);
+                    if (kept == standby_allocator_keepalive_.end()) {
+                        continue;
+                    }
+                    auto* placeholder =
+                        dynamic_cast<DummyBufferAllocator*>(kept->second.get());
+                    if (placeholder != nullptr &&
+                        std::find(placeholders.begin(), placeholders.end(),
+                                  placeholder) == placeholders.end()) {
+                        placeholders.push_back(placeholder);
+                    }
+                }
+            }
+            std::vector<AllocatedBuffer*> restored_buffers;
+            for (auto* placeholder : placeholders) {
+                auto tracked = placeholder->Tracked();
+                restored_buffers.insert(restored_buffers.end(), tracked.begin(),
+                                        tracked.end());
+            }
+            for (AllocatedBuffer* restored : restored_buffers) {
+                auto descriptor = restored->get_descriptor();
+                [&] {
+                    SegmentRestore* match = nullptr;
+                    bool endpoint_match = false;
+                    for (auto& restore : restores) {
+                        if (descriptor.transport_endpoint_ ==
+                                restore.segment.te_endpoint ||
+                            descriptor.transport_endpoint_ ==
+                                restore.segment.name) {
+                            endpoint_match = true;
+                            // Reject CXL via the existing check below.
+                            if (descriptor.protocol_ != "cxl" &&
+                                (descriptor.buffer_address_ <
+                                     restore.segment.base ||
+                                 descriptor.buffer_address_ -
+                                         restore.segment.base >=
+                                     restore.segment.size))
+                                continue;
+                            if (match != nullptr) {
                                 ambiguous_endpoint = true;
                                 return;
                             }
-                            if (match != nullptr) {
-                                if (descriptor.protocol_ == "cxl") {
-                                    unsupported_cxl = true;
-                                    return;
-                                }
-                                descriptor.transport_endpoint_ =
-                                    match->segment.te_endpoint;
-                                match->replicas.push_back(&replica);
-                                match->descriptors.push_back(descriptor);
-                                affected = true;
-                            }
-                        });
-                    if (affected) {
-                        affected_objects.emplace_back(tenant_id, object.ref());
+                            match = &restore;
+                        }
                     }
+                    if (endpoint_match && match == nullptr) {
+                        ambiguous_endpoint = true;
+                        return;
+                    }
+                    if (match != nullptr) {
+                        if (descriptor.protocol_ == "cxl") {
+                            unsupported_cxl = true;
+                            return;
+                        }
+                        descriptor.transport_endpoint_ =
+                            match->segment.te_endpoint;
+                        match->restored.push_back(restored);
+                        match->descriptors.push_back(descriptor);
+                    }
+                }();
+                if (ambiguous_endpoint || unsupported_cxl) {
+                    break;
                 }
-            });
+            }
         }
         if (ambiguous_endpoint) {
             return fail_remount(ErrorCode::INVALID_PARAMS);
@@ -1306,7 +1331,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             allocator_replacements;
         for (auto& restore : restores) {
             if (restore.restored_allocator) {
-                if (restore.buffers.size() != restore.replicas.size() ||
+                if (restore.buffers.size() != restore.restored.size() ||
                     std::any_of(restore.buffers.begin(), restore.buffers.end(),
                                 [](const auto& buffer) { return !buffer; })) {
                     return fail_remount(ErrorCode::INTERNAL_ERROR);
@@ -1359,21 +1384,13 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                     standby_accounted_memory_bytes_.erase(accounted);
                 }
             }
-            for (size_t i = 0; i < restore.replicas.size(); ++i) {
-                (void)restore.replicas[i]->replace_memory_buffer(
-                    std::move(restore.buffers[i]));
+            for (size_t i = 0; i < restore.restored.size(); ++i) {
+                restore.restored[i]->AdoptFrom(std::move(*restore.buffers[i]));
             }
             invalid_replica_endpoints_.erase(restore.segment.te_endpoint);
             invalid_replica_endpoints_.erase(restore.segment.name);
             standby_allocator_keepalive_.erase(restore.segment.te_endpoint);
             standby_allocator_keepalive_.erase(restore.segment.name);
-        }
-        for (const auto& [tenant_id, object] : affected_objects) {
-            MetadataAccessorRW accessor(this, tenant_id, object);
-            if (accessor.IsPublished()) {
-                accessor.Get().GrantReadLease(
-                    std::chrono::milliseconds(default_kv_lease_ttl_));
-            }
         }
 
         // Change the client status to OK
@@ -3369,9 +3386,11 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
                     object_bytes[segment->segment_name] += buffer.size_;
                 }
 
-                replicas.push_back(Replica(
-                    desc.id, std::make_unique<AllocatedBuffer>(alloc, buffer),
-                    desc.status));
+                auto restored_buffer =
+                    std::make_unique<AllocatedBuffer>(alloc, buffer);
+                TrackRestoredMemoryBuffer(alloc, *restored_buffer, desc.status);
+                replicas.push_back(
+                    Replica(desc.id, std::move(restored_buffer), desc.status));
             } else if (desc.is_nof_replica()) {
                 const auto& buffer =
                     desc.get_nof_descriptor().buffer_descriptor;
@@ -3486,6 +3505,10 @@ tl::expected<void, ErrorCode> MasterService::PublishRestoredObjects(
         auto& metadata = accessor.Get();
         metadata.MutablePart(0).SetChecksum(standby_meta.object_checksum);
         metadata.session_id = standby_meta.session_id.value_or("");
+        // A reader of the previous term may still hold a lease on these bytes;
+        // that lease ends at most one TTL after the old leader stopped.
+        metadata.GrantReadLease(
+            std::chrono::milliseconds(default_kv_lease_ttl_));
         installed.emplace_back(object.tenant_id,
                                route::ObjectRef{object.user_key, generation});
     }
@@ -3950,6 +3973,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                         restored_allocators.at(buffer.transport_endpoint_);
                     auto restored_buffer =
                         std::make_unique<AllocatedBuffer>(alloc, buffer);
+                    TrackRestoredMemoryBuffer(alloc, *restored_buffer,
+                                              desc.status);
                     replicas.push_back(Replica(
                         desc.id, std::move(restored_buffer), desc.status));
                 } else if (desc.is_nof_replica()) {
