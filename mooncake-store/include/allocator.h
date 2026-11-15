@@ -474,6 +474,9 @@ class OffsetBufferAllocator
 struct RestoredOffsetBufferAllocator {
     std::shared_ptr<OffsetBufferAllocator> allocator;
     std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
+    // With hold_free_space: allocations covering the space no input
+    // allocation took, so none of it can be handed out while they live.
+    std::vector<std::unique_ptr<AllocatedBuffer>> held_free_space;
 };
 
 // Reconstructs an empty OffsetBufferAllocator from final live allocations.
@@ -483,7 +486,8 @@ std::optional<RestoredOffsetBufferAllocator> ImportOffsetBufferAllocator(
     std::string segment_name, size_t base, size_t size,
     std::string transport_endpoint,
     const std::vector<LiveAllocation>& allocations,
-    ReplicaType replica_type = ReplicaType::MEMORY);
+    ReplicaType replica_type = ReplicaType::MEMORY,
+    bool hold_free_space = false);
 
 tl::expected<std::shared_ptr<BufferAllocatorBase>, ErrorCode>
 CreateBufferAllocator(BufferAllocatorType allocator_type,

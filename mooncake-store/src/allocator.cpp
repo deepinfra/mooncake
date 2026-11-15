@@ -604,7 +604,8 @@ size_t OffsetBufferAllocator::getLargestFreeRegion() const {
 std::optional<RestoredOffsetBufferAllocator> ImportOffsetBufferAllocator(
     std::string segment_name, size_t base, size_t size,
     std::string transport_endpoint,
-    const std::vector<LiveAllocation>& allocations, ReplicaType replica_type) {
+    const std::vector<LiveAllocation>& allocations, ReplicaType replica_type,
+    bool hold_free_space) {
     if (base > std::numeric_limits<size_t>::max() - size) {
         return std::nullopt;
     }
@@ -682,6 +683,13 @@ std::optional<RestoredOffsetBufferAllocator> ImportOffsetBufferAllocator(
         buffers[index] = std::move(buffer);
     }
 
+    if (hold_free_space) {
+        // Best effort past the last allocation: a remainder below the
+        // allocator's smallest unit stays free.
+        (void)fill_gap(end - cursor);
+        return RestoredOffsetBufferAllocator{
+            std::move(allocator), std::move(buffers), std::move(gaps)};
+    }
     gaps.clear();
     return RestoredOffsetBufferAllocator{std::move(allocator),
                                          std::move(buffers)};

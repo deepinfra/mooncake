@@ -4,12 +4,15 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <limits>
 #include <mutex>
 #include <shared_mutex>
+#include <thread>
 
 #include "allocator.h"
 #include "ha/ha_types.h"
+#include "ha/handoff_record.h"
 #include "ha/kv/ha_kv_backend_factory.h"
 #include "ha/oplog/oplog_batch_storage.h"
 #include "master_metric_manager.h"
@@ -435,6 +438,7 @@ tl::expected<void, ErrorCode> MasterService::ActivateFollower(
         }
     }
 
+    ArmPromotionQuarantine(applied.last_seq);
     {
         std::unique_lock<std::shared_mutex> exclusive(master_state_mutex_);
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
@@ -505,6 +509,140 @@ tl::expected<void, ErrorCode> MasterService::ActivateFollower(
               << ", segments=" << standby_memory_segments_.size()
               << ", applied_seq=" << applied.last_seq;
     return {};
+}
+
+std::vector<AllocatedBuffer::Descriptor> MasterService::BeginHandoffDrain(
+    std::chrono::milliseconds timeout) {
+    handoff_draining_.store(true, std::memory_order_release);
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    const auto in_flight = [this] {
+        std::vector<std::pair<TenantId, std::string>> keys;
+        VisitNamespaces(
+            [&keys](const TenantId& tenant_id, metadata::Namespace& ns) {
+                for (auto& key : ns.InFlightKeys()) {
+                    keys.emplace_back(tenant_id, std::move(key));
+                }
+            });
+        return keys;
+    };
+    auto keys = in_flight();
+    while (!keys.empty() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        keys = in_flight();
+    }
+    std::vector<AllocatedBuffer::Descriptor> ranges;
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    for (const auto& [tenant_id, key] : keys) {
+        MetadataAccessorRW accessor(this, {tenant_id, key});
+        if (!accessor.IsPublished()) {
+            continue;
+        }
+        accessor.Get().VisitReplicas(
+            [](const Replica& replica) {
+                return replica.is_memory_replica() && replica.is_processing();
+            },
+            [&ranges](const Replica& replica) {
+                ranges.push_back(replica.get_descriptor()
+                                     .get_memory_descriptor()
+                                     .buffer_descriptor);
+            });
+    }
+    LOG(INFO) << "action=handoff_drain, writes_in_flight=" << keys.size()
+              << ", ranges_in_flight=" << ranges.size();
+    return ranges;
+}
+
+ErrorCode MasterService::WriteHandoffRecord(
+    const std::vector<AllocatedBuffer::Descriptor>& in_flight) {
+    if (!batch_oplog_kv_backend_) {
+        return ErrorCode::OK;
+    }
+    DurablePrefix durable;
+    OpLogBatchStorage storage(cluster_id_, *batch_oplog_kv_backend_);
+    if (const ErrorCode err = storage.ReadDurablePrefix(durable);
+        err != ErrorCode::OK && err != ErrorCode::ETCD_KEY_NOT_EXIST) {
+        return err;
+    }
+    const ha::HandoffRecord record{.view_version = view_version_,
+                                   .durable_last_seq = durable.last_seq,
+                                   .in_flight = in_flight};
+    const auto key = ha::HandoffKey(cluster_id_);
+    if (key.empty()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    const ErrorCode err = batch_oplog_kv_backend_->Put(
+        key, struct_pack::serialize<std::string>(record));
+    LOG(INFO) << "action=write_handoff_record, view=" << view_version_
+              << ", durable_seq=" << durable.last_seq
+              << ", ranges_in_flight=" << in_flight.size()
+              << ", error=" << toString(err);
+    return err;
+}
+
+void MasterService::ArmPromotionQuarantine(uint64_t applied_last_seq) {
+    PromotionQuarantine quarantine;
+    quarantine.until =
+        std::chrono::steady_clock::now() + put_start_release_timeout_sec_;
+    const auto record =
+        batch_oplog_kv_backend_
+            ? ha::ReadCleanHandoff(*batch_oplog_kv_backend_, cluster_id_,
+                                   view_version_, applied_last_seq)
+            : std::nullopt;
+    const bool clean = record.has_value();
+    if (record) {
+        for (const auto& range : record->in_flight) {
+            quarantine.ranges[range.transport_endpoint_].emplace_back(
+                range.buffer_address_, range.size_);
+        }
+    }
+    quarantine.all_free = !clean;
+    LOG(INFO) << "action=arm_promotion_quarantine, clean_handoff=" << clean
+              << ", ranges=" << quarantine.ranges.size()
+              << ", for_s=" << put_start_release_timeout_sec_.count();
+    std::unique_lock<std::shared_mutex> exclusive(master_state_mutex_);
+    promotion_quarantine_ = std::move(quarantine);
+}
+
+void MasterService::HoldQuarantined(
+    std::vector<std::unique_ptr<AllocatedBuffer>> buffers,
+    std::chrono::steady_clock::time_point until) {
+    std::lock_guard<std::mutex> lock(quarantine_mutex_);
+    for (auto& buffer : buffers) {
+        quarantine_holds_.push_back({until, std::move(buffer)});
+    }
+}
+
+void MasterService::ReleaseExpiredQuarantine() {
+    std::vector<std::unique_ptr<AllocatedBuffer>> expired;
+    {
+        std::lock_guard<std::mutex> lock(quarantine_mutex_);
+        if (quarantine_holds_.empty()) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        auto keep = std::partition(
+            quarantine_holds_.begin(), quarantine_holds_.end(),
+            [now](const QuarantineHold& hold) { return hold.until > now; });
+        for (auto it = keep; it != quarantine_holds_.end(); ++it) {
+            expired.push_back(std::move(it->buffer));
+        }
+        quarantine_holds_.erase(keep, quarantine_holds_.end());
+    }
+    if (!expired.empty()) {
+        std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+        LOG(INFO) << "action=release_promotion_quarantine, holds="
+                  << expired.size();
+        expired.clear();
+    }
+}
+
+uint64_t MasterService::PromotionQuarantineBytes() const {
+    std::lock_guard<std::mutex> lock(quarantine_mutex_);
+    uint64_t bytes = 0;
+    for (const auto& hold : quarantine_holds_) {
+        bytes += hold.buffer ? hold.buffer->size() : 0;
+    }
+    return bytes;
 }
 
 uint64_t MasterService::FollowerOrphanedReplicas() const {

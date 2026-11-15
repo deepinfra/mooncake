@@ -1077,6 +1077,24 @@ class MasterService {
     void FollowerSegmentUnmount(const SegmentUnmountOp& op);
     // Drops every followed object and segment, before a new baseline.
     void FollowerClear();
+
+    // Planned hand-off, on the leader being stopped: refuses new write
+    // starts, copies, moves and mounts, then waits up to `timeout` for the
+    // writes in flight to end. Returns the memory ranges still in flight,
+    // which the next leader keeps unallocated for a while.
+    std::vector<AllocatedBuffer::Descriptor> BeginHandoffDrain(
+        std::chrono::milliseconds timeout);
+    // Records the hand-off for the next leader: this term's view, the
+    // durable prefix, and the ranges still in flight. Call after the writer
+    // stopped and before the lease is released.
+    ErrorCode WriteHandoffRecord(
+        const std::vector<AllocatedBuffer::Descriptor>& in_flight);
+    // At promotion: a write the old leader started may still land. After a
+    // clean hand-off (a record for the previous view at this durable prefix)
+    // the recorded ranges stay unallocated; otherwise all space free at each
+    // segment's remount does, for put_start_release_timeout.
+    void ArmPromotionQuarantine(uint64_t applied_last_seq);
+    uint64_t PromotionQuarantineBytes() const;
     // Turns the followed index into the leader's, without visiting objects:
     // takes the OpLog with a fenced writer for `view_version` at `applied`
     // (which must be the durable prefix), and leaves what a restore would.
@@ -1743,6 +1761,25 @@ class MasterService {
     bool LeaseExpired(const ObjectMetadata& metadata) const;
     bool MemoryEvictionPaused() const;
     std::atomic<int64_t> inherited_lease_floor_ms_{0};
+    std::atomic<bool> handoff_draining_{false};
+    struct PromotionQuarantine {
+        bool all_free{false};
+        std::unordered_map<std::string,
+                           std::vector<std::pair<uintptr_t, uint64_t>>>
+            ranges;
+        std::chrono::steady_clock::time_point until;
+    };
+    // Set at promotion, read by remounts under master_state_mutex_.
+    std::optional<PromotionQuarantine> promotion_quarantine_;
+    struct QuarantineHold {
+        std::chrono::steady_clock::time_point until;
+        std::unique_ptr<AllocatedBuffer> buffer;
+    };
+    mutable std::mutex quarantine_mutex_;
+    std::vector<QuarantineHold> quarantine_holds_;
+    void HoldQuarantined(std::vector<std::unique_ptr<AllocatedBuffer>> buffers,
+                         std::chrono::steady_clock::time_point until);
+    void ReleaseExpiredQuarantine();
 
     static constexpr auto kOpLogForegroundReserveWait =
         std::chrono::milliseconds(100);

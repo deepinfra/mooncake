@@ -3252,6 +3252,101 @@ TEST_F(MasterServiceFollowerTest, ActivationRefusesAFollowerBehindTheLog) {
               MasterService::RestoreLifecycleState::kFailed);
 }
 
+TEST_F(MasterServiceFollowerTest, ACrashQuarantinesTheFreeSpaceUntilItExpires) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(false)
+                              .set_put_start_discard_timeout_sec(1)
+                              .set_put_start_release_timeout_sec(2)
+                              .build());
+    const std::string endpoint = "quarantine_crash";
+    auto object = MakeStandbyObject("restored", endpoint);
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {object}, 7, {MakeStandbyMemorySegment(endpoint)})
+                    .has_value());
+    // No hand-off record: the previous leader stopped uncleanly.
+    service.ArmPromotionQuarantine(7);
+    ASSERT_TRUE(service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid())
+                    .has_value());
+    EXPECT_GT(service.PromotionQuarantineBytes(), 0u);
+    EXPECT_TRUE(service.GetReplicaList("restored", kDefaultTenant).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    EXPECT_FALSE(service
+                     .PutStart(generate_uuid(), "during_quarantine",
+                               kDefaultTenant, 4096, config)
+                     .has_value());
+    bool allocated = false;
+    for (int i = 0; i < 100 && !allocated; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        allocated = service
+                        .PutStart(generate_uuid(), "after_quarantine",
+                                  kDefaultTenant, 4096, config)
+                        .has_value();
+    }
+    EXPECT_TRUE(allocated);
+    EXPECT_EQ(service.PromotionQuarantineBytes(), 0u);
+}
+
+TEST_F(MasterServiceFollowerTest,
+       ACleanHandoffQuarantinesOnlyTheRecordedWrites) {
+    const auto path = FreshSqlitePath("follower_handoff");
+    const std::string endpoint = "handoff_endpoint";
+    {
+        MasterService old_leader(MasterServiceConfig::builder()
+                                     .set_enable_ha(true)
+                                     .set_enable_oplog(true)
+                                     .set_cluster_id("follower_activation")
+                                     .set_ha_backend_type("sqlite")
+                                     .set_ha_backend_connstring(path)
+                                     .set_view_version(1)
+                                     .build());
+        AllocatedBuffer::Descriptor in_flight{8192, kDefaultSegmentBase + 65536,
+                                              "tcp", endpoint};
+        ASSERT_EQ(old_leader.WriteHandoffRecord({in_flight}), ErrorCode::OK);
+    }
+    MasterService follower(SqliteFollowerConfig(path));
+    follower.FollowerSegmentMount(MountOf(endpoint, {1, 1}));
+    ASSERT_TRUE(follower
+                    .FollowerPut("default", "key",
+                                 ObjectAt(endpoint, kDefaultSegmentBase))
+                    .has_value());
+    ASSERT_TRUE(follower.ActivateFollower(2, DurablePrefix{}, {}, {}));
+    ASSERT_TRUE(
+        follower.ReMountSegment({MakeSegment(endpoint)}, generate_uuid())
+            .has_value());
+    EXPECT_EQ(follower.PromotionQuarantineBytes(), 8192u);
+}
+
+TEST_F(MasterServiceFollowerTest, TheDrainRefusesNewWritesAndReportsInFlight) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string endpoint = "drain_endpoint";
+    ASSERT_TRUE(service.MountSegment(MakeSegment(endpoint), generate_uuid())
+                    .has_value());
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const UUID writer = generate_uuid();
+    ASSERT_TRUE(service.PutStart(writer, "open", kDefaultTenant, 4096, config)
+                    .has_value());
+
+    const auto in_flight =
+        service.BeginHandoffDrain(std::chrono::milliseconds(50));
+    ASSERT_EQ(in_flight.size(), 1u);
+    EXPECT_EQ(in_flight[0].transport_endpoint_, endpoint);
+    EXPECT_EQ(in_flight[0].size_, 4096u);
+    auto refused =
+        service.PutStart(writer, "refused", kDefaultTenant, 4096, config);
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    EXPECT_TRUE(
+        service.PutEnd(writer, "open", kDefaultTenant, ReplicaType::MEMORY));
+}
+
 TEST_F(MasterServiceFollowerTest, AServingIndexRefusesFollowerApply) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());

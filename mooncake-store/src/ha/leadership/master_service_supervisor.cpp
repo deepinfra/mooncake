@@ -17,6 +17,7 @@
 #include "config/rpc_protocol_config.h"
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "ha/leadership/leader_label_reconciler.h"
+#include "ha/handoff_record.h"
 #include "ha/kv/ha_kv_backend_factory.h"
 #include "ha/oplog/oplog_batch_storage.h"
 #include "ha/oplog/oplog_test_failpoint.h"
@@ -446,6 +447,9 @@ void EnterStandbyMode(MasterAdminServer& admin_server,
 }
 
 namespace {
+// How long a planned stop waits for writes in flight before it stops.
+constexpr int64_t kHandoffDrainMs = 1000;
+
 // Detaches /standby_status from the controller before the controller goes.
 struct StandbyStatusProviderScope {
     mooncake::MasterAdminServer& admin_server;
@@ -713,10 +717,26 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             continue;
         }
 
-        LOG(INFO) << "Entering warmup phase...";
+        // The warmup outwaits a predecessor that may still be serving on a
+        // lease it has not noticed it lost. One that handed off stopped
+        // serving before it wrote the record, so there is none to outwait.
+        const uint64_t applied_last_seq =
+            promotion_ctx->metadata_store
+                ? promotion_ctx->applied_cursor.last_seq
+                : promotion_ctx->applied_seq_id;
+        bool handed_off = false;
+        if (auto handoff_backend = CreateHaKvBackend(spec); handoff_backend) {
+            handed_off = ReadCleanHandoff(**handoff_backend, config.cluster_id,
+                                          leadership_session->view.view_version,
+                                          applied_last_seq)
+                             .has_value();
+        }
+        LOG(INFO) << "Entering warmup phase..., handed_off=" << handed_off;
         SetRuntimeState(admin_server, MasterRuntimeState::kLeaderWarmup);
-        auto warmup_result = WarmupLeadership(
-            leader_coordinator, *leadership_session, shutdown_requested);
+        auto warmup_result = handed_off ? tl::expected<bool, ErrorCode>(true)
+                                        : WarmupLeadership(leader_coordinator,
+                                                           *leadership_session,
+                                                           shutdown_requested);
         if (ShutdownObserved(shutdown_requested)) {
             return shutdown_exit("warmup", term_lease);
         }
@@ -878,6 +898,13 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             continue;
         }
 
+        if (!follower_index) {
+            wrapped_master_service->master_service().ArmPromotionQuarantine(
+                promotion_ctx->metadata_store
+                    ? promotion_ctx->applied_cursor.last_seq
+                    : promotion_ctx->applied_seq_id);
+        }
+
         // Restore can outlast catch-up. Recheck the side-thread guard and
         // renew once more before registering RPC or publishing a serving
         // endpoint, otherwise a lease lost mid-restore keeps recovering.
@@ -967,10 +994,18 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         }
         auto leadership_monitor_handle = std::move(leadership_monitor.value());
 
+        // A planned stop hands off: readiness drops first, new writes are
+        // refused while those in flight finish, and what is still in flight
+        // is recorded for the next leader before the lease goes.
+        std::optional<std::vector<AllocatedBuffer::Descriptor>>
+            handoff_in_flight;
         ServingShutdownTrigger shutdown_trigger(shutdown_requested, [&]() {
             serving_state.RequestShutdown([&]() {
                 admin_server.SetServiceAvailable(false);
                 label_reconciler.SetLeader(false);
+                handoff_in_flight =
+                    wrapped_master_service->master_service().BeginHandoffDrain(
+                        std::chrono::milliseconds(kHandoffDrainMs));
                 SetRuntimeState(admin_server, MasterRuntimeState::kStandby);
                 LOG(INFO) << "Trying to stop server, reason=shutdown requested";
                 server.stop();
@@ -1079,6 +1114,10 @@ int RunSupervisorLoop(const HABackendSpec& spec,
 
         StopLeadershipMonitor(leadership_monitor_handle);
         wrapped_master_service->StopBatchOpLogWriter();
+        if (handoff_in_flight) {
+            wrapped_master_service->master_service().WriteHandoffRecord(
+                *handoff_in_flight);
+        }
         DeactivateServingState(admin_server, label_reconciler);
         wrapped_master_service->StopHttpMetadataCleanup();
         auto err = release_term("serving");

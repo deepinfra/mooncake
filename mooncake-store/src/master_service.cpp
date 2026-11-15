@@ -966,6 +966,9 @@ TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
 
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    if (handoff_draining_.load(std::memory_order_acquire)) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     ErrorCode mount_result = ErrorCode::INTERNAL_ERROR;
     {
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
@@ -1149,6 +1152,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             std::vector<AllocatedBuffer*> restored;
             std::vector<AllocatedBuffer::Descriptor> descriptors;
             std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
+            std::vector<std::unique_ptr<AllocatedBuffer>> quarantined;
             uint64_t imported_size{0};
         };
         std::vector<SegmentRestore> restores;
@@ -1207,6 +1211,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                     restores.push_back({std::move(authoritative),
                                         std::move(allocator),
                                         nullptr,
+                                        {},
                                         {},
                                         {},
                                         {},
@@ -1305,8 +1310,16 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             return fail_remount(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
         }
 
+        const bool quarantine_armed =
+            any_standby_kept_alive && promotion_quarantine_ &&
+            std::chrono::steady_clock::now() < promotion_quarantine_->until;
         for (auto& restore : restores) {
-            if (restore.descriptors.empty()) {
+            const bool offset_allocator =
+                std::dynamic_pointer_cast<OffsetBufferAllocator>(
+                    restore.old_allocator) != nullptr;
+            const bool hold_free_space = quarantine_armed && offset_allocator &&
+                                         promotion_quarantine_->all_free;
+            if (restore.descriptors.empty() && !quarantine_armed) {
                 continue;
             }
             const RegionResourceSpec spec{
@@ -1317,17 +1330,61 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             if (!allocations) {
                 return fail_remount(allocations.error());
             }
-            if (std::dynamic_pointer_cast<OffsetBufferAllocator>(
-                    restore.old_allocator)) {
+            const size_t restored_count = allocations->size();
+            if (quarantine_armed && offset_allocator &&
+                !promotion_quarantine_->all_free) {
+                // The old leader's writes still in flight at the hand-off:
+                // their ranges stay taken, whatever this index restored.
+                for (const std::string* alias :
+                     {&restore.segment.te_endpoint, &restore.segment.name}) {
+                    auto recorded = promotion_quarantine_->ranges.find(*alias);
+                    if (recorded == promotion_quarantine_->ranges.end()) {
+                        continue;
+                    }
+                    for (const auto& [address, size] : recorded->second) {
+                        if (address < restore.segment.base || size == 0 ||
+                            address - restore.segment.base >=
+                                restore.segment.size ||
+                            size > restore.segment.size -
+                                       (address - restore.segment.base)) {
+                            continue;
+                        }
+                        const uint64_t offset = address - restore.segment.base;
+                        const bool overlaps = std::any_of(
+                            allocations->begin(), allocations->end(),
+                            [&](const LiveAllocation& live) {
+                                return live.offset_from_base < offset + size &&
+                                       offset < live.offset_from_base +
+                                                    live.requested_size;
+                            });
+                        if (!overlaps) {
+                            allocations->push_back({offset, size});
+                        }
+                    }
+                }
+            }
+            if (allocations->empty() && !hold_free_space) {
+                continue;
+            }
+            if (offset_allocator) {
                 auto imported = ImportOffsetBufferAllocator(
                     restore.segment.name, restore.segment.base,
                     restore.segment.size, restore.segment.te_endpoint,
-                    *allocations);
+                    *allocations, ReplicaType::MEMORY, hold_free_space);
                 if (!imported) {
                     return fail_remount(ErrorCode::INVALID_PARAMS);
                 }
                 restore.restored_allocator = std::move(imported->allocator);
+                for (size_t i = restored_count; i < imported->buffers.size();
+                     ++i) {
+                    restore.quarantined.push_back(
+                        std::move(imported->buffers[i]));
+                }
+                imported->buffers.resize(restored_count);
                 restore.buffers = std::move(imported->buffers);
+                for (auto& held : imported->held_free_space) {
+                    restore.quarantined.push_back(std::move(held));
+                }
             } else if (std::dynamic_pointer_cast<CachelibBufferAllocator>(
                            restore.old_allocator)) {
                 auto imported = ImportCachelibBufferAllocator(
@@ -1360,8 +1417,9 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                     });
                 auto accounted =
                     standby_accounted_memory_bytes_.find(restore.segment.name);
-                if (accounted == standby_accounted_memory_bytes_.end() ||
-                    accounted->second < restore.imported_size) {
+                if (restore.imported_size != 0 &&
+                    (accounted == standby_accounted_memory_bytes_.end() ||
+                     accounted->second < restore.imported_size)) {
                     return fail_remount(ErrorCode::INTERNAL_ERROR);
                 }
                 allocator_replacements.push_back({restore.segment.id,
@@ -1387,6 +1445,16 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                     segment_access.BindBufferToSegment(restore.segment.id,
                                                        *buffer);
                 }
+                for (auto& buffer : restore.quarantined) {
+                    segment_access.BindBufferToSegment(restore.segment.id,
+                                                       *buffer);
+                }
+            }
+        }
+        for (auto& restore : restores) {
+            if (!restore.quarantined.empty()) {
+                HoldQuarantined(std::move(restore.quarantined),
+                                promotion_quarantine_->until);
             }
         }
         for (auto& restore : restores) {
@@ -5262,6 +5330,9 @@ auto MasterService::PrepareWriteStart(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id,
     uint64_t slice_length, const ReplicateConfig& config,
     std::string_view action) -> tl::expected<WriteStartPlan, ErrorCode> {
+    if (handoff_draining_.load(std::memory_order_acquire)) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     if ((config.replica_num == 0 && config.nof_replica_num == 0 &&
          config.dfs_replica_num == 0) ||
         key.empty() || slice_length == 0) {
@@ -6624,6 +6695,9 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     const std::vector<std::string>& tgt_segments,
     const UUID& dynamic_replication_lease_id,
     uint64_t dynamic_replication_version_epoch) {
+    if (handoff_draining_.load(std::memory_order_acquire)) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     auto normalized_tenant_result = ResolveTenantIdForWrite(tenant_id);
     if (!normalized_tenant_result) {
         return tl::make_unexpected(normalized_tenant_result.error());
@@ -7056,6 +7130,9 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
 tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id,
     const std::string& src_segment, const std::string& tgt_segment) {
+    if (handoff_draining_.load(std::memory_order_acquire)) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     const auto record = FindClientRecord(client_id);
     auto serving_guard =
@@ -10228,6 +10305,7 @@ void MasterService::ClientMonitorFunc() {
         }
 
         DropUnremountedStandbySegments();
+        ReleaseExpiredQuarantine();
         const auto now = ClientLivenessRecord::Clock::now();
         std::vector<std::pair<UUID, std::shared_ptr<ClientLivenessRecord>>>
             clients;
