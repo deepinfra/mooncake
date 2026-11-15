@@ -1091,6 +1091,8 @@ ErrorCode MasterService::ValidateStandbyRemountSegment(
 auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    const auto remount_start = std::chrono::steady_clock::now();
+    size_t adopted_replicas = 0;
     {
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
         auto [record_it, record_inserted] =
@@ -1310,10 +1312,23 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             return fail_remount(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
         }
 
-        const bool quarantine_armed =
-            any_standby_kept_alive && promotion_quarantine_ &&
+        const bool quarantine_open =
+            promotion_quarantine_ &&
             std::chrono::steady_clock::now() < promotion_quarantine_->until;
+        const auto restored_segment = [this](const Segment& segment) {
+            return std::any_of(
+                standby_memory_segments_.begin(),
+                standby_memory_segments_.end(),
+                [&segment](const StandbySegmentInfo& restored) {
+                    return restored.segment_name == segment.name ||
+                           restored.transport_endpoint == segment.te_endpoint;
+                });
+        };
         for (auto& restore : restores) {
+            // Any segment the previous term knew may receive its late writes,
+            // whether or not anything on it was restored.
+            const bool quarantine_armed =
+                quarantine_open && restored_segment(restore.segment);
             const bool offset_allocator =
                 std::dynamic_pointer_cast<OffsetBufferAllocator>(
                     restore.old_allocator) != nullptr;
@@ -1472,6 +1487,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             for (size_t i = 0; i < restore.restored.size(); ++i) {
                 restore.restored[i]->AdoptFrom(std::move(*restore.buffers[i]));
             }
+            adopted_replicas += restore.restored.size();
             invalid_replica_endpoints_.erase(restore.segment.te_endpoint);
             invalid_replica_endpoints_.erase(restore.segment.name);
             standby_allocator_keepalive_.erase(restore.segment.te_endpoint);
@@ -1481,6 +1497,15 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         // Change the client status to OK
         ok_client_.insert(client_id);
         MasterMetricManager::instance().inc_active_clients();
+    }
+    if (adopted_replicas > 0) {
+        LOG(INFO) << "action=remount_restored, client_id=" << client_id
+                  << ", segments=" << segments.size()
+                  << ", adopted_replicas=" << adopted_replicas
+                  << ", elapsed_ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - remount_start)
+                         .count();
     }
 
     if (enable_oplog_ && ordered_oplog_writer_) {

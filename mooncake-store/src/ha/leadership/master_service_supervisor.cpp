@@ -997,15 +997,14 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         // A planned stop hands off: readiness drops first, new writes are
         // refused while those in flight finish, and what is still in flight
         // is recorded for the next leader before the lease goes.
-        std::optional<std::vector<AllocatedBuffer::Descriptor>>
-            handoff_in_flight;
+        std::atomic<bool> handing_off{false};
         ServingShutdownTrigger shutdown_trigger(shutdown_requested, [&]() {
             serving_state.RequestShutdown([&]() {
                 admin_server.SetServiceAvailable(false);
                 label_reconciler.SetLeader(false);
-                handoff_in_flight =
-                    wrapped_master_service->master_service().BeginHandoffDrain(
-                        std::chrono::milliseconds(kHandoffDrainMs));
+                wrapped_master_service->master_service().BeginHandoffDrain(
+                    std::chrono::milliseconds(kHandoffDrainMs));
+                handing_off.store(true, std::memory_order_release);
                 SetRuntimeState(admin_server, MasterRuntimeState::kStandby);
                 LOG(INFO) << "Trying to stop server, reason=shutdown requested";
                 server.stop();
@@ -1114,9 +1113,12 @@ int RunSupervisorLoop(const HABackendSpec& spec,
 
         StopLeadershipMonitor(leadership_monitor_handle);
         wrapped_master_service->StopBatchOpLogWriter();
-        if (handoff_in_flight) {
-            wrapped_master_service->master_service().WriteHandoffRecord(
-                *handoff_in_flight);
+        if (handing_off.load(std::memory_order_acquire)) {
+            // A write admitted just before the drain began can publish after
+            // it returned; the workers are done now, so collect again.
+            auto& service = wrapped_master_service->master_service();
+            service.WriteHandoffRecord(
+                service.BeginHandoffDrain(std::chrono::milliseconds(0)));
         }
         DeactivateServingState(admin_server, label_reconciler);
         wrapped_master_service->StopHttpMetadataCleanup();

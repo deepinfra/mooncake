@@ -154,7 +154,8 @@ tl::expected<void, ErrorCode> MasterService::FollowerRemove(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
-    MetadataAccessorRW accessor(this, {tenant, key});
+    MetadataAccessorRW accessor(this, {tenant, key},
+                                MetadataAccessorRW::AsIs{});
     if (accessor.IsPublished()) {
         accessor.Erase();
     }
@@ -291,7 +292,8 @@ std::optional<StandbyObjectMetadata> MasterService::FollowerGet(
         return std::nullopt;
     }
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
-    MetadataAccessorRW accessor(this, {tenant, key});
+    MetadataAccessorRW accessor(this, {tenant, key},
+                                MetadataAccessorRW::AsIs{});
     if (!accessor.IsPublished()) {
         return std::nullopt;
     }
@@ -440,8 +442,8 @@ tl::expected<void, ErrorCode> MasterService::ActivateFollower(
 
     ArmPromotionQuarantine(applied.last_seq);
     {
-        std::unique_lock<std::shared_mutex> exclusive(master_state_mutex_);
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+        std::unique_lock<std::shared_mutex> exclusive(master_state_mutex_);
         std::lock_guard<std::mutex> lock(follower_mutex_);
         std::unordered_map<std::string, StandbySegmentInfo> memory_segments;
         for (const auto& [endpoint, segment] : follower_segments_) {
@@ -507,7 +509,9 @@ tl::expected<void, ErrorCode> MasterService::ActivateFollower(
                            std::memory_order_release);
     LOG(INFO) << "action=activate_follower, objects=" << GetKeyCount()
               << ", segments=" << standby_memory_segments_.size()
-              << ", applied_seq=" << applied.last_seq;
+              << ", applied_seq=" << applied.last_seq
+              << ", orphaned_replicas=" << FollowerOrphanedReplicas()
+              << ", rejected_entries=" << FollowerRejectedEntries();
     return {};
 }
 
@@ -533,7 +537,8 @@ std::vector<AllocatedBuffer::Descriptor> MasterService::BeginHandoffDrain(
     std::vector<AllocatedBuffer::Descriptor> ranges;
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     for (const auto& [tenant_id, key] : keys) {
-        MetadataAccessorRW accessor(this, {tenant_id, key});
+        MetadataAccessorRW accessor(this, {tenant_id, key},
+                                    MetadataAccessorRW::AsIs{});
         if (!accessor.IsPublished()) {
             continue;
         }
