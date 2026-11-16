@@ -48,6 +48,11 @@ class K8sLeaderCoordinator final : public LeaderCoordinator {
     // A process's identity on the Lease: its address and a per-process
     // suffix, so a restart at the same address is a new holder.
     static std::string LeaseIdentity(const std::string& leader_address);
+    // See K8sLeaseHelper::LastRenewMonoNs.
+    int64_t LastRenewMonoNs() const {
+        return K8sLeaseHelper::LastRenewMonoNs(namespace_, lease_name_);
+    }
+    static constexpr std::chrono::seconds kRenewDeadline{3};
     static std::string AddressOf(const std::string& identity);
 
    private:

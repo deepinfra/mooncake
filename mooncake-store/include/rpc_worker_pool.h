@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <stdexcept>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -13,6 +14,8 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/util/type_traits.h>
 #include <ylt/util/utils.hpp>
+
+#include "ha/serving_gate.h"
 
 namespace mooncake {
 
@@ -39,13 +42,24 @@ class PooledHandler<Method, Service, std::tuple<Params...>> {
     PooledHandler(Service& service, asio::thread_pool::executor_type executor)
         : service_(service), executor_(executor) {}
 
+    // Past the leader's serving deadline nothing is answered: coro_rpc
+    // turns the throw into an error for the caller. Checked again after the
+    // call, so a result computed across a pause is not delivered either.
     async_simple::coro::Lazy<Result> Handle(Params... params) {
+        ThrowUnlessServing();
         auto result = co_await coro_io::post(
             [&]() -> Result {
                 return (service_.*Method)(std::move(params)...);
             },
             executor_);
+        ThrowUnlessServing();
         co_return std::move(result).value();
+    }
+
+    static void ThrowUnlessServing() {
+        if (!ha::ServingGate::Instance().Open()) {
+            throw std::runtime_error("leader lease deadline passed");
+        }
     }
 
    private:

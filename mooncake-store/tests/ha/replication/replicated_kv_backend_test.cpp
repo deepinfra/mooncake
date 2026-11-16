@@ -1,5 +1,7 @@
 #include "ha/replication/replicated_kv_backend.h"
 
+#include "ha/serving_gate.h"
+
 #include <gtest/gtest.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -371,6 +373,22 @@ TEST_F(ReplicationTest, AWrongTokenIsRefused) {
         .value = "v"});
     EXPECT_EQ(forward.status, static_cast<int32_t>(ReplStatus::kDenied));
     EXPECT_EQ(Value(*primary.backend, "/x"), "<absent>");
+}
+
+TEST(ServingGateTest, ClosesOnceTheLastRenewalIsPastTheDeadline) {
+    ServingGate gate;
+    EXPECT_TRUE(gate.Open());  // not armed
+    gate.Arm(std::chrono::milliseconds(50), ServingGate::NowMonoNs());
+    EXPECT_TRUE(gate.Open());
+    std::this_thread::sleep_for(60ms);
+    EXPECT_FALSE(gate.Open());  // e.g. resumed from a pause
+    gate.Renewed(ServingGate::NowMonoNs() - 1'000'000'000);  // older: ignored
+    EXPECT_FALSE(gate.Open());
+    gate.Renewed(ServingGate::NowMonoNs());
+    EXPECT_TRUE(gate.Open());
+    gate.Disarm();
+    std::this_thread::sleep_for(60ms);
+    EXPECT_TRUE(gate.Open());
 }
 
 TEST(ReplicationRecordTest, RoundTripsAndRejectsGarbage) {

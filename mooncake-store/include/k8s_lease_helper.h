@@ -29,6 +29,10 @@ class K8sLeaseHelper {
     static ErrorCode GetHolder(const std::string& ns, const std::string& lease,
                                std::string& holder, int64_t& lease_transitions);
 
+    // When this process's last successful acquire or renew of the Lease was
+    // sent, on CLOCK_MONOTONIC (steady_clock); -1 without a running election.
+    static int64_t LastRenewMonoNs(const std::string& ns,
+                                   const std::string& lease);
     // K8S_LEASE_NOT_FOUND when the Lease or the annotation is absent.
     static ErrorCode GetAnnotation(const std::string& ns,
                                    const std::string& lease,

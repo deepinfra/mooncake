@@ -121,6 +121,12 @@ ErrorCode K8sLeaseHelper::GetHolder(const std::string& ns,
     return ErrorCode::OK;
 }
 
+int64_t K8sLeaseHelper::LastRenewMonoNs(const std::string& ns,
+                                        const std::string& lease) {
+    return static_cast<int64_t>(K8sLeaseLastRenewMonoNs(
+        const_cast<char*>(ns.c_str()), const_cast<char*>(lease.c_str())));
+}
+
 ErrorCode K8sLeaseHelper::GetAnnotation(const std::string& ns,
                                         const std::string& lease,
                                         const std::string& key,
@@ -262,6 +268,11 @@ ErrorCode K8sLeaseHelper::GetHolder(const std::string&, const std::string&,
                                     std::string&, int64_t&) {
     LOG(FATAL) << "K8s Lease is not enabled in compilation";
     return ErrorCode::K8S_LEASE_OPERATION_ERROR;
+}
+
+int64_t K8sLeaseHelper::LastRenewMonoNs(const std::string&,
+                                        const std::string&) {
+    return -1;
 }
 
 ErrorCode K8sLeaseHelper::GetAnnotation(const std::string&,

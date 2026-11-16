@@ -15,6 +15,14 @@ static inline void call_holder_change_cb(holder_change_cb_t func, void* ctx,
                                           int64_t leaseTransitions) {
   func(ctx, holder, holderSize, leaseTransitions);
 }
+
+#include <time.h>
+// The clock C++ steady_clock reads, so both sides compare one timeline.
+static inline int64_t mono_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
 */
 import "C"
 
@@ -24,6 +32,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -46,6 +55,35 @@ type electionState struct {
 	lost        chan struct{} // closed when OnStoppedLeading fires
 	err         error         // set before lost is closed, if any
 	transitions int64         // set before elected is closed
+	// When the last successful acquire or renew was sent (CLOCK_MONOTONIC):
+	// the Lease is ours until a renew deadline after it.
+	lastRenew atomic.Int64
+}
+
+// timedLock records when each successful write of the election record was
+// sent. Sent, not acknowledged: the apiserver may have committed it (and a
+// candidate seen it) before the reply arrived.
+type timedLock struct {
+	resourcelock.Interface
+	lastRenew *atomic.Int64
+}
+
+func (l *timedLock) Create(ctx context.Context, ler resourcelock.LeaderElectionRecord) error {
+	sent := int64(C.mono_ns())
+	err := l.Interface.Create(ctx, ler)
+	if err == nil {
+		l.lastRenew.Store(sent)
+	}
+	return err
+}
+
+func (l *timedLock) Update(ctx context.Context, ler resourcelock.LeaderElectionRecord) error {
+	sent := int64(C.mono_ns())
+	err := l.Interface.Update(ctx, ler)
+	if err == nil && ler.HolderIdentity == l.Interface.Identity() {
+		l.lastRenew.Store(sent)
+	}
+	return err
 }
 
 // watchState holds the runtime state for a single Lease watch.
@@ -150,8 +188,9 @@ func runElection(namespace, leaseName, identity string,
 		},
 	}
 
+	state.lastRenew.Store(-1)
 	le, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
-		Lock:            lock,
+		Lock:            &timedLock{Interface: lock, lastRenew: &state.lastRenew},
 		LeaseDuration:   time.Duration(leaseDurationSec) * time.Second,
 		RenewDeadline:   time.Duration(renewDeadlineSec) * time.Second,
 		RetryPeriod:     time.Duration(retryPeriodSec) * time.Second,
@@ -426,6 +465,18 @@ func casAnnotation(namespace, leaseName, identity string, transitions int64,
 		}
 	}
 	return false, fmt.Errorf("lease %s/%s kept changing", namespace, leaseName)
+}
+
+//export K8sLeaseLastRenewMonoNs
+func K8sLeaseLastRenewMonoNs(ns, leaseName *C.char) C.longlong {
+	key := electionKey(C.GoString(ns), C.GoString(leaseName))
+	electionMutex.Lock()
+	state, ok := elections[key]
+	electionMutex.Unlock()
+	if !ok {
+		return -1
+	}
+	return C.longlong(state.lastRenew.Load())
 }
 
 //export K8sLeaseGetAnnotation

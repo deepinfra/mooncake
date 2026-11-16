@@ -1,5 +1,6 @@
 #include "ha/leadership/master_service_supervisor.h"
 #include "ha/replication/replicated_kv_backend.h"
+#include "ha/serving_gate.h"
 #ifdef STORE_USE_K8S_LEASE
 #include "ha/leadership/backends/k8s/k8s_leader_coordinator.h"
 #endif
@@ -468,6 +469,36 @@ struct StandbyStatusProviderScope {
 // that led a term, or whose primary started a new history, restarts so it
 // rejoins from scratch instead of reusing its in-memory index.
 constexpr int kReplicationRestartExitCode = 75;
+
+// Refreshes the serving gate from the Lease's last renewal and stops the
+// server once the renew deadline passes (see ServingGate).
+class LeaseDeadlineWatch {
+   public:
+    LeaseDeadlineWatch(std::function<int64_t()> last_renew,
+                       std::function<void()> on_expired)
+        : thread_([this, last_renew = std::move(last_renew),
+                   on_expired = std::move(on_expired)] {
+              auto& gate = ServingGate::Instance();
+              bool fired = false;
+              while (!stop_.load(std::memory_order_acquire)) {
+                  gate.Renewed(last_renew());
+                  if (!fired && !gate.Open()) {
+                      fired = true;
+                      LOG(WARNING) << "action=lease_deadline_passed";
+                      on_expired();
+                  }
+                  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+              }
+          }) {}
+    ~LeaseDeadlineWatch() {
+        stop_.store(true, std::memory_order_release);
+        thread_.join();
+    }
+
+   private:
+    std::atomic<bool> stop_{false};
+    std::thread thread_;
+};
 
 [[noreturn]] void ExitToRejoin(std::string_view reason) {
     LOG(WARNING) << "action=replication_restart, reason=" << reason;
@@ -1063,6 +1094,28 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             continue;
         }
         auto leadership_monitor_handle = std::move(leadership_monitor.value());
+        std::unique_ptr<LeaseDeadlineWatch> lease_watch;
+#ifdef STORE_USE_K8S_LEASE
+        if (auto* k8s = dynamic_cast<backends::k8s::K8sLeaderCoordinator*>(
+                &leader_coordinator)) {
+            ServingGate::Instance().Arm(
+                backends::k8s::K8sLeaderCoordinator::kRenewDeadline,
+                k8s->LastRenewMonoNs());
+            lease_watch = std::make_unique<LeaseDeadlineWatch>(
+                [k8s] { return k8s->LastRenewMonoNs(); },
+                [&server, &admin_server, &serving_state, &label_reconciler] {
+                    serving_state.RequestShutdown([&]() {
+                        admin_server.SetServiceAvailable(false);
+                        label_reconciler.SetLeader(false);
+                        SetRuntimeState(admin_server,
+                                        MasterRuntimeState::kStandby);
+                        LOG(INFO) << "Trying to stop server, reason="
+                                     "lease_deadline_passed";
+                        server.stop();
+                    });
+                });
+        }
+#endif
 
         // A planned stop hands off: readiness drops first, new writes are
         // refused while those in flight finish, and what is still in flight
