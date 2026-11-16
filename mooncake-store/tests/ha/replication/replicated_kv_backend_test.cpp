@@ -1,6 +1,8 @@
 #include "ha/replication/replicated_kv_backend.h"
 
+#include "ha/kv/sqlite_ha_kv_backend.h"
 #include "ha/serving_gate.h"
+#include "ha/snapshot/object/backends/ha_kv/ha_kv_snapshot_object_store.h"
 
 #include <gtest/gtest.h>
 #include <netinet/in.h>
@@ -391,6 +393,43 @@ TEST_F(ReplicationTest, AWrongTokenIsRefused) {
         .value = "v"});
     EXPECT_EQ(forward.status, static_cast<int32_t>(ReplStatus::kDenied));
     EXPECT_EQ(Value(*primary.backend, "/x"), "<absent>");
+}
+
+TEST(HaKvSnapshotObjectStoreTest, StoresChunkedObjectsInTheKvStore) {
+    auto backend = SqliteHaKvBackend::Open(FreshDb("snapshot_objects"));
+    ASSERT_TRUE(backend);
+    HaKvSnapshotObjectStore store(*backend, /*chunk_bytes=*/1000);
+    std::vector<uint8_t> big(4321);
+    for (size_t i = 0; i < big.size(); ++i) {
+        big[i] = static_cast<uint8_t>(i * 7);
+    }
+    ASSERT_TRUE(store.UploadBuffer("snap/1/chunk_0", big));
+    ASSERT_TRUE(store.UploadString("snap/1/manifest", "m1"));
+    ASSERT_TRUE(store.UploadString("snap/10/manifest", "m10"));
+    ASSERT_TRUE(store.UploadString("snap/1/empty", ""));
+    std::vector<uint8_t> read;
+    ASSERT_TRUE(store.DownloadBuffer("snap/1/chunk_0", read));
+    EXPECT_EQ(read, big);
+    std::string text;
+    ASSERT_TRUE(store.DownloadString("snap/1/empty", text));
+    EXPECT_EQ(text, "");
+    EXPECT_EQ(store.InspectObject("snap/1/chunk_0")->stored_size, big.size());
+
+    // Re-uploading shorter leaves no stale chunks behind.
+    ASSERT_TRUE(store.UploadString("snap/1/chunk_0", "short"));
+    ASSERT_TRUE(store.DownloadString("snap/1/chunk_0", text));
+    EXPECT_EQ(text, "short");
+
+    std::vector<std::string> keys;
+    ASSERT_TRUE(store.ListObjectsWithPrefix("snap/1/", keys));
+    EXPECT_EQ(keys, (std::vector<std::string>{"snap/1/chunk_0", "snap/1/empty",
+                                              "snap/1/manifest"}));
+    ASSERT_TRUE(store.DeleteObjectsWithPrefix("snap/1/"));
+    auto missing = store.DownloadString("snap/1/manifest", text);
+    ASSERT_FALSE(missing);
+    EXPECT_TRUE(store.IsNotFoundError(missing.error()));
+    ASSERT_TRUE(store.DownloadString("snap/10/manifest", text));
+    EXPECT_EQ(text, "m10");
 }
 
 TEST(ServingGateTest, ClosesOnceTheLastRenewalIsPastTheDeadline) {

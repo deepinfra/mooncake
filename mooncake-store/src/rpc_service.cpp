@@ -11,6 +11,7 @@
 #include "master_metric_manager.h"
 #include "master_service.h"
 #include "ha/oplog/oplog_test_failpoint.h"
+#include "ha/serving_gate.h"
 #include "rpc_worker_pool.h"
 #include "rpc_helper.h"
 #include "types.h"
@@ -1605,6 +1606,9 @@ WrappedMasterService::GetStorageConfig() {
 
 tl::expected<PingResponse, ErrorCode> WrappedMasterService::Ping(
     const UUID& client_id) {
+    if (!ha::ServingGate::Instance().Open()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     ScopedVLogTimer timer(1, "Ping");
     timer.LogRequest("client_id=", client_id);
 
@@ -1617,6 +1621,9 @@ tl::expected<PingResponse, ErrorCode> WrappedMasterService::Ping(
 }
 
 tl::expected<std::string, ErrorCode> WrappedMasterService::ServiceReady() {
+    if (!ha::ServingGate::Instance().Open()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     return GetMooncakeStoreVersion();
 }
 
@@ -2151,18 +2158,15 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::QueryWeightOperation,
         &WrappedMasterService::DeleteWeightRevision>(
         server, wrapped_master_service, worker_pool);
-    // The prefetch additions stay individual registrations on top of the
-    // pool: read-only replica queries (no lease, no promotion-on-hit, no
-    // metrics) and the prefetch task RPC. Purely additive for old peers.
-    server.register_handler<
-        &mooncake::WrappedMasterService::GetReplicaListForAdmin>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::BatchGetReplicaListForAdmin>(
-        &wrapped_master_service);
-    server.register_handler<
+    // The prefetch additions: read-only replica queries (no lease, no
+    // promotion-on-hit, no metrics) and the prefetch task RPC. Purely
+    // additive for old peers. Pooled like the rest, so a leader past its
+    // Lease deadline answers none of them (ServingGate).
+    RegisterPooledHandlers<
+        &mooncake::WrappedMasterService::GetReplicaListForAdmin,
+        &mooncake::WrappedMasterService::BatchGetReplicaListForAdmin,
         &mooncake::WrappedMasterService::RegisterPrefetchTask>(
-        &wrapped_master_service);
+        server, wrapped_master_service, worker_pool);
 }
 
 }  // namespace mooncake

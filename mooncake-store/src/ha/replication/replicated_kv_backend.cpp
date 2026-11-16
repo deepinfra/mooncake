@@ -485,7 +485,8 @@ CopyPageResponse ReplicatedHaKvBackend::HandleCopyPage(
         response.status = static_cast<int32_t>(ReplStatus::kNotPrimary);
         return response;
     }
-    sqlite::SqliteHaStore::SnapshotReader* reader = nullptr;
+    // Shared: another request may evict the session while this one reads.
+    std::shared_ptr<sqlite::SqliteHaStore::SnapshotReader> reader;
     bool from_start = false;
     const auto now = std::chrono::steady_clock::now();
     // An abandoned copy's read transaction would hold the WAL forever.
@@ -502,9 +503,8 @@ CopyPageResponse ReplicatedHaKvBackend::HandleCopyPage(
             return response;
         }
         request.session = next_session_++;
-        reader = opened->get();
-        copy_sessions_[request.session] =
-            CopySession{std::move(opened.value()), now};
+        reader = std::move(opened.value());
+        copy_sessions_[request.session] = CopySession{reader, now};
         from_start = true;
     } else {
         auto it = copy_sessions_.find(request.session);
@@ -513,7 +513,7 @@ CopyPageResponse ReplicatedHaKvBackend::HandleCopyPage(
             return response;
         }
         it->second.used = now;
-        reader = it->second.reader.get();
+        reader = it->second.reader;
     }
     response.session = request.session;
     response.revision = reader->revision();

@@ -233,7 +233,7 @@ class ReplicatedHaKvBackend final
     bool fenced_{false};
     ReplicationRecordStore* records_{nullptr};
     struct CopySession {
-        std::unique_ptr<sqlite::SqliteHaStore::SnapshotReader> reader;
+        std::shared_ptr<sqlite::SqliteHaStore::SnapshotReader> reader;
         std::chrono::steady_clock::time_point used;
     };
     std::map<uint64_t, CopySession> copy_sessions_;
