@@ -3378,10 +3378,9 @@ TEST_F(MasterServiceFollowerTest, TheDrainReportsReplicasHeldForRelease) {
                             }));
 }
 
-TEST_F(MasterServiceFollowerTest, ASecondRemountKeepsTheLiveAllocator) {
-    const auto path = FreshSqlitePath("follower_second_remount");
-    const std::string endpoint = "second_remount_endpoint";
-    const uint64_t in_flight_address = kDefaultSegmentBase + 65536;
+TEST_F(MasterServiceFollowerTest, ARestartedClientsRemountKeepsItsAllocator) {
+    const auto path = FreshSqlitePath("follower_restarted_client");
+    const std::string endpoint = "restarted_client_endpoint";
     {
         MasterService old_leader(MasterServiceConfig::builder()
                                      .set_enable_ha(true)
@@ -3391,8 +3390,8 @@ TEST_F(MasterServiceFollowerTest, ASecondRemountKeepsTheLiveAllocator) {
                                      .set_ha_backend_connstring(path)
                                      .set_view_version(1)
                                      .build());
-        AllocatedBuffer::Descriptor in_flight{8192, in_flight_address, "tcp",
-                                              endpoint};
+        AllocatedBuffer::Descriptor in_flight{
+            8192, kDefaultSegmentBase + (8u << 20), "tcp", endpoint};
         ASSERT_EQ(old_leader.WriteHandoffRecord({in_flight}), ErrorCode::OK);
     }
     MasterService service(SqliteFollowerConfig(path));
@@ -3402,43 +3401,52 @@ TEST_F(MasterServiceFollowerTest, ASecondRemountKeepsTheLiveAllocator) {
                                  ObjectAt(endpoint, kDefaultSegmentBase))
                     .has_value());
     ASSERT_TRUE(service.ActivateFollower(2, DurablePrefix{}, {}, {}));
+    const Segment old_segment = MakeSegment(endpoint);
+    const UUID old_client = generate_uuid();
+    ASSERT_TRUE(
+        service.ReMountSegment({old_segment}, old_client).has_value());
+    ASSERT_TRUE(
+        service.UnmountSegment(old_segment.id, old_client).has_value());
+
+    // The client restarts on the same endpoint inside the quarantine window:
+    // it mounts, takes writes, then remounts as its first ping asks.
     const Segment segment = MakeSegment(endpoint);
     const UUID client = generate_uuid();
-    ASSERT_TRUE(service.ReMountSegment({segment}, client).has_value());
-
-    std::vector<std::pair<uint64_t, uint64_t>> live{
-        {kDefaultSegmentBase, 1024}, {in_flight_address, 8192}};
+    ASSERT_TRUE(service.MountSegment(segment, client).has_value());
+    std::vector<std::pair<uint64_t, uint64_t>> live;
     ReplicateConfig config;
     config.replica_num = 1;
-    const UUID writer = generate_uuid();
     for (int i = 0; i < 8; ++i) {
         const std::string key = "this_term_" + std::to_string(i);
-        auto started =
-            service.PutStart(writer, key, kDefaultTenant, 4096, config);
+        auto started = service.PutStart(client, key, kDefaultTenant, 4096, config);
         ASSERT_TRUE(started.has_value());
         live.emplace_back(started->front()
                               .get_memory_descriptor()
                               .buffer_descriptor.buffer_address_,
                           4096);
         ASSERT_TRUE(
-            service.PutEnd(writer, key, kDefaultTenant, ReplicaType::MEMORY));
+            service.PutEnd(client, key, kDefaultTenant, ReplicaType::MEMORY));
     }
-
-    // The client remounts again inside the quarantine window.
     ASSERT_TRUE(service.ReMountSegment({segment}, client).has_value());
-    EXPECT_EQ(service.PromotionQuarantineBytes(), 8192u);
-    for (int i = 0; i < 64; ++i) {
-        auto started = service.PutStart(writer, "after_" + std::to_string(i),
-                                        kDefaultTenant, 4096, config);
-        ASSERT_TRUE(started.has_value());
+    // Fill the segment: any range the allocator forgot is handed out again.
+    constexpr size_t kChunk = 64 * 1024;
+    size_t allocated = 0;
+    for (size_t i = 0; i < kDefaultSegmentSize / kChunk; ++i) {
+        auto started = service.PutStart(client, "after_" + std::to_string(i),
+                                        kDefaultTenant, kChunk, config);
+        if (!started.has_value()) {
+            break;
+        }
+        ++allocated;
         const auto address = started->front()
                                  .get_memory_descriptor()
                                  .buffer_descriptor.buffer_address_;
         for (const auto& [start, size] : live) {
-            EXPECT_FALSE(address < start + size && start < address + 4096)
+            EXPECT_FALSE(address < start + size && start < address + kChunk)
                 << "allocation " << address << " overlaps live " << start;
         }
     }
+    EXPECT_GT(allocated, 0u);
 }
 
 TEST_F(MasterServiceFollowerTest, AServingIndexRefusesFollowerApply) {

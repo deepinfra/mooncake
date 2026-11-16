@@ -11,9 +11,12 @@
 //   remount: mounts a segment of its own (no memory behind it: only the
 //          master's allocation is checked), writes objects there and leaves
 //          one write open, then pings until the leader changes. On the new
-//          leader it remounts as a client would, writes more objects,
-//          remounts again, and counts new allocations on the segment that
-//          overlap any live object or the open write.
+//          leader it remounts as a client would, then dies. A restarted
+//          client mounts the same endpoint once the old one is offboarded,
+//          writes objects, and remounts as its first ping asks it to. It
+//          then counts new allocations on the segment that overlap the
+//          restarted client's objects (`overlapping`) or the old term's
+//          open write (`overlapping_open`).
 
 #include <chrono>
 #include <fstream>
@@ -37,7 +40,7 @@ DEFINE_string(ranges, "", "check: the ranges `start` printed");
 DEFINE_string(key_prefix, "late-write-probe", "Key prefix");
 DEFINE_string(segment_endpoint, "172.31.250.99:1",
               "remount: the probe segment's endpoint");
-DEFINE_uint64(segment_mb, 64, "remount: the probe segment's size");
+DEFINE_uint64(segment_mb, 16, "remount: the probe segment's size");
 DEFINE_uint64(wait_s, 300, "remount: how long to wait for a new leader");
 
 namespace {
@@ -150,17 +153,52 @@ int Remount(mooncake::MasterClient& client, mooncake::ReplicateConfig config,
         std::cerr << "no new leader" << std::endl;
         return 3;
     }
-    std::cout << "this_term_objects="
-              << WriteOnSegment(client, config, slices, prefix + "-new", 64,
-                                true, live)
+    const std::vector<std::pair<uint64_t, uint64_t>> open(live.end() - 1,
+                                                          live.end());
+
+    // The client dies; a restarted one takes the same endpoint.
+    mooncake::MasterClient restarted(mooncake::generate_uuid());
+    if (restarted.Connect(FLAGS_master_server) != mooncake::ErrorCode::OK) {
+        std::cerr << "restarted connect failed" << std::endl;
+        return 2;
+    }
+    mooncake::Segment again = segment;
+    again.id = mooncake::generate_uuid();
+    const auto mounted_by =
+        std::chrono::steady_clock::now() + std::chrono::seconds(FLAGS_wait_s);
+    bool mounted = false;
+    while (!mounted && std::chrono::steady_clock::now() < mounted_by) {
+        mounted = static_cast<bool>(restarted.MountSegment(again));
+        if (!mounted) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+    }
+    if (!mounted) {
+        std::cerr << "restarted mount failed" << std::endl;
+        return 3;
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> fresh;
+    std::cout << "RESTARTED_MOUNTED this_term_objects="
+              << WriteOnSegment(restarted, config, slices, prefix + "-new", 64,
+                                true, fresh)
               << std::endl;
-    const bool again = static_cast<bool>(client.ReMountSegment({segment}));
-    std::cout << "REMOUNTED_AGAIN ok=" << again << std::endl;
+    auto ping = restarted.Ping();
+    const bool needs_remount =
+        ping && ping->client_status == mooncake::ClientStatus::NEED_REMOUNT;
+    const bool remounted_again =
+        static_cast<bool>(restarted.ReMountSegment({again}));
+    std::cout << "RESTARTED_REMOUNTED need_remount=" << needs_remount
+              << " ok=" << remounted_again << std::endl;
     size_t allocated = 0;
     size_t overlapping = 0;
-    for (size_t i = 0; i < 1024; ++i) {
+    size_t overlapping_open = 0;
+    // Enough to fill the segment, held until the end: a range the
+    // allocator forgot comes back.
+    std::vector<std::string> held;
+    const size_t fill = (FLAGS_segment_mb << 20) / FLAGS_value_size + 64;
+    for (size_t i = 0; i < fill; ++i) {
         const std::string key = prefix + "-check-" + std::to_string(i);
-        auto started = client.PutStart(key, slices, config);
+        auto started = restarted.PutStart(key, slices, config);
         if (!started) {
             continue;
         }
@@ -169,17 +207,19 @@ int Remount(mooncake::MasterClient& client, mooncake::ReplicateConfig config,
                 continue;
             }
             ++allocated;
-            if (Overlaps(range.address, range.size, live)) {
-                ++overlapping;
-            }
+            overlapping += Overlaps(range.address, range.size, fresh);
+            overlapping_open += Overlaps(range.address, range.size, open);
         }
-        (void)client.PutRevoke(key, mooncake::ReplicaType::MEMORY);
+        held.push_back(key);
         if (i % 64 == 0) {
-            (void)client.Ping();
+            (void)restarted.Ping();
         }
     }
+    for (const auto& key : held) {
+        (void)restarted.PutRevoke(key, mooncake::ReplicaType::MEMORY);
+    }
     std::cout << "allocated=" << allocated << " overlapping=" << overlapping
-              << std::endl;
+              << " overlapping_open=" << overlapping_open << std::endl;
     return 0;
 }
 
