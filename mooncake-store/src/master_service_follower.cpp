@@ -33,7 +33,8 @@ std::shared_ptr<DummyBufferAllocator> MasterService::FollowerPlaceholderLocked(
 }
 
 tl::expected<std::vector<Replica>, ErrorCode>
-MasterService::BuildFollowerReplicas(const StandbyObjectMetadata& metadata) {
+MasterService::BuildFollowerReplicas(const StandbyObjectMetadata& metadata,
+                                     bool ordered) {
     std::vector<Replica> replicas;
     replicas.reserve(metadata.replicas.size());
     std::lock_guard<std::mutex> lock(follower_mutex_);
@@ -54,7 +55,8 @@ MasterService::BuildFollowerReplicas(const StandbyObjectMetadata& metadata) {
             if (desc.status != ReplicaStatus::REMOVED &&
                 desc.status != ReplicaStatus::FAILED) {
                 follower_orphaned_replicas_.fetch_add(
-                    placeholder->Track(*restored), std::memory_order_relaxed);
+                    placeholder->Track(*restored, ordered),
+                    std::memory_order_relaxed);
             }
             replicas.push_back(
                 Replica(desc.id, std::move(restored), desc.status));
@@ -100,7 +102,7 @@ MasterService::BuildFollowerReplicas(const StandbyObjectMetadata& metadata) {
 
 tl::expected<void, ErrorCode> MasterService::FollowerPut(
     const std::string& tenant_id, const std::string& key,
-    const StandbyObjectMetadata& metadata) {
+    const StandbyObjectMetadata& metadata, bool ordered) {
     if (lifecycle_state_.load(std::memory_order_acquire) !=
         RestoreLifecycleState::kFollowing) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
@@ -119,7 +121,7 @@ tl::expected<void, ErrorCode> MasterService::FollowerPut(
     if (accessor.IsPublished()) {
         accessor.Erase();
     }
-    auto replicas = BuildFollowerReplicas(metadata);
+    auto replicas = BuildFollowerReplicas(metadata, ordered);
     if (!replicas) {
         // Erasing is always safe: the worst case is a miss.
         follower_rejected_entries_.fetch_add(1, std::memory_order_relaxed);
@@ -552,8 +554,21 @@ std::vector<AllocatedBuffer::Descriptor> MasterService::BeginHandoffDrain(
                                      .buffer_descriptor);
             });
     }
+    const size_t in_flight_ranges = ranges.size();
+    {
+        // Their keys are gone from the index, so the next leader would hand
+        // these ranges out while a late write or a reader may still use them.
+        std::lock_guard lock(discarded_replicas_mutex_);
+        const auto now = std::chrono::system_clock::now();
+        for (const auto& discarded : discarded_replicas_) {
+            if (!discarded.isExpired(now)) {
+                discarded.AppendMemoryRanges(ranges);
+            }
+        }
+    }
     LOG(INFO) << "action=handoff_drain, writes_in_flight=" << keys.size()
-              << ", ranges_in_flight=" << ranges.size();
+              << ", ranges_in_flight=" << in_flight_ranges
+              << ", ranges_held_for_release=" << ranges.size() - in_flight_ranges;
     return ranges;
 }
 

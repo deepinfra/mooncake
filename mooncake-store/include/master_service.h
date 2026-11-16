@@ -160,7 +160,8 @@ class MasterService {
 
     void SetBatchOpLogTerminalCallback(
         OrderedOpLogWriter::TerminalCallback callback);
-    void StopBatchOpLogWriter();
+    // False when entries the writer accepted did not become durable.
+    bool StopBatchOpLogWriter();
 
     /**
      * @brief Mount a memory segment for buffer allocation. This function is
@@ -1068,9 +1069,10 @@ class MasterService {
     // one instead of rebuilding it. Until ActivateFollower the OpLog applier
     // is the only mutator: no RPC is served, no business worker runs, and
     // there is no OpLog writer. Each call takes one entry's full state.
+    // `ordered` is false for a snapshot's objects, which carry no order.
     tl::expected<void, ErrorCode> FollowerPut(
         const std::string& tenant_id, const std::string& key,
-        const StandbyObjectMetadata& metadata);
+        const StandbyObjectMetadata& metadata, bool ordered = true);
     tl::expected<void, ErrorCode> FollowerRemove(const std::string& tenant_id,
                                                  const std::string& key);
     void FollowerSegmentMount(const SegmentMountOp& op);
@@ -1080,8 +1082,9 @@ class MasterService {
 
     // Planned hand-off, on the leader being stopped: refuses new write
     // starts, copies, moves and mounts, then waits up to `timeout` for the
-    // writes in flight to end. Returns the memory ranges still in flight,
-    // which the next leader keeps unallocated for a while.
+    // writes in flight to end. Returns the memory ranges a write or read
+    // from this term may still touch (writes in flight and replicas held
+    // for delayed release), which the next leader keeps unallocated.
     std::vector<AllocatedBuffer::Descriptor> BeginHandoffDrain(
         std::chrono::milliseconds timeout);
     // Records the hand-off for the next leader: this term's view, the
@@ -2290,6 +2293,17 @@ class MasterService {
             return ttl_ <= now;
         }
 
+        void AppendMemoryRanges(
+            std::vector<AllocatedBuffer::Descriptor>& out) const {
+            for (const auto& replica : replicas_) {
+                if (replica.is_memory_replica()) {
+                    out.push_back(replica.get_descriptor()
+                                      .get_memory_descriptor()
+                                      .buffer_descriptor);
+                }
+            }
+        }
+
        private:
         std::vector<Replica> replicas_;
         std::chrono::system_clock::time_point ttl_;
@@ -2541,7 +2555,7 @@ class MasterService {
     std::atomic<uint64_t> follower_orphaned_replicas_{0};
     std::atomic<uint64_t> follower_rejected_entries_{0};
     tl::expected<std::vector<Replica>, ErrorCode> BuildFollowerReplicas(
-        const StandbyObjectMetadata& metadata);
+        const StandbyObjectMetadata& metadata, bool ordered);
     std::shared_ptr<DummyBufferAllocator> FollowerPlaceholderLocked(
         const std::string& endpoint, const std::string& segment_name);
     std::vector<StandbySegmentInfo> standby_memory_segments_;

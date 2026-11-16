@@ -450,6 +450,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
             .durable_seq = status.primary_seq_id,
             .lag_entries = status.lag_entries,
             .capture_active = standby_service_->IsSnapshotCaptureActive(),
+            .last_poll_age_ms = standby_service_->MillisSinceLastPoll(),
         };
     }
 

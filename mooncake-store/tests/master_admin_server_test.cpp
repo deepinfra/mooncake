@@ -588,6 +588,7 @@ TEST_F(MasterAdminServerTest, StandbyStatusReportsTheProvidersView) {
             .durable_seq = 42,
             .lag_entries = 1,
             .capture_active = false,
+            .last_poll_age_ms = 7,
         });
     });
     auto resp = HttpGet(port, "/standby_status");
@@ -595,7 +596,8 @@ TEST_F(MasterAdminServerTest, StandbyStatusReportsTheProvidersView) {
     for (const char* field :
          {"\"role\":\"standby\"", "\"follower_ready\":true",
           "\"applied_seq\":41", "\"durable_seq\":42", "\"lag_entries\":1",
-          "\"capture_active\":false", "\"progress_ms\":"}) {
+          "\"capture_active\":false", "\"progress_ms\":",
+          "\"last_poll_age_ms\":7"}) {
         EXPECT_NE(resp.body.find(field), std::string::npos)
             << field << " in " << resp.body;
     }

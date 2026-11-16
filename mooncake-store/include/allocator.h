@@ -284,9 +284,11 @@ class DummyBufferAllocator final : public BufferAllocatorBase {
     ~DummyBufferAllocator() override;
 
     // Records a buffer restored onto this endpoint, so a remount finds it
-    // without walking the index. A tracked buffer the new one overlaps is
-    // older, so stale: it is orphaned. Returns how many were.
-    size_t Track(AllocatedBuffer& buffer);
+    // without walking the index. When `ordered` (OpLog order), a tracked
+    // buffer the new one overlaps is older, so stale: it is orphaned. When
+    // not (a snapshot), neither is known to be newer and both are orphaned.
+    // Returns how many were.
+    size_t Track(AllocatedBuffer& buffer, bool ordered = true);
     // The buffers still restored onto this endpoint, by address.
     std::vector<AllocatedBuffer*> Tracked() const;
     // Orphans every tracked buffer, as when the endpoint's segment goes.
@@ -328,6 +330,9 @@ class DummyBufferAllocator final : public BufferAllocatorBase {
                           boost::intrusive::constant_time_size<false>>
         tracked_;
     uint64_t tracked_bytes_{0};
+    // Ranges an unordered overlap orphaned: a later unordered buffer on any
+    // of them is not known to be newer either.
+    std::vector<std::pair<uintptr_t, uintptr_t>> contested_;
 };
 
 /**

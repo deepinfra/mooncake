@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <thread>
 
 #include "ha/kv/ha_kv_backend_factory.h"
@@ -473,6 +474,15 @@ void HotStandbyService::SetFollowerIndexFactory(FollowerIndexFactory factory) {
     follower_index_factory_ = std::move(factory);
     metadata_store_ = MakeMetadataStore();
     oplog_applier_ = std::make_unique<OpLogApplier>(metadata_store_.get());
+}
+
+uint64_t HotStandbyService::MillisSinceLastPoll() const {
+    const int64_t last = last_poll_ms_.load(std::memory_order_relaxed);
+    if (last < 0) {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    const int64_t since = ha::ProgressNowMs() - last;
+    return since > 0 ? static_cast<uint64_t>(since) : 0;
 }
 
 bool HotStandbyService::IsSnapshotCaptureActive() const {
@@ -1266,6 +1276,8 @@ void HotStandbyService::ReplicationLoop() {
             }
             HandleSnapshotCaptureRequest(result);
             if (result.durable_prefix_present) {
+                last_poll_ms_.store(ha::ProgressNowMs(),
+                                    std::memory_order_relaxed);
                 const uint64_t current_primary = primary_seq_id_.load();
                 if (result.durable_prefix.last_seq > current_primary) {
                     primary_seq_id_.store(result.durable_prefix.last_seq);

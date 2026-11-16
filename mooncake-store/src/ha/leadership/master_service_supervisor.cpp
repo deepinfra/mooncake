@@ -1112,13 +1112,22 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         LOG(ERROR) << "Master service stopped: " << server_err;
 
         StopLeadershipMonitor(leadership_monitor_handle);
-        wrapped_master_service->StopBatchOpLogWriter();
+        const bool oplog_durable =
+            wrapped_master_service->StopBatchOpLogWriter();
         if (handing_off.load(std::memory_order_acquire)) {
             // A write admitted just before the drain began can publish after
             // it returned; the workers are done now, so collect again.
             auto& service = wrapped_master_service->master_service();
-            service.WriteHandoffRecord(
-                service.BeginHandoffDrain(std::chrono::milliseconds(0)));
+            auto ranges =
+                service.BeginHandoffDrain(std::chrono::milliseconds(0));
+            if (oplog_durable) {
+                service.WriteHandoffRecord(ranges);
+            } else {
+                // Without a record the next leader quarantines all free
+                // space, as after a crash.
+                LOG(WARNING) << "action=write_handoff_record, skipped=1"
+                             << ", reason=oplog_not_durable";
+            }
         }
         DeactivateServingState(admin_server, label_reconciler);
         wrapped_master_service->StopHttpMetadataCleanup();

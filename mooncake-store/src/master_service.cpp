@@ -940,12 +940,14 @@ void MasterService::SetBatchOpLogTerminalCallback(
     }
 }
 
-void MasterService::StopBatchOpLogWriter() {
+bool MasterService::StopBatchOpLogWriter() {
     if (ordered_oplog_writer_ &&
         !ordered_oplog_writer_->FlushAndStop(kOpLogFlushOnStopTimeout)) {
         LOG(WARNING) << "action=stop_batch_oplog_writer"
                      << ", error=entries_not_durable_before_stop";
+        return false;
     }
+    return true;
 }
 
 TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
@@ -1156,6 +1158,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
             std::vector<std::unique_ptr<AllocatedBuffer>> quarantined;
             uint64_t imported_size{0};
+            bool existed{false};
         };
         std::vector<SegmentRestore> restores;
         restores.reserve(segments.size());
@@ -1217,12 +1220,16 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                         {},
                                         {},
                                         {},
-                                        0});
+                                        0,
+                                        false});
                 }
             }
         }
         if (remount_error != ErrorCode::OK) {
             return fail_remount(remount_error);
+        }
+        for (size_t i = 0; i < restores.size(); ++i) {
+            restores[i].existed = segment_existed[i];
         }
 
         bool ambiguous_endpoint = false;
@@ -1315,20 +1322,11 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         const bool quarantine_open =
             promotion_quarantine_ &&
             std::chrono::steady_clock::now() < promotion_quarantine_->until;
-        const auto restored_segment = [this](const Segment& segment) {
-            return std::any_of(
-                standby_memory_segments_.begin(),
-                standby_memory_segments_.end(),
-                [&segment](const StandbySegmentInfo& restored) {
-                    return restored.segment_name == segment.name ||
-                           restored.transport_endpoint == segment.te_endpoint;
-                });
-        };
         for (auto& restore : restores) {
-            // Any segment the previous term knew may receive its late writes,
-            // whether or not anything on it was restored.
-            const bool quarantine_armed =
-                quarantine_open && restored_segment(restore.segment);
+            // A segment first mounted in this term may receive the previous
+            // term's late writes, whether or not this index knew it; one
+            // already mounted keeps its live allocator.
+            const bool quarantine_armed = quarantine_open && !restore.existed;
             const bool offset_allocator =
                 std::dynamic_pointer_cast<OffsetBufferAllocator>(
                     restore.old_allocator) != nullptr;

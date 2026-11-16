@@ -46,7 +46,9 @@ bool StandbyMetadataStore::RestoreMetadata(
         if (Exists(tenant_id, key)) {
             return false;
         }
-        return PutMetadata(tenant_id, key, metadata);
+        return follower_->master_service()
+            .FollowerPut(tenant_id, key, metadata, /*ordered=*/false)
+            .has_value();
     }
     std::lock_guard<std::mutex> lock(mutex_);
     return store_[NormalizeTenantId(tenant_id)].emplace(key, metadata).second;

@@ -621,10 +621,12 @@ struct HttpStandbyStatusResponse {
     uint64_t lag_entries{0};
     bool capture_active{false};
     uint64_t progress_ms{0};
+    uint64_t last_poll_age_ms{0};
     std::string build;
 };
 YLT_REFL(HttpStandbyStatusResponse, role, follower_ready, applied_seq,
-         durable_seq, lag_entries, capture_active, progress_ms, build);
+         durable_seq, lag_entries, capture_active, progress_ms,
+         last_poll_age_ms, build);
 
 void MasterAdminServer::HandleStandbyStatus(
     coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
@@ -645,6 +647,7 @@ void MasterAdminServer::HandleStandbyStatus(
                 payload.durable_seq = report->durable_seq;
                 payload.lag_entries = report->lag_entries;
                 payload.capture_active = report->capture_active;
+                payload.last_poll_age_ms = report->last_poll_age_ms;
             }
         }
     }

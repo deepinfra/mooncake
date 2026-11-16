@@ -148,6 +148,35 @@ TEST(DummyBufferAllocatorTest, ALaterOverlappingBufferOrphansTheOlderOnes) {
     EXPECT_EQ(placeholder->Tracked().size(), 2u);
 }
 
+TEST(DummyBufferAllocatorTest, AnUnorderedOverlapOrphansEveryClaimant) {
+    auto placeholder =
+        std::make_shared<DummyBufferAllocator>("seg", "10.0.0.1:1");
+    auto first = RestoredBuffer(placeholder, 0x1000, 0x1000);
+    auto apart = RestoredBuffer(placeholder, 0x5000, 0x1000);
+    EXPECT_EQ(placeholder->Track(*first, /*ordered=*/false), 0u);
+    EXPECT_EQ(placeholder->Track(*apart, /*ordered=*/false), 0u);
+
+    auto second = RestoredBuffer(placeholder, 0x1800, 0x1000);
+    EXPECT_EQ(placeholder->Track(*second, /*ordered=*/false), 2u);
+    EXPECT_FALSE(first->isAllocatorValid());
+    EXPECT_FALSE(second->isAllocatorValid());
+    EXPECT_TRUE(apart->isAllocatorValid());
+
+    // Overlaps only the orphaned first: still not known to be newer.
+    auto third = RestoredBuffer(placeholder, 0x0800, 0x1000);
+    EXPECT_EQ(placeholder->Track(*third, /*ordered=*/false), 1u);
+    EXPECT_FALSE(third->isAllocatorValid());
+    auto tracked = placeholder->Tracked();
+    ASSERT_EQ(tracked.size(), 1u);
+    EXPECT_EQ(tracked[0], apart.get());
+    EXPECT_EQ(placeholder->TrackedBytes(), 0x1000u);
+
+    // OpLog order resolves it again: a later write owns its range.
+    auto later = RestoredBuffer(placeholder, 0x1000, 0x1000);
+    EXPECT_EQ(placeholder->Track(*later), 0u);
+    EXPECT_TRUE(later->isAllocatorValid());
+}
+
 TEST(DummyBufferAllocatorTest, OrphanAllAndDestroyLeaveBuffersSafe) {
     auto placeholder =
         std::make_shared<DummyBufferAllocator>("seg", "10.0.0.1:1");

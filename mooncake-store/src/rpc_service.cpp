@@ -125,8 +125,8 @@ void WrappedMasterService::SetBatchOpLogTerminalCallback(
     master_service_.SetBatchOpLogTerminalCallback(std::move(callback));
 }
 
-void WrappedMasterService::StopBatchOpLogWriter() {
-    master_service_.StopBatchOpLogWriter();
+bool WrappedMasterService::StopBatchOpLogWriter() {
+    return master_service_.StopBatchOpLogWriter();
 }
 
 void WrappedMasterService::StopHttpMetadataCleanup() {

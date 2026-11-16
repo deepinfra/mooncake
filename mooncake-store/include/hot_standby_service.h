@@ -121,6 +121,9 @@ class HotStandbyService {
     bool IsReadyForPromotion() const;
     // Whether a snapshot capture holds OpLog apply paused right now.
     bool IsSnapshotCaptureActive() const;
+    // Since the last poll that read the leader's durable prefix; the lag is
+    // only as fresh as that. UINT64_MAX before the first.
+    uint64_t MillisSinceLastPoll() const;
 
     /**
      * @brief Promote this standby to Primary
@@ -311,6 +314,7 @@ class HotStandbyService {
     // Replication state
     std::atomic<uint64_t> applied_seq_id_{0};
     std::atomic<uint64_t> primary_seq_id_{0};
+    std::atomic<int64_t> last_poll_ms_{-1};
     std::atomic<ErrorCode> last_error_{ErrorCode::OK};
     std::atomic<bool> recovering_{false};
 

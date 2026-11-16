@@ -117,28 +117,47 @@ DummyBufferAllocator::~DummyBufferAllocator() {
     tracked_.clear();
 }
 
-size_t DummyBufferAllocator::Track(AllocatedBuffer& buffer) {
+size_t DummyBufferAllocator::Track(AllocatedBuffer& buffer, bool ordered) {
     std::lock_guard<std::mutex> lock(StandbyTrackingMutex());
     if (buffer.standby_hook_.is_linked()) {
         return 0;
     }
     const auto start = reinterpret_cast<uintptr_t>(buffer.data());
     const uintptr_t end = start + buffer.size();
+    uintptr_t union_start = start;
+    uintptr_t union_end = end;
+    const auto orphan = [&](AllocatedBuffer& overlapped) {
+        const auto overlapped_start =
+            reinterpret_cast<uintptr_t>(overlapped.data());
+        union_start = std::min(union_start, overlapped_start);
+        union_end = std::max(union_end, overlapped_start + overlapped.size());
+        overlapped.OrphanLocked();
+    };
     size_t orphaned = 0;
     auto it = tracked_.lower_bound(buffer, ByAddress{});
     if (it != tracked_.begin()) {
         auto before = std::prev(it);
         if (reinterpret_cast<uintptr_t>(before->data()) + before->size() >
             start) {
-            before->OrphanLocked();
+            orphan(*before);
             ++orphaned;
         }
     }
     while (it != tracked_.end() &&
            reinterpret_cast<uintptr_t>(it->data()) < end) {
-        auto& overlapped = *it++;
-        overlapped.OrphanLocked();
+        orphan(*it++);
         ++orphaned;
+    }
+    if (!ordered) {
+        const bool contested = std::any_of(
+            contested_.begin(), contested_.end(), [&](const auto& range) {
+                return range.first < end && start < range.second;
+            });
+        if (orphaned > 0 || contested) {
+            contested_.emplace_back(union_start, union_end);
+            buffer.OrphanLocked();
+            return orphaned + 1;
+        }
     }
     tracked_.insert(buffer);
     tracked_bytes_ += buffer.size();
@@ -154,6 +173,7 @@ size_t DummyBufferAllocator::OrphanAll() {
         ++orphaned;
     }
     tracked_bytes_ = 0;
+    contested_.clear();
     return orphaned;
 }
 

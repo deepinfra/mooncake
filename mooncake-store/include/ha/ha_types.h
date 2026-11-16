@@ -153,6 +153,7 @@ struct StandbyStatusReport {
     uint64_t durable_seq{0};
     uint64_t lag_entries{0};
     bool capture_active{false};
+    uint64_t last_poll_age_ms{0};
 };
 
 enum class MasterRuntimeState {

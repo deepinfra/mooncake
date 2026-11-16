@@ -3347,6 +3347,100 @@ TEST_F(MasterServiceFollowerTest, TheDrainRefusesNewWritesAndReportsInFlight) {
         service.PutEnd(writer, "open", kDefaultTenant, ReplicaType::MEMORY));
 }
 
+TEST_F(MasterServiceFollowerTest, TheDrainReportsReplicasHeldForRelease) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(false)
+                              .set_put_start_discard_timeout_sec(1)
+                              .build());
+    const std::string endpoint = "drain_discarded_endpoint";
+    ASSERT_TRUE(service.MountSegment(MakeSegment(endpoint), generate_uuid())
+                    .has_value());
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const UUID writer = generate_uuid();
+    auto expired = service.PutStart(writer, "key", kDefaultTenant, 4096, config);
+    ASSERT_TRUE(expired.has_value());
+    const auto expired_address = expired->front()
+                                     .get_memory_descriptor()
+                                     .buffer_descriptor.buffer_address_;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    // The stale put is dropped from the index, but its writer may still
+    // write into its range until put_start_release_timeout.
+    ASSERT_TRUE(service.PutStart(writer, "key", kDefaultTenant, 4096, config)
+                    .has_value());
+
+    const auto ranges = service.BeginHandoffDrain(std::chrono::milliseconds(0));
+    ASSERT_EQ(ranges.size(), 2u);
+    EXPECT_TRUE(std::any_of(ranges.begin(), ranges.end(),
+                            [&](const AllocatedBuffer::Descriptor& range) {
+                                return range.buffer_address_ ==
+                                       expired_address;
+                            }));
+}
+
+TEST_F(MasterServiceFollowerTest, ASecondRemountKeepsTheLiveAllocator) {
+    const auto path = FreshSqlitePath("follower_second_remount");
+    const std::string endpoint = "second_remount_endpoint";
+    const uint64_t in_flight_address = kDefaultSegmentBase + 65536;
+    {
+        MasterService old_leader(MasterServiceConfig::builder()
+                                     .set_enable_ha(true)
+                                     .set_enable_oplog(true)
+                                     .set_cluster_id("follower_activation")
+                                     .set_ha_backend_type("sqlite")
+                                     .set_ha_backend_connstring(path)
+                                     .set_view_version(1)
+                                     .build());
+        AllocatedBuffer::Descriptor in_flight{8192, in_flight_address, "tcp",
+                                              endpoint};
+        ASSERT_EQ(old_leader.WriteHandoffRecord({in_flight}), ErrorCode::OK);
+    }
+    MasterService service(SqliteFollowerConfig(path));
+    service.FollowerSegmentMount(MountOf(endpoint, {1, 1}));
+    ASSERT_TRUE(service
+                    .FollowerPut("default", "restored",
+                                 ObjectAt(endpoint, kDefaultSegmentBase))
+                    .has_value());
+    ASSERT_TRUE(service.ActivateFollower(2, DurablePrefix{}, {}, {}));
+    const Segment segment = MakeSegment(endpoint);
+    const UUID client = generate_uuid();
+    ASSERT_TRUE(service.ReMountSegment({segment}, client).has_value());
+
+    std::vector<std::pair<uint64_t, uint64_t>> live{
+        {kDefaultSegmentBase, 1024}, {in_flight_address, 8192}};
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const UUID writer = generate_uuid();
+    for (int i = 0; i < 8; ++i) {
+        const std::string key = "this_term_" + std::to_string(i);
+        auto started =
+            service.PutStart(writer, key, kDefaultTenant, 4096, config);
+        ASSERT_TRUE(started.has_value());
+        live.emplace_back(started->front()
+                              .get_memory_descriptor()
+                              .buffer_descriptor.buffer_address_,
+                          4096);
+        ASSERT_TRUE(
+            service.PutEnd(writer, key, kDefaultTenant, ReplicaType::MEMORY));
+    }
+
+    // The client remounts again inside the quarantine window.
+    ASSERT_TRUE(service.ReMountSegment({segment}, client).has_value());
+    EXPECT_EQ(service.PromotionQuarantineBytes(), 8192u);
+    for (int i = 0; i < 64; ++i) {
+        auto started = service.PutStart(writer, "after_" + std::to_string(i),
+                                        kDefaultTenant, 4096, config);
+        ASSERT_TRUE(started.has_value());
+        const auto address = started->front()
+                                 .get_memory_descriptor()
+                                 .buffer_descriptor.buffer_address_;
+        for (const auto& [start, size] : live) {
+            EXPECT_FALSE(address < start + size && start < address + 4096)
+                << "allocation " << address << " overlaps live " << start;
+        }
+    }
+}
+
 TEST_F(MasterServiceFollowerTest, AServingIndexRefusesFollowerApply) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
