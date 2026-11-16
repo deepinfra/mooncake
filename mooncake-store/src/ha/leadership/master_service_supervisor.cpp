@@ -834,7 +834,12 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         }
         LOG(INFO) << "Entering warmup phase..., handed_off=" << handed_off;
         SetRuntimeState(admin_server, MasterRuntimeState::kLeaderWarmup);
-        auto warmup_result = handed_off ? tl::expected<bool, ErrorCode>(true)
+        // A Lease leader stops answering at its renew deadline (ServingGate),
+        // and the Lease was granted only after no renewal for a full Lease
+        // duration: it has stopped already.
+        const bool predecessor_fenced = replication_promoted;
+        auto warmup_result = handed_off || predecessor_fenced
+                                 ? tl::expected<bool, ErrorCode>(true)
                                         : WarmupLeadership(leader_coordinator,
                                                            *leadership_session,
                                                            shutdown_requested);
