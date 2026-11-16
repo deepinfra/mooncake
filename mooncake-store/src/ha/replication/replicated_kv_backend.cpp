@@ -243,24 +243,26 @@ ErrorCode ReplicatedHaKvBackend::Forward(ForwardRequest request) {
         }
         return WaitDurable(seq);
     }
+    // Every failure to reach the primary is transient for the caller (the
+    // standby retries it): one is elected, or this process becomes it.
     auto endpoint = PrimaryEndpoint();
     if (!endpoint) {
-        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+        return ErrorCode::ETCD_OPERATION_ERROR;
     }
     request.token = config_.token;
     RpcClient client;
     if (client.Connect(*endpoint) != ErrorCode::OK) {
-        return ErrorCode::RPC_FAIL;
+        return ErrorCode::ETCD_OPERATION_ERROR;
     }
     auto result = async_simple::coro::syncAwait(
         client.get()->call_for<&ReplicatedHaKvBackend::HandleForward>(
             kRpcTimeout, std::move(request)));
     if (!result) {
-        return ErrorCode::RPC_FAIL;
+        return ErrorCode::ETCD_OPERATION_ERROR;
     }
     const ForwardResponse& response = result.value();
     if (response.status != static_cast<int32_t>(ReplStatus::kOk)) {
-        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+        return ErrorCode::ETCD_OPERATION_ERROR;
     }
     const auto error = static_cast<ErrorCode>(response.error);
     if (error != ErrorCode::OK || response.seq == 0) {
@@ -270,7 +272,7 @@ ErrorCode ReplicatedHaKvBackend::Forward(ForwardRequest request) {
     if (!cv_.wait_for(lock, kForwardApplyWait, [&] {
             return applied_seq_ >= response.seq || primary_;
         })) {
-        return ErrorCode::RPC_TIMEOUT;
+        return ErrorCode::ETCD_OPERATION_ERROR;
     }
     return ErrorCode::OK;
 }
@@ -679,15 +681,25 @@ void ReplicatedHaKvBackend::FollowLoop() {
 
 void ReplicatedHaKvBackend::StartFollowing(
     PrimaryLocator locator, std::chrono::milliseconds initial_wait,
-    std::function<void()> on_history_change) {
+    std::function<void()> on_history_change,
+    std::chrono::milliseconds no_primary_wait) {
     locator_ = std::move(locator);
     on_history_change_ = std::move(on_history_change);
     stop_following_.store(false);
     follow_thread_ = std::thread([this] { FollowLoop(); });
+    const auto start = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> lock(mu_);
-    if (!cv_.wait_for(lock, initial_wait, [&] { return caught_up_; })) {
-        LOG(WARNING) << "action=replication_initial_sync_skipped, wait_ms="
-                     << initial_wait.count();
+    bool primary_seen = false;
+    while (!caught_up_) {
+        const auto now = std::chrono::steady_clock::now();
+        primary_seen = primary_seen || primary_endpoint_.has_value();
+        if (now - start >= initial_wait ||
+            (!primary_seen && now - start >= no_primary_wait)) {
+            LOG(WARNING) << "action=replication_initial_sync_skipped"
+                         << ", primary_seen=" << primary_seen;
+            break;
+        }
+        cv_.wait_for(lock, std::chrono::milliseconds(200));
     }
     standby_started_ = true;
 }

@@ -697,6 +697,19 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                                  : "promotion failed");
             }
             replication_promoted = true;
+            if (decision == replication::PromotionDecision::kEmpty) {
+                // An empty store had no leader to bootstrap the standby from;
+                // its writes are local now.
+                standby_controller->StopStandby();
+                const ErrorCode restarted =
+                    standby_controller->StartStandby(leadership_session->view);
+                if (restarted != ErrorCode::OK) {
+                    LOG(ERROR) << "Standby restart on an empty store failed: "
+                               << toString(restarted);
+                    release_term("replication");
+                    ExitToRejoin("standby restart failed");
+                }
+            }
         }
 
         auto claim_error = ClaimProducerViewForServing(

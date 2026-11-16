@@ -114,6 +114,12 @@ class K8sReplicationRecordStore final
 
 }  // namespace
 
+// A new Lease starts at 0 transitions; views start at 1, as the OpLog's
+// producer fencing requires.
+static ViewVersionId ViewOf(int64_t transitions) {
+    return static_cast<ViewVersionId>(transitions) + 1;
+}
+
 std::string K8sLeaderCoordinator::LeaseIdentity(
     const std::string& leader_address) {
     return leader_address + "#" + ProcessInstance();
@@ -128,7 +134,7 @@ K8sLeaderCoordinator::MakeReplicationRecordStore(
     const LeadershipSession& session) {
     return std::make_unique<K8sReplicationRecordStore>(
         namespace_, lease_name_, LeaseIdentity(session.view.leader_address),
-        static_cast<int64_t>(session.view.view_version));
+        static_cast<int64_t>(session.view.view_version) - 1);
 }
 
 K8sLeaderCoordinator::K8sLeaderCoordinator(const HABackendSpec& spec)
@@ -179,7 +185,7 @@ K8sLeaderCoordinator::ReadCurrentView() {
 
     return std::optional<MasterView>{
         MasterView{.leader_address = AddressOf(holder),
-                   .view_version = static_cast<ViewVersionId>(transitions)}};
+                   .view_version = ViewOf(transitions)}};
 }
 
 tl::expected<AcquireLeadershipResult, ErrorCode>
@@ -223,7 +229,7 @@ K8sLeaderCoordinator::TryAcquireLeadership(const std::string& leader_address) {
     LeadershipSession session{
         .view =
             MasterView{.leader_address = leader_address,
-                       .view_version = static_cast<ViewVersionId>(transitions)},
+                       .view_version = ViewOf(transitions)},
         .owner_token = token,
         .lease_ttl = std::chrono::seconds(kDefaultLeaseDurationSec),
     };

@@ -161,9 +161,12 @@ class ReplicatedHaKvBackend final
     // up with one, or after `initial_wait` without finding one, so the
     // standby starts on data that belongs to the current history. A later
     // change of history ends the process (`on_history_change`).
+    // Gives up early once no primary has been located for `no_primary_wait`.
     void StartFollowing(PrimaryLocator locator,
                         std::chrono::milliseconds initial_wait,
-                        std::function<void()> on_history_change);
+                        std::function<void()> on_history_change,
+                        std::chrono::milliseconds no_primary_wait =
+                            std::chrono::milliseconds(8000));
     // At promotion, before any write of the new term: stops following,
     // decides whether this copy may be trusted, and makes this store the
     // primary of a new epoch.
