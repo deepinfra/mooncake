@@ -56,7 +56,7 @@ visible actions only expose data early (a lost one is a miss).
      record) holds free space of every remounted segment.
 6. **Snapshots** live in the replicated KV (`snapshot_object_store_type=ha_kv`,
    objects chunked), so a fresh follower can always be rebuilt from the
-   leader alone. The snapshot maintenance lock moves to a node-local file.
+   leader alone. Its maintenance lock is replicated too (item 9).
 7. **Hand-off**: unchanged. The record is a KV Put, replicated before the
    leader releases the Lease.
 8. **Fencing**: the Lease helper records when each successful renewal was
