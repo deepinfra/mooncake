@@ -5,6 +5,8 @@
 #include <chrono>
 #include <cstdint>
 #include <optional>
+#include <random>
+#include <sstream>
 #include <string>
 #include <thread>
 
@@ -54,6 +56,87 @@ class K8sLeadershipMonitorHandle final : public LeadershipMonitorHandle {
 
 }  // namespace
 
+namespace {
+
+constexpr char kReplicationAnnotation[] = "mooncake.kvcache.ai/replication";
+
+const std::string& ProcessInstance() {
+    static const std::string instance = [] {
+        std::random_device device;
+        std::ostringstream out;
+        out << std::hex << device() << device();
+        return out.str();
+    }();
+    return instance;
+}
+
+class K8sReplicationRecordStore final
+    : public replication::ReplicationRecordStore {
+   public:
+    K8sReplicationRecordStore(std::string ns, std::string lease,
+                              std::string identity, int64_t transitions)
+        : ns_(std::move(ns)),
+          lease_(std::move(lease)),
+          identity_(std::move(identity)),
+          transitions_(transitions) {}
+
+    tl::expected<std::optional<replication::ReplicationRecord>, ErrorCode>
+    Read() override {
+        std::string value;
+        const ErrorCode err = K8sLeaseHelper::GetAnnotation(
+            ns_, lease_, kReplicationAnnotation, value);
+        if (err == ErrorCode::K8S_LEASE_NOT_FOUND) {
+            return std::optional<replication::ReplicationRecord>{};
+        }
+        if (err != ErrorCode::OK) {
+            return tl::make_unexpected(err);
+        }
+        auto record = replication::ParseReplicationRecord(value);
+        if (!record) {
+            LOG(ERROR) << "Unreadable replication record: " << value;
+            return tl::make_unexpected(ErrorCode::K8S_LEASE_OPERATION_ERROR);
+        }
+        return std::optional<replication::ReplicationRecord>{*record};
+    }
+
+    ErrorCode Write(const replication::ReplicationRecord& record) override {
+        return K8sLeaseHelper::CasAnnotation(
+            ns_, lease_, identity_, transitions_, kReplicationAnnotation,
+            replication::EncodeReplicationRecord(record));
+    }
+
+   private:
+    std::string ns_;
+    std::string lease_;
+    std::string identity_;
+    int64_t transitions_;
+};
+
+}  // namespace
+
+// A new Lease starts at 0 transitions; views start at 1, as the OpLog's
+// producer fencing requires.
+static ViewVersionId ViewOf(int64_t transitions) {
+    return static_cast<ViewVersionId>(transitions) + 1;
+}
+
+std::string K8sLeaderCoordinator::LeaseIdentity(
+    const std::string& leader_address) {
+    return leader_address + "#" + ProcessInstance();
+}
+
+std::string K8sLeaderCoordinator::AddressOf(const std::string& identity) {
+    return identity.substr(0, identity.find('#'));
+}
+
+std::unique_ptr<replication::ReplicationRecordStore>
+K8sLeaderCoordinator::MakeReplicationRecordStore(
+    const LeadershipSession& session) {
+    return std::make_unique<K8sReplicationRecordStore>(
+        namespace_, lease_name_, LeaseIdentity(session.view.leader_address),
+        static_cast<int64_t>(session.view.view_version) - 1);
+}
+
 K8sLeaderCoordinator::K8sLeaderCoordinator(const HABackendSpec& spec)
     : spec_(spec) {}
 
@@ -101,8 +184,8 @@ K8sLeaderCoordinator::ReadCurrentView() {
     }
 
     return std::optional<MasterView>{
-        MasterView{.leader_address = std::move(holder),
-                   .view_version = static_cast<ViewVersionId>(transitions)}};
+        MasterView{.leader_address = AddressOf(holder),
+                   .view_version = ViewOf(transitions)}};
 }
 
 tl::expected<AcquireLeadershipResult, ErrorCode>
@@ -114,7 +197,8 @@ K8sLeaderCoordinator::TryAcquireLeadership(const std::string& leader_address) {
 
     // Start election goroutine
     err = K8sLeaseHelper::RunElection(
-        namespace_, lease_name_, leader_address, kDefaultLeaseDurationSec,
+        namespace_, lease_name_, LeaseIdentity(leader_address),
+        kDefaultLeaseDurationSec,
         kDefaultRenewDeadlineSec, kDefaultRetryPeriodSec);
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
@@ -145,7 +229,7 @@ K8sLeaderCoordinator::TryAcquireLeadership(const std::string& leader_address) {
     LeadershipSession session{
         .view =
             MasterView{.leader_address = leader_address,
-                       .view_version = static_cast<ViewVersionId>(transitions)},
+                       .view_version = ViewOf(transitions)},
         .owner_token = token,
         .lease_ttl = std::chrono::seconds(kDefaultLeaseDurationSec),
     };
@@ -156,7 +240,7 @@ K8sLeaderCoordinator::TryAcquireLeadership(const std::string& leader_address) {
         if (election_monitor_thread_.joinable() && election_monitor_stopped_) {
             thread_to_join = std::move(election_monitor_thread_);
         }
-        election_identity_ = leader_address;
+        election_identity_ = LeaseIdentity(leader_address);
         election_owner_token_ = session.owner_token;
         election_active_ = true;
         election_monitor_stopped_ = false;

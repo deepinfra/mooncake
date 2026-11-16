@@ -14,7 +14,8 @@ namespace mooncake {
 // Snapshot object store type enumeration
 enum class SnapshotObjectStoreType {
     LOCAL_FILE = 0,  // Local file system
-    S3 = 1           // S3 storage
+    S3 = 1,          // S3 storage
+    HA_KV = 2        // the HA KV store (replicated with it)
 };
 
 struct SnapshotObjectInspection {
@@ -39,6 +40,9 @@ inline SnapshotObjectStoreType ParseSnapshotObjectStoreType(
 #endif
     if (type_str == "local" || type_str == "LOCAL") {
         return SnapshotObjectStoreType::LOCAL_FILE;
+    }
+    if (type_str == "ha_kv") {
+        return SnapshotObjectStoreType::HA_KV;
     }
 
     // Unknown object store type - fail fast.

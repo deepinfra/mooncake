@@ -7,6 +7,7 @@
 
 #include "k8s_lease_helper.h"
 #include "ha/leadership/leader_coordinator.h"
+#include "ha/replication/replication_record.h"
 
 namespace mooncake {
 namespace ha {
@@ -38,6 +39,21 @@ class K8sLeaderCoordinator final : public LeaderCoordinator {
                            LeadershipLostCallback on_leadership_lost) override;
 
     ErrorCode ReleaseLeadership(const LeadershipSession& session) override;
+
+    // The replication record on this Lease, writable only while `session`
+    // still holds it.
+    std::unique_ptr<replication::ReplicationRecordStore>
+    MakeReplicationRecordStore(const LeadershipSession& session);
+
+    // A process's identity on the Lease: its address and a per-process
+    // suffix, so a restart at the same address is a new holder.
+    static std::string LeaseIdentity(const std::string& leader_address);
+    // See K8sLeaseHelper::LastRenewMonoNs.
+    int64_t LastRenewMonoNs() const {
+        return K8sLeaseHelper::LastRenewMonoNs(namespace_, lease_name_);
+    }
+    static constexpr std::chrono::seconds kRenewDeadline{3};
+    static std::string AddressOf(const std::string& identity);
 
    private:
     ErrorCode EnsureConnected();

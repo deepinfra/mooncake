@@ -15,6 +15,14 @@ static inline void call_holder_change_cb(holder_change_cb_t func, void* ctx,
                                           int64_t leaseTransitions) {
   func(ctx, holder, holderSize, leaseTransitions);
 }
+
+#include <time.h>
+// The clock C++ steady_clock reads, so both sides compare one timeline.
+static inline int64_t mono_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
 */
 import "C"
 
@@ -24,6 +32,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -46,6 +55,35 @@ type electionState struct {
 	lost        chan struct{} // closed when OnStoppedLeading fires
 	err         error         // set before lost is closed, if any
 	transitions int64         // set before elected is closed
+	// When the last successful acquire or renew was sent (CLOCK_MONOTONIC):
+	// the Lease is ours until a renew deadline after it.
+	lastRenew atomic.Int64
+}
+
+// timedLock records when each successful write of the election record was
+// sent. Sent, not acknowledged: the apiserver may have committed it (and a
+// candidate seen it) before the reply arrived.
+type timedLock struct {
+	resourcelock.Interface
+	lastRenew *atomic.Int64
+}
+
+func (l *timedLock) Create(ctx context.Context, ler resourcelock.LeaderElectionRecord) error {
+	sent := int64(C.mono_ns())
+	err := l.Interface.Create(ctx, ler)
+	if err == nil {
+		l.lastRenew.Store(sent)
+	}
+	return err
+}
+
+func (l *timedLock) Update(ctx context.Context, ler resourcelock.LeaderElectionRecord) error {
+	sent := int64(C.mono_ns())
+	err := l.Interface.Update(ctx, ler)
+	if err == nil && ler.HolderIdentity == l.Interface.Identity() {
+		l.lastRenew.Store(sent)
+	}
+	return err
 }
 
 // watchState holds the runtime state for a single Lease watch.
@@ -103,6 +141,10 @@ func initClient() error {
 		}
 	}
 
+	// The holder is polled every 200 ms besides the renewals; client-go's
+	// default 5 QPS would delay renewals past their deadline.
+	config.QPS = 50
+	config.Burst = 100
 	client, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		return fmt.Errorf("failed to create k8s clientset: %w", err)
@@ -146,8 +188,9 @@ func runElection(namespace, leaseName, identity string,
 		},
 	}
 
+	state.lastRenew.Store(-1)
 	le, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
-		Lock:            lock,
+		Lock:            &timedLock{Interface: lock, lastRenew: &state.lastRenew},
 		LeaseDuration:   time.Duration(leaseDurationSec) * time.Second,
 		RenewDeadline:   time.Duration(renewDeadlineSec) * time.Second,
 		RetryPeriod:     time.Duration(retryPeriodSec) * time.Second,
@@ -356,6 +399,121 @@ func K8sLeaseGetHolder(
 		*holderIdentity = C.CString(holder)
 	}
 	*leaseTransitions = C.longlong(transitions)
+	return 0
+}
+
+// getAnnotation reads one annotation of the Lease.
+func getAnnotation(namespace, leaseName, key string) (string, bool, error) {
+	if err := ensureClientInitialized(); err != nil {
+		return "", false, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	lease, err := globalClient.CoordinationV1().Leases(namespace).Get(ctx, leaseName, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	value, ok := lease.Annotations[key]
+	return value, ok, nil
+}
+
+// casAnnotation sets one annotation only while `identity` holds the Lease at
+// `transitions`; the update carries the read's resourceVersion, so a new
+// holder in between makes it fail. Returns false, nil when not the holder.
+func casAnnotation(namespace, leaseName, identity string, transitions int64,
+	key, value string) (bool, error) {
+	if err := ensureClientInitialized(); err != nil {
+		return false, err
+	}
+	leases := globalClient.CoordinationV1().Leases(namespace)
+	for attempt := 0; attempt < 5; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		lease, err := leases.Get(ctx, leaseName, metav1.GetOptions{})
+		if err != nil {
+			cancel()
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		holder := ""
+		if lease.Spec.HolderIdentity != nil {
+			holder = *lease.Spec.HolderIdentity
+		}
+		current := int64(0)
+		if lease.Spec.LeaseTransitions != nil {
+			current = int64(*lease.Spec.LeaseTransitions)
+		}
+		if holder != identity || current != transitions {
+			cancel()
+			return false, nil
+		}
+		if lease.Annotations == nil {
+			lease.Annotations = map[string]string{}
+		}
+		lease.Annotations[key] = value
+		_, err = leases.Update(ctx, lease, metav1.UpdateOptions{})
+		cancel()
+		if err == nil {
+			return true, nil
+		}
+		if !apierrors.IsConflict(err) {
+			return false, err
+		}
+	}
+	return false, fmt.Errorf("lease %s/%s kept changing", namespace, leaseName)
+}
+
+//export K8sLeaseLastRenewMonoNs
+func K8sLeaseLastRenewMonoNs(ns, leaseName *C.char) C.longlong {
+	key := electionKey(C.GoString(ns), C.GoString(leaseName))
+	electionMutex.Lock()
+	state, ok := elections[key]
+	electionMutex.Unlock()
+	if !ok {
+		return -1
+	}
+	return C.longlong(state.lastRenew.Load())
+}
+
+//export K8sLeaseGetAnnotation
+func K8sLeaseGetAnnotation(
+	ns, leaseName, key *C.char,
+	value **C.char,
+	errMsg **C.char,
+) C.int {
+	got, found, err := getAnnotation(C.GoString(ns), C.GoString(leaseName), C.GoString(key))
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	if !found {
+		*value = nil
+		return 1
+	}
+	*value = C.CString(got)
+	return 0
+}
+
+//export K8sLeaseCasAnnotation
+func K8sLeaseCasAnnotation(
+	ns, leaseName, identity *C.char,
+	transitions C.longlong,
+	key, value *C.char,
+	errMsg **C.char,
+) C.int {
+	ok, err := casAnnotation(C.GoString(ns), C.GoString(leaseName), C.GoString(identity),
+		int64(transitions), C.GoString(key), C.GoString(value))
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	if !ok {
+		return 1
+	}
 	return 0
 }
 

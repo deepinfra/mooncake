@@ -121,6 +121,59 @@ ErrorCode K8sLeaseHelper::GetHolder(const std::string& ns,
     return ErrorCode::OK;
 }
 
+int64_t K8sLeaseHelper::LastRenewMonoNs(const std::string& ns,
+                                        const std::string& lease) {
+    return static_cast<int64_t>(K8sLeaseLastRenewMonoNs(
+        const_cast<char*>(ns.c_str()), const_cast<char*>(lease.c_str())));
+}
+
+ErrorCode K8sLeaseHelper::GetAnnotation(const std::string& ns,
+                                        const std::string& lease,
+                                        const std::string& key,
+                                        std::string& value) {
+    char* err_msg = nullptr;
+    char* value_ptr = nullptr;
+    const int ret = K8sLeaseGetAnnotation(
+        const_cast<char*>(ns.c_str()), const_cast<char*>(lease.c_str()),
+        const_cast<char*>(key.c_str()), &value_ptr, &err_msg);
+    if (ret == 1) {
+        value.clear();
+        return ErrorCode::K8S_LEASE_NOT_FOUND;
+    }
+    if (ret != 0) {
+        LOG(ERROR) << "GetAnnotation failed: " << err_msg;
+        free(err_msg);
+        return ErrorCode::K8S_LEASE_OPERATION_ERROR;
+    }
+    value = value_ptr != nullptr ? std::string(value_ptr) : std::string();
+    free(value_ptr);
+    return ErrorCode::OK;
+}
+
+ErrorCode K8sLeaseHelper::CasAnnotation(const std::string& ns,
+                                        const std::string& lease,
+                                        const std::string& identity,
+                                        int64_t lease_transitions,
+                                        const std::string& key,
+                                        const std::string& value) {
+    char* err_msg = nullptr;
+    const int ret = K8sLeaseCasAnnotation(
+        const_cast<char*>(ns.c_str()), const_cast<char*>(lease.c_str()),
+        const_cast<char*>(identity.c_str()),
+        static_cast<long long>(lease_transitions),
+        const_cast<char*>(key.c_str()), const_cast<char*>(value.c_str()),
+        &err_msg);
+    if (ret == 1) {
+        return ErrorCode::ETCD_TRANSACTION_FAIL;
+    }
+    if (ret != 0) {
+        LOG(ERROR) << "CasAnnotation failed: " << err_msg;
+        free(err_msg);
+        return ErrorCode::K8S_LEASE_OPERATION_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
 ErrorCode K8sLeaseHelper::WatchHolder(
     const std::string& ns, const std::string& lease, void* callback_context,
     void (*callback_func)(void*, const char*, size_t, int64_t)) {
@@ -214,6 +267,24 @@ ErrorCode K8sLeaseHelper::CancelElection(const std::string&,
 ErrorCode K8sLeaseHelper::GetHolder(const std::string&, const std::string&,
                                     std::string&, int64_t&) {
     LOG(FATAL) << "K8s Lease is not enabled in compilation";
+    return ErrorCode::K8S_LEASE_OPERATION_ERROR;
+}
+
+int64_t K8sLeaseHelper::LastRenewMonoNs(const std::string&,
+                                        const std::string&) {
+    return -1;
+}
+
+ErrorCode K8sLeaseHelper::GetAnnotation(const std::string&,
+                                        const std::string&, const std::string&,
+                                        std::string&) {
+    return ErrorCode::K8S_LEASE_OPERATION_ERROR;
+}
+
+ErrorCode K8sLeaseHelper::CasAnnotation(const std::string&,
+                                        const std::string&, const std::string&,
+                                        int64_t, const std::string&,
+                                        const std::string&) {
     return ErrorCode::K8S_LEASE_OPERATION_ERROR;
 }
 

@@ -396,6 +396,17 @@ DEFINE_bool(weight_management_oplog_capability_confirmed, false,
             "and lease entry types before enabling weight mutations");
 DEFINE_bool(enable_oplog_snapshot, false,
             "Enable standby batch OpLog snapshot production");
+DEFINE_string(ha_leader_backend_type, "",
+              "Cross-node HA: leadership backend (k8s) apart from the store");
+DEFINE_string(ha_leader_backend_connstring, "",
+              "Cross-node HA: leadership backend connstring (namespace/lease)");
+DEFINE_int32(ha_replication_port, 0,
+             "Cross-node HA: port the store replicates on; 0 disables");
+DEFINE_string(ha_replication_token_file, "",
+              "Cross-node HA: file holding the replication token");
+DEFINE_uint32(ha_replication_sync_timeout_ms, 1000,
+              "Cross-node HA: how long the leader waits for its follower "
+              "before recording it out of sync");
 DEFINE_bool(standby_serving_index, false,
             "Standby applies the OpLog into a serving index, so promotion "
             "activates it instead of rebuilding one (needs a batch OpLog)");
@@ -715,6 +726,21 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("standby_serving_index",
                            &master_config.standby_serving_index,
                            FLAGS_standby_serving_index);
+    default_config.GetString("ha_leader_backend_type",
+                             &master_config.ha_leader_backend_type,
+                             FLAGS_ha_leader_backend_type);
+    default_config.GetString("ha_leader_backend_connstring",
+                             &master_config.ha_leader_backend_connstring,
+                             FLAGS_ha_leader_backend_connstring);
+    default_config.GetInt32("ha_replication_port",
+                            &master_config.ha_replication_port,
+                            FLAGS_ha_replication_port);
+    default_config.GetString("ha_replication_token_file",
+                             &master_config.ha_replication_token_file,
+                             FLAGS_ha_replication_token_file);
+    default_config.GetUInt32("ha_replication_sync_timeout_ms",
+                             &master_config.ha_replication_sync_timeout_ms,
+                             FLAGS_ha_replication_sync_timeout_ms);
     default_config.GetUInt64("weight_import_idle_timeout_ms",
                              &master_config.weight_import_idle_timeout_ms,
                              FLAGS_weight_import_idle_timeout_ms);
@@ -1208,6 +1234,36 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.standby_serving_index = FLAGS_standby_serving_index;
+    }
+    if ((google::GetCommandLineFlagInfo("ha_leader_backend_type", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.ha_leader_backend_type = FLAGS_ha_leader_backend_type;
+    }
+    if ((google::GetCommandLineFlagInfo("ha_leader_backend_connstring",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.ha_leader_backend_connstring =
+            FLAGS_ha_leader_backend_connstring;
+    }
+    if ((google::GetCommandLineFlagInfo("ha_replication_port", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.ha_replication_port = FLAGS_ha_replication_port;
+    }
+    if ((google::GetCommandLineFlagInfo("ha_replication_token_file", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.ha_replication_token_file =
+            FLAGS_ha_replication_token_file;
+    }
+    if ((google::GetCommandLineFlagInfo("ha_replication_sync_timeout_ms",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.ha_replication_sync_timeout_ms =
+            FLAGS_ha_replication_sync_timeout_ms;
     }
     if ((google::GetCommandLineFlagInfo("weight_import_idle_timeout_ms",
                                         &info) &&

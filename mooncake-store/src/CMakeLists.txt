@@ -87,6 +87,8 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/snapshot/snapshot_maintenance_lease.cpp
     ha/snapshot/object/snapshot_object_store.cpp
     ha/snapshot/object/backends/local/local_file_snapshot_object_store.cpp
+    ha/snapshot/object/backends/ha_kv/ha_kv_snapshot_object_store.cpp
+    ha/replication/replicated_kv_backend.cpp
     ha/snapshot/object/backends/s3/s3_snapshot_object_store.cpp
     task_manager.cpp
     ha/oplog/oplog_types.cpp

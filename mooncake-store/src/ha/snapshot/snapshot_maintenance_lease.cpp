@@ -51,7 +51,7 @@ SnapshotMaintenanceLease::SnapshotMaintenanceLease(std::string cluster_id)
       lock_key_(ha::BuildBatchOpLogSnapshotMaintenanceKey(cluster_id_)) {}
 
 SnapshotMaintenanceLease::SnapshotMaintenanceLease(
-    std::string cluster_id, std::shared_ptr<ha::sqlite::SqliteHaStore> store)
+    std::string cluster_id, std::shared_ptr<ha::LeasedKeyStore> store)
     : cluster_id_(std::move(cluster_id)),
       lock_key_(ha::BuildBatchOpLogSnapshotMaintenanceKey(cluster_id_)),
       sqlite_store_(std::move(store)) {}

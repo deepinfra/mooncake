@@ -29,6 +29,22 @@ class K8sLeaseHelper {
     static ErrorCode GetHolder(const std::string& ns, const std::string& lease,
                                std::string& holder, int64_t& lease_transitions);
 
+    // When this process's last successful acquire or renew of the Lease was
+    // sent, on CLOCK_MONOTONIC (steady_clock); -1 without a running election.
+    static int64_t LastRenewMonoNs(const std::string& ns,
+                                   const std::string& lease);
+    // K8S_LEASE_NOT_FOUND when the Lease or the annotation is absent.
+    static ErrorCode GetAnnotation(const std::string& ns,
+                                   const std::string& lease,
+                                   const std::string& key, std::string& value);
+    // Sets the annotation only while `identity` holds the Lease at
+    // `lease_transitions`: ETCD_TRANSACTION_FAIL when it does not.
+    static ErrorCode CasAnnotation(const std::string& ns,
+                                   const std::string& lease,
+                                   const std::string& identity,
+                                   int64_t lease_transitions,
+                                   const std::string& key,
+                                   const std::string& value);
     static ErrorCode WatchHolder(
         const std::string& ns, const std::string& lease, void* callback_context,
         void (*callback_func)(void*, const char*, size_t, int64_t));

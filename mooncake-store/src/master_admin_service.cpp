@@ -1,5 +1,7 @@
 #include "master_admin_service.h"
 
+#include "ha/serving_gate.h"
+
 #include <algorithm>
 #include <charconv>
 #include <chrono>
@@ -605,7 +607,8 @@ void MasterAdminServer::HandleReady(coro_http::coro_http_request&,
                                     coro_http::coro_http_response& resp) {
     const auto snapshot = SnapshotState();
     const bool ready = snapshot.state == ha::MasterRuntimeState::kServing &&
-                       snapshot.service_available;
+                       snapshot.service_available &&
+                       ha::ServingGate::Instance().Open();
     resp.add_header("Content-Type", "text/plain; charset=utf-8");
     resp.set_status_and_content(
         ready ? coro_http::status_type::ok
