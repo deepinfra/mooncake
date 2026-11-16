@@ -103,6 +103,10 @@ func initClient() error {
 		}
 	}
 
+	// The holder is polled every 200 ms besides the renewals; client-go's
+	// default 5 QPS would delay renewals past their deadline.
+	config.QPS = 50
+	config.Burst = 100
 	client, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		return fmt.Errorf("failed to create k8s clientset: %w", err)

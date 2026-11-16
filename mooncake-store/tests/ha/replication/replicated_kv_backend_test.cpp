@@ -259,6 +259,31 @@ TEST_F(ReplicationTest, AFollowersWriteGoesThroughThePrimary) {
     EXPECT_EQ(Value(*follower.backend, "/from_follower"), "<absent>");
 }
 
+TEST_F(ReplicationTest, ForwardsWaitingForAcksDoNotStarveThePulls) {
+    StartPair("busy_forwards");
+    const int writes_before = records.writes;
+    std::vector<std::thread> writers;
+    std::atomic<int> failed{0};
+    for (int t = 0; t < 8; ++t) {
+        writers.emplace_back([&, t] {
+            for (int i = 0; i < 25; ++i) {
+                const std::string key =
+                    "/f" + std::to_string(t) + "_" + std::to_string(i);
+                if (follower.backend->Put(key, std::string(4096, 'x')) !=
+                    ErrorCode::OK) {
+                    ++failed;
+                }
+            }
+        });
+    }
+    for (auto& writer : writers) {
+        writer.join();
+    }
+    EXPECT_EQ(failed.load(), 0);
+    EXPECT_EQ(records.writes, writes_before) << "the record flapped";
+    EXPECT_TRUE(records.Current()->in_sync);
+}
+
 TEST_F(ReplicationTest, AFollowerFromAnotherHistoryGetsAFullCopy) {
     primary = OpenNode("copy_primary");
     ASSERT_EQ(primary.backend->BecomePrimary(records, 1),

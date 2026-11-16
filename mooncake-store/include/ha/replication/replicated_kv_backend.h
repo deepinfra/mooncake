@@ -22,6 +22,7 @@
 #include "ha/kv/ha_kv_backend.h"
 #include "ha/replication/change_set.h"
 #include "ha/replication/replication_record.h"
+#include "rpc_worker_pool.h"
 #include "types.h"
 
 namespace mooncake::ha::replication {
@@ -208,6 +209,11 @@ class ReplicatedHaKvBackend final
     std::unique_ptr<sqlite::SqliteHaStore> store_;
     std::unique_ptr<coro_rpc::coro_rpc_server> server_;
     std::thread server_thread_;
+    // Handlers block (a pull waits for changes, a forward for the follower's
+    // acknowledgment), so they run off the io threads, on separate pools: a
+    // forward waiting for an ack never holds up the pull that carries it.
+    std::unique_ptr<RpcWorkerPool> pull_pool_;
+    std::unique_ptr<RpcWorkerPool> forward_pool_;
 
     std::mutex mu_;
     std::condition_variable cv_;

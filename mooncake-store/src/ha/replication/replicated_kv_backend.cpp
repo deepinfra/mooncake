@@ -124,12 +124,19 @@ ReplicatedHaKvBackend::Open(ReplicationConfig config) {
 
 ReplicatedHaKvBackend::~ReplicatedHaKvBackend() {
     StopFollowing();
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        primary_ = false;
+        cv_.notify_all();
+    }
     if (server_) {
         server_->stop();
     }
     if (server_thread_.joinable()) {
         server_thread_.join();
     }
+    pull_pool_.reset();
+    forward_pool_.reset();
     store_->SetChangeSink(nullptr);
 }
 
@@ -138,10 +145,14 @@ bool ReplicatedHaKvBackend::TokenOk(const std::string& token) const {
 }
 
 ErrorCode ReplicatedHaKvBackend::StartServer() {
-    server_ = std::make_unique<coro_rpc::coro_rpc_server>(4, config_.port);
-    server_->register_handler<&ReplicatedHaKvBackend::HandlePull,
-                              &ReplicatedHaKvBackend::HandleCopyPage,
-                              &ReplicatedHaKvBackend::HandleForward>(this);
+    server_ = std::make_unique<coro_rpc::coro_rpc_server>(2, config_.port);
+    pull_pool_ = std::make_unique<RpcWorkerPool>(4);
+    forward_pool_ = std::make_unique<RpcWorkerPool>(8);
+    pull_pool_->Register<&ReplicatedHaKvBackend::HandlePull>(*server_, *this);
+    pull_pool_->Register<&ReplicatedHaKvBackend::HandleCopyPage>(*server_,
+                                                                 *this);
+    forward_pool_->Register<&ReplicatedHaKvBackend::HandleForward>(*server_,
+                                                                   *this);
     auto started = server_->async_start();
     if (started.hasResult()) {
         LOG(ERROR) << "HA replication server failed on port " << config_.port
