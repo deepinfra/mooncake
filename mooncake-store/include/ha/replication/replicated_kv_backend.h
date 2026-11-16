@@ -226,13 +226,17 @@ class ReplicatedHaKvBackend final
     size_t ring_size_{0};
     Mode mode_{Mode::kSolo};
     std::string replica_copy_;
+    std::chrono::steady_clock::time_point replica_last_pull_{};
     uint64_t acked_seq_{0};
     uint64_t join_target_{0};
     bool record_busy_{false};
     bool fenced_{false};
     ReplicationRecordStore* records_{nullptr};
-    std::map<uint64_t, std::unique_ptr<sqlite::SqliteHaStore::SnapshotReader>>
-        copy_sessions_;
+    struct CopySession {
+        std::unique_ptr<sqlite::SqliteHaStore::SnapshotReader> reader;
+        std::chrono::steady_clock::time_point used;
+    };
+    std::map<uint64_t, CopySession> copy_sessions_;
     uint64_t next_session_{1};
     // Follower.
     PrimaryLocator locator_;

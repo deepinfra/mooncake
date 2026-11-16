@@ -388,8 +388,26 @@ PullResponse ReplicatedHaKvBackend::HandlePull(PullRequest request) {
         response.status = static_cast<int32_t>(ReplStatus::kFullCopy);
         return response;
     }
+    const auto now = std::chrono::steady_clock::now();
+    if (request.copy_id != replica_copy_ && mode_ != Mode::kSolo &&
+        !record_busy_ && now - replica_last_pull_ > config_.sync_timeout) {
+        // The tracked copy went quiet with no write to notice it: record it
+        // out of sync before another copy joins.
+        record_busy_ = true;
+        const std::string gone = replica_copy_;
+        lock.unlock();
+        const ErrorCode err = WriteRecord(false, gone);
+        lock.lock();
+        record_busy_ = false;
+        if (err == ErrorCode::OK) {
+            mode_ = Mode::kSolo;
+        } else if (err == ErrorCode::ETCD_TRANSACTION_FAIL) {
+            fenced_ = true;
+        }
+        cv_.notify_all();
+    }
     if (request.copy_id != replica_copy_) {
-        if (mode_ != Mode::kSolo) {
+        if (mode_ != Mode::kSolo || fenced_) {
             // The tracked copy's acks must lapse first; its record goes
             // "not in sync" before another copy can join.
             response.status = static_cast<int32_t>(ReplStatus::kRetry);
@@ -401,6 +419,7 @@ PullResponse ReplicatedHaKvBackend::HandlePull(PullRequest request) {
         acked_seq_ = request.after_seq;
     }
     acked_seq_ = std::max(acked_seq_, request.after_seq);
+    replica_last_pull_ = now;
     cv_.notify_all();
 
     if (mode_ == Mode::kSolo && acked_seq_ == committed_seq_ &&
@@ -468,6 +487,11 @@ CopyPageResponse ReplicatedHaKvBackend::HandleCopyPage(
     }
     sqlite::SqliteHaStore::SnapshotReader* reader = nullptr;
     bool from_start = false;
+    const auto now = std::chrono::steady_clock::now();
+    // An abandoned copy's read transaction would hold the WAL forever.
+    std::erase_if(copy_sessions_, [&](const auto& entry) {
+        return now - entry.second.used > kCopySessionIdle;
+    });
     if (request.session == 0) {
         if (copy_sessions_.size() >= 4) {
             copy_sessions_.erase(copy_sessions_.begin());
@@ -479,7 +503,8 @@ CopyPageResponse ReplicatedHaKvBackend::HandleCopyPage(
         }
         request.session = next_session_++;
         reader = opened->get();
-        copy_sessions_[request.session] = std::move(opened.value());
+        copy_sessions_[request.session] =
+            CopySession{std::move(opened.value()), now};
         from_start = true;
     } else {
         auto it = copy_sessions_.find(request.session);
@@ -487,7 +512,8 @@ CopyPageResponse ReplicatedHaKvBackend::HandleCopyPage(
             response.status = static_cast<int32_t>(ReplStatus::kFullCopy);
             return response;
         }
-        reader = it->second.get();
+        it->second.used = now;
+        reader = it->second.reader.get();
     }
     response.session = request.session;
     response.revision = reader->revision();

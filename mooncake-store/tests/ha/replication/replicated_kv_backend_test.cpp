@@ -286,6 +286,24 @@ TEST_F(ReplicationTest, ForwardsWaitingForAcksDoNotStarveThePulls) {
     EXPECT_TRUE(records.Current()->in_sync);
 }
 
+TEST_F(ReplicationTest, ANewCopyJoinsAnIdleLeaderWhoseFollowerWentQuiet) {
+    StartPair("idle_rejoin");
+    const std::string first_copy =
+        follower.backend->store().ReadReplState()->copy_id;
+    follower.backend.reset();  // no write follows to notice it
+    std::this_thread::sleep_for(400ms);
+    Node second = OpenNode("idle_rejoin_second");
+    second.backend->StartFollowing(
+        [endpoint = primary.Endpoint()] { return endpoint; }, 5000ms, [] {});
+    const std::string second_copy =
+        second.backend->store().ReadReplState()->copy_id;
+    ASSERT_NE(second_copy, first_copy);
+    EXPECT_TRUE(WaitFor([&] {
+        auto record = records.Current();
+        return record && record->in_sync && record->replica == second_copy;
+    }));
+}
+
 TEST_F(ReplicationTest, AFollowerFromAnotherHistoryGetsAFullCopy) {
     primary = OpenNode("copy_primary");
     ASSERT_EQ(primary.backend->BecomePrimary(records, 1),
