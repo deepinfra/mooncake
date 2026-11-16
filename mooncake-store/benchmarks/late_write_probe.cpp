@@ -42,6 +42,9 @@ DEFINE_string(segment_endpoint, "172.31.250.99:1",
               "remount: the probe segment's endpoint");
 DEFINE_uint64(segment_mb, 16, "remount: the probe segment's size");
 DEFINE_uint64(wait_s, 300, "remount: how long to wait for a new leader");
+DEFINE_uint64(restart_delay_s, 45,
+              "remount: how long the client is down, past its liveness "
+              "timeout so the master unmounts its segment");
 
 namespace {
 
@@ -157,6 +160,7 @@ int Remount(mooncake::MasterClient& client, mooncake::ReplicateConfig config,
                                                           live.end());
 
     // The client dies; a restarted one takes the same endpoint.
+    std::this_thread::sleep_for(std::chrono::seconds(FLAGS_restart_delay_s));
     mooncake::MasterClient restarted(mooncake::generate_uuid());
     if (restarted.Connect(FLAGS_master_server) != mooncake::ErrorCode::OK) {
         std::cerr << "restarted connect failed" << std::endl;
