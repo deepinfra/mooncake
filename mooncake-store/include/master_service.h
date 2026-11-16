@@ -1770,8 +1770,26 @@ class MasterService {
         std::unordered_map<std::string,
                            std::vector<std::pair<uintptr_t, uint64_t>>>
             ranges;
+        // The previous term's memory segments by endpoint and by name; base
+        // is unknown when the follower never saw it logged.
+        struct OldSegment {
+            std::optional<uintptr_t> base;
+            uint64_t size{0};
+        };
+        std::unordered_map<std::string, std::vector<OldSegment>> old_segments;
         std::chrono::steady_clock::time_point until;
     };
+    // What a fresh mount inside the quarantine window must hold: the old
+    // term's late writes can land wherever its ranges fall in the new
+    // segment's addresses.
+    struct MountHold {
+        std::vector<LiveAllocation> allocations;
+        bool hold_free_space{false};
+    };
+    std::optional<MountHold> MountHoldLocked(const Segment& segment) const;
+    std::vector<std::unique_ptr<AllocatedBuffer>> HoldOnFreshMountLocked(
+        ScopedSegmentAccess& segment_access, const Segment& segment,
+        const UUID& client_id, const MountHold& hold, ErrorCode& mount_result);
     // Set at promotion, read by remounts under master_state_mutex_.
     std::optional<PromotionQuarantine> promotion_quarantine_;
     struct QuarantineHold {
@@ -2541,6 +2559,7 @@ class MasterService {
     struct FollowerSegment {
         StandbySegmentInfo info;
         std::optional<UUID> segment_id;
+        std::optional<uintptr_t> base;
     };
     bool follower_mode_{false};
     std::optional<KvEventConfig> follower_kv_event_config_;

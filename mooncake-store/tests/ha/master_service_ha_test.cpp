@@ -3445,8 +3445,39 @@ TEST_F(MasterServiceFollowerTest, ARestartedClientsRemountKeepsItsAllocator) {
             EXPECT_FALSE(address < start + size && start < address + kChunk)
                 << "allocation " << address << " overlaps live " << start;
         }
+        // The restarted process mapped the same addresses: the old term's
+        // open write may still land there.
+        const uint64_t open_write = kDefaultSegmentBase + (8u << 20);
+        EXPECT_FALSE(address < open_write + 8192 &&
+                     open_write < address + kChunk)
+            << "allocation " << address << " overlaps the old open write";
     }
     EXPECT_GT(allocated, 0u);
+}
+
+TEST_F(MasterServiceFollowerTest, AFreshMountAfterACrashHoldsTheOldAddresses) {
+    const std::string endpoint = "crash_fresh_mount_endpoint";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    for (const bool same_addresses : {true, false}) {
+        MasterService service(SqliteFollowerConfig(FreshSqlitePath(
+            same_addresses ? "crash_fresh_same" : "crash_fresh_moved")));
+        service.FollowerSegmentMount(MountOf(endpoint, {1, 1}));
+        // No hand-off record: the previous leader crashed.
+        ASSERT_TRUE(service.ActivateFollower(2, DurablePrefix{}, {}, {}));
+        const size_t base = same_addresses
+                                ? kDefaultSegmentBase
+                                : kDefaultSegmentBase + (1ull << 30);
+        ASSERT_TRUE(service
+                        .MountSegment(MakeSegment(endpoint, base),
+                                      generate_uuid())
+                        .has_value());
+        auto started = service.PutStart(generate_uuid(), "key", kDefaultTenant,
+                                        4096, config);
+        EXPECT_EQ(started.has_value(), !same_addresses)
+            << "same_addresses=" << same_addresses;
+        EXPECT_EQ(service.PromotionQuarantineBytes() > 0, same_addresses);
+    }
 }
 
 TEST_F(MasterServiceFollowerTest, AServingIndexRefusesFollowerApply) {

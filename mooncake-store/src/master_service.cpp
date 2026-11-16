@@ -966,6 +966,53 @@ TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
     return snapshot;
 }
 
+std::vector<std::unique_ptr<AllocatedBuffer>>
+MasterService::HoldOnFreshMountLocked(ScopedSegmentAccess& segment_access,
+                                      const Segment& segment,
+                                      const UUID& client_id,
+                                      const MountHold& hold,
+                                      ErrorCode& mount_result) {
+    std::vector<std::unique_ptr<AllocatedBuffer>> held;
+    auto allocator = segment_access.GetAllocator(segment.id);
+    if (!std::dynamic_pointer_cast<OffsetBufferAllocator>(allocator)) {
+        return held;
+    }
+    auto imported = ImportOffsetBufferAllocator(
+        segment.name, segment.base, segment.size, segment.te_endpoint,
+        hold.allocations, ReplicaType::MEMORY, hold.hold_free_space);
+    if (!imported || !segment_access.ReplaceAllocators(
+                         {{segment.id, allocator, imported->allocator}})) {
+        LOG(ERROR) << "client_id=" << client_id
+                   << ", segment_name=" << segment.name
+                   << ", error=mount_quarantine_hold_failed";
+        size_t capacity = 0;
+        if (segment_access.PrepareUnmountSegment(segment.id, capacity) ==
+            ErrorCode::OK) {
+            segment_access.CommitUnmountSegment(segment.id, client_id,
+                                                capacity);
+        }
+        mount_result = ErrorCode::INTERNAL_ERROR;
+        return held;
+    }
+    for (auto& buffer : imported->buffers) {
+        held.push_back(std::move(buffer));
+    }
+    for (auto& buffer : imported->held_free_space) {
+        held.push_back(std::move(buffer));
+    }
+    uint64_t bytes = 0;
+    for (auto& buffer : held) {
+        segment_access.BindBufferToSegment(segment.id, *buffer);
+        bytes += buffer->size();
+    }
+    LOG(INFO) << "client_id=" << client_id
+              << ", segment_name=" << segment.name
+              << ", action=mount_quarantine_hold, ranges="
+              << hold.allocations.size()
+              << ", all_free=" << hold.hold_free_space << ", bytes=" << bytes;
+    return held;
+}
+
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
     if (handoff_draining_.load(std::memory_order_acquire)) {
@@ -982,20 +1029,51 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         if (inserted) {
             MasterMetricManager::instance().client_liveness_record_created();
         }
+        std::optional<MountHold> hold;
+        {
+            std::shared_lock<std::shared_mutex> snapshot_lock(
+                master_state_mutex_);
+            hold = MountHoldLocked(segment);
+        }
+        std::vector<std::unique_ptr<AllocatedBuffer>> held;
+        std::chrono::steady_clock::time_point held_until;
+        const auto mount = [&](ScopedSegmentAccess& segment_access) {
+            LOG(INFO) << "client_id=" << client_id
+                      << ", action=mount_segment, segment_name="
+                      << segment.name;
+            mount_result =
+                segment_access.MountSegment(segment, client_id, record);
+            return mount_result == ErrorCode::OK ||
+                   mount_result == ErrorCode::SEGMENT_ALREADY_EXISTS;
+        };
         const auto observation =
             record->ObserveAndRun(ClientLivenessRecord::Clock::now(), [&] {
-                std::shared_lock<std::shared_mutex> snapshot_lock(
+                if (!hold) {
+                    std::shared_lock<std::shared_mutex> snapshot_lock(
+                        master_state_mutex_);
+                    ScopedSegmentAccess segment_access =
+                        segment_manager_.getSegmentAccess();
+                    return mount(segment_access);
+                }
+                // Mount and hold under the exclusive lock, so nothing is
+                // allocated on the segment before the held ranges are.
+                std::unique_lock<std::shared_mutex> snapshot_lock(
                     master_state_mutex_);
                 ScopedSegmentAccess segment_access =
                     segment_manager_.getSegmentAccess();
-                LOG(INFO) << "client_id=" << client_id
-                          << ", action=mount_segment, segment_name="
-                          << segment.name;
-                mount_result =
-                    segment_access.MountSegment(segment, client_id, record);
-                return mount_result == ErrorCode::OK ||
-                       mount_result == ErrorCode::SEGMENT_ALREADY_EXISTS;
+                if (!mount(segment_access) || mount_result != ErrorCode::OK) {
+                    return mount_result == ErrorCode::SEGMENT_ALREADY_EXISTS;
+                }
+                held = HoldOnFreshMountLocked(segment_access, segment, client_id,
+                                              *hold, mount_result);
+                held_until = promotion_quarantine_
+                                 ? promotion_quarantine_->until
+                                 : std::chrono::steady_clock::now();
+                return mount_result == ErrorCode::OK;
             });
+        if (!held.empty()) {
+            HoldQuarantined(std::move(held), held_until);
+        }
         if (observation == ClientLivenessObservation::REJECTED_OFFLINE) {
             return tl::make_unexpected(
                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);

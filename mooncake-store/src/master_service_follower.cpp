@@ -190,6 +190,8 @@ void MasterService::FollowerSegmentMount(const SegmentMountOp& op) {
     if (op.segment_id) {
         segment.segment_id = op.segment_id.value();
     }
+    segment.base = op.base ? std::optional<uintptr_t>(op.base.value())
+                           : std::nullopt;
     auto placeholder =
         FollowerPlaceholderLocked(op.transport_endpoint, op.segment_name);
     if (!op.segment_name.empty() && op.segment_name != op.transport_endpoint) {
@@ -616,11 +618,93 @@ void MasterService::ArmPromotionQuarantine(uint64_t applied_last_seq) {
         }
     }
     quarantine.all_free = !clean;
+    std::unique_lock<std::shared_mutex> exclusive(master_state_mutex_);
+    {
+        std::lock_guard<std::mutex> lock(follower_mutex_);
+        for (const auto& [endpoint, segment] : follower_segments_) {
+            const PromotionQuarantine::OldSegment old{segment.base,
+                                                      segment.info.capacity};
+            quarantine.old_segments[endpoint].push_back(old);
+            if (!segment.info.segment_name.empty() &&
+                segment.info.segment_name != endpoint) {
+                quarantine.old_segments[segment.info.segment_name].push_back(
+                    old);
+            }
+        }
+    }
+    for (const auto& standby : standby_memory_segments_) {
+        for (const std::string* alias :
+             {&standby.transport_endpoint, &standby.segment_name}) {
+            if (!alias->empty() && !quarantine.old_segments.contains(*alias)) {
+                quarantine.old_segments[*alias].push_back(
+                    {std::nullopt, standby.capacity});
+            }
+        }
+    }
     LOG(INFO) << "action=arm_promotion_quarantine, clean_handoff=" << clean
               << ", ranges=" << quarantine.ranges.size()
+              << ", old_segments=" << quarantine.old_segments.size()
               << ", for_s=" << put_start_release_timeout_sec_.count();
-    std::unique_lock<std::shared_mutex> exclusive(master_state_mutex_);
     promotion_quarantine_ = std::move(quarantine);
+}
+
+std::optional<MasterService::MountHold> MasterService::MountHoldLocked(
+    const Segment& segment) const {
+    if (!promotion_quarantine_ ||
+        std::chrono::steady_clock::now() >= promotion_quarantine_->until ||
+        segment.size == 0 ||
+        segment.base > std::numeric_limits<uintptr_t>::max() - segment.size) {
+        return std::nullopt;
+    }
+    const uintptr_t begin = segment.base;
+    const uintptr_t end = segment.base + segment.size;
+    const auto& quarantine = *promotion_quarantine_;
+    MountHold hold;
+    if (quarantine.all_free) {
+        for (const std::string* alias : {&segment.te_endpoint, &segment.name}) {
+            auto old = quarantine.old_segments.find(*alias);
+            if (old == quarantine.old_segments.end()) {
+                continue;
+            }
+            for (const auto& [base, size] : old->second) {
+                if (!base || (*base < end && begin < *base + size)) {
+                    hold.hold_free_space = true;
+                }
+            }
+        }
+        return hold.hold_free_space ? std::optional<MountHold>(hold)
+                                    : std::nullopt;
+    }
+    std::vector<std::pair<uintptr_t, uintptr_t>> clipped;
+    for (const std::string* alias : {&segment.te_endpoint, &segment.name}) {
+        auto recorded = quarantine.ranges.find(*alias);
+        if (recorded == quarantine.ranges.end()) {
+            continue;
+        }
+        for (const auto& [address, size] : recorded->second) {
+            const uintptr_t from = std::max<uintptr_t>(address, begin);
+            const uintptr_t to = std::min<uintptr_t>(address + size, end);
+            if (from < to) {
+                clipped.emplace_back(from, to);
+            }
+        }
+    }
+    std::sort(clipped.begin(), clipped.end());
+    for (const auto& [from, to] : clipped) {
+        if (!hold.allocations.empty()) {
+            auto& last = hold.allocations.back();
+            const uintptr_t last_end =
+                begin + last.offset_from_base + last.requested_size;
+            if (from <= last_end) {
+                last.requested_size =
+                    std::max(last_end, to) - begin - last.offset_from_base;
+                continue;
+            }
+        }
+        hold.allocations.push_back({from - begin, to - from});
+    }
+    return hold.allocations.empty() ? std::nullopt
+                                    : std::optional<MountHold>(hold);
 }
 
 void MasterService::HoldQuarantined(
