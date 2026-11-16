@@ -488,6 +488,8 @@ add_ha_test(leader_label_reconciler_test
 add_ha_test(oplog_batch_storage_test ha/oplog/oplog_batch_storage_test.cpp)
 if(STORE_USE_SQLITE)
   add_ha_test(sqlite_ha_backend_test ha/kv/sqlite_ha_backend_test.cpp)
+  add_ha_test(replicated_kv_backend_test
+              ha/replication/replicated_kv_backend_test.cpp)
 endif()
 add_ha_test(redis_ha_kv_backend_test ha/kv/redis_ha_kv_backend_test.cpp)
 if(STORE_USE_REDIS)

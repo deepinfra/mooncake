@@ -93,6 +93,15 @@ CREATE TABLE IF NOT EXISTS revision (
   rev INTEGER NOT NULL
 );
 INSERT OR IGNORE INTO revision (id, rev) VALUES (1, 0);
+CREATE TABLE IF NOT EXISTS repl_meta (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  seq INTEGER NOT NULL,
+  epoch TEXT NOT NULL,
+  copy_id TEXT NOT NULL,
+  is_primary INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO repl_meta (id, seq, epoch, copy_id, is_primary)
+  VALUES (1, 0, '', '', 0);
 CREATE TABLE IF NOT EXISTS leader (
   ns TEXT PRIMARY KEY NOT NULL,
   view_version INTEGER NOT NULL,
@@ -303,6 +312,98 @@ bool CompareHolds(const KvCompare& compare, const std::optional<LiveRow>& row) {
     return false;
 }
 
+tl::expected<uint64_t, ErrorCode> NextReplSeq(::sqlite3* db) {
+    if (Stmt(db, "UPDATE repl_meta SET seq = seq + 1 WHERE id = 1").Run() !=
+        ErrorCode::OK) {
+        return tl::make_unexpected(ErrorCode::ETCD_OPERATION_ERROR);
+    }
+    Stmt read(db, "SELECT seq FROM repl_meta WHERE id = 1");
+    if (read.Step() != SQLITE_ROW) {
+        return tl::make_unexpected(ErrorCode::ETCD_OPERATION_ERROR);
+    }
+    return static_cast<uint64_t>(read.ColumnInt(0));
+}
+
+tl::expected<replication::RowImage, ErrorCode> ReadRowImage(
+    ::sqlite3* db, std::string_view key) {
+    Stmt read(db,
+              "SELECT value, create_rev, mod_rev, expires_ms FROM kv WHERE "
+              "key = ?1");
+    read.Blob(1, key);
+    if (read.Step() != SQLITE_ROW) {
+        return tl::make_unexpected(ErrorCode::ETCD_OPERATION_ERROR);
+    }
+    return replication::RowImage{.key = std::string(key),
+                                 .value = read.ColumnBytes(0),
+                                 .create_rev = read.ColumnInt(1),
+                                 .mod_rev = read.ColumnInt(2),
+                                 .expires_ms = read.ColumnInt(3)};
+}
+
+tl::expected<int64_t, ErrorCode> ReadRevision(::sqlite3* db) {
+    Stmt read(db, "SELECT rev FROM revision WHERE id = 1");
+    if (read.Step() != SQLITE_ROW) {
+        return tl::make_unexpected(ErrorCode::ETCD_OPERATION_ERROR);
+    }
+    return read.ColumnInt(0);
+}
+
+tl::expected<replication::ReplState, ErrorCode> ReadReplStateLocked(
+    ::sqlite3* db) {
+    Stmt read(db,
+              "SELECT seq, epoch, copy_id, is_primary FROM repl_meta WHERE "
+              "id = 1");
+    if (read.Step() != SQLITE_ROW) {
+        return tl::make_unexpected(ErrorCode::ETCD_OPERATION_ERROR);
+    }
+    return replication::ReplState{
+        .epoch = read.ColumnBytes(1),
+        .seq = static_cast<uint64_t>(read.ColumnInt(0)),
+        .copy_id = read.ColumnBytes(2),
+        .primary = read.ColumnInt(3) != 0};
+}
+
+ErrorCode WriteRowImage(::sqlite3* db, const replication::RowImage& row) {
+    return Stmt(db,
+                "INSERT OR REPLACE INTO kv (key, value, create_rev, mod_rev, "
+                "expires_ms) VALUES (?1, ?2, ?3, ?4, ?5)")
+        .Blob(1, row.key)
+        .Blob(2, row.value)
+        .Int(3, row.create_rev)
+        .Int(4, row.mod_rev)
+        .Int(5, row.expires_ms)
+        .Run();
+}
+
+ErrorCode WriteMetaLocked(::sqlite3* db, int64_t revision,
+                          const replication::ReplState& state) {
+    if (Stmt(db, "UPDATE revision SET rev = ?1 WHERE id = 1")
+            .Int(1, revision)
+            .Run() != ErrorCode::OK) {
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    return Stmt(db,
+                "UPDATE repl_meta SET seq = ?1, epoch = ?2, copy_id = ?3, "
+                "is_primary = ?4 WHERE id = 1")
+        .Int(1, static_cast<int64_t>(state.seq))
+        .Blob(2, state.epoch)
+        .Blob(3, state.copy_id)
+        .Int(4, state.primary ? 1 : 0)
+        .Run();
+}
+
+::sqlite3* OpenConnection(const std::string& path) {
+    ::sqlite3* db = nullptr;
+    if (sqlite3_open_v2(path.c_str(), &db,
+                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOMUTEX,
+                        nullptr) != SQLITE_OK) {
+        sqlite3_close(db);
+        return nullptr;
+    }
+    sqlite3_busy_timeout(db, kBusyTimeoutMs);
+    return db;
+}
+
 }  // namespace
 
 tl::expected<std::unique_ptr<SqliteHaStore>, ErrorCode> SqliteHaStore::Open(
@@ -322,7 +423,7 @@ tl::expected<std::unique_ptr<SqliteHaStore>, ErrorCode> SqliteHaStore::Open(
         sqlite3_close(db);
         return tl::make_unexpected(ErrorCode::ETCD_OPERATION_ERROR);
     }
-    std::unique_ptr<SqliteHaStore> store(new SqliteHaStore(db));
+    std::unique_ptr<SqliteHaStore> store(new SqliteHaStore(db, path));
     sqlite3_busy_timeout(db, kBusyTimeoutMs);
     {
         Stmt wal(db, "PRAGMA journal_mode=WAL");
@@ -360,7 +461,8 @@ ErrorCode SqliteHaStore::Get(std::string_view key, std::string& value,
     return ErrorCode::OK;
 }
 
-ErrorCode SqliteHaStore::Put(std::string_view key, std::string_view value) {
+ErrorCode SqliteHaStore::Put(std::string_view key, std::string_view value,
+                             uint64_t* repl_seq) {
     std::lock_guard<std::mutex> lock(mu_);
     WriteTxn txn(db_);
     if (!txn.begun()) {
@@ -374,7 +476,25 @@ ErrorCode SqliteHaStore::Put(std::string_view key, std::string_view value) {
     if (err != ErrorCode::OK) {
         return err;
     }
-    return txn.Commit();
+    replication::ChangeSet changes;
+    if (sink_) {
+        auto row = ReadRowImage(db_, key);
+        auto seq = NextReplSeq(db_);
+        if (!row || !seq) {
+            return ErrorCode::ETCD_OPERATION_ERROR;
+        }
+        changes.rows.push_back(std::move(*row));
+        changes.seq = *seq;
+        changes.revision = *revision;
+    }
+    const ErrorCode commit = txn.Commit();
+    if (commit == ErrorCode::OK && sink_) {
+        if (repl_seq != nullptr) {
+            *repl_seq = changes.seq;
+        }
+        sink_(std::move(changes));
+    }
+    return commit;
 }
 
 ErrorCode SqliteHaStore::Range(std::string_view begin_key,
@@ -422,7 +542,8 @@ ErrorCode SqliteHaStore::Range(std::string_view begin_key,
 }
 
 ErrorCode SqliteHaStore::DeleteRange(std::string_view begin_key,
-                                     std::string_view end_key) {
+                                     std::string_view end_key,
+                                     uint64_t* repl_seq) {
     // Same bounds contract as the etcd backend: finite and nonempty.
     if (begin_key.empty() || end_key.empty() ||
         end_key == std::string_view("\0", 1) || begin_key > end_key) {
@@ -436,17 +557,36 @@ ErrorCode SqliteHaStore::DeleteRange(std::string_view begin_key,
     if (!txn.begun()) {
         return ErrorCode::ETCD_OPERATION_ERROR;
     }
-    if (!NextRevision(db_)) {
+    auto revision = NextRevision(db_);
+    if (!revision) {
         return ErrorCode::ETCD_OPERATION_ERROR;
     }
     Stmt remove(db_, "DELETE FROM kv WHERE key >= ?1 AND key < ?2");
     if (remove.Blob(1, begin_key).Blob(2, end_key).Run() != ErrorCode::OK) {
         return ErrorCode::ETCD_OPERATION_ERROR;
     }
-    return txn.Commit();
+    replication::ChangeSet changes;
+    if (sink_) {
+        auto seq = NextReplSeq(db_);
+        if (!seq) {
+            return ErrorCode::ETCD_OPERATION_ERROR;
+        }
+        changes.deleted.push_back(
+            {std::string(begin_key), std::string(end_key)});
+        changes.seq = *seq;
+        changes.revision = *revision;
+    }
+    const ErrorCode commit = txn.Commit();
+    if (commit == ErrorCode::OK && sink_) {
+        if (repl_seq != nullptr) {
+            *repl_seq = changes.seq;
+        }
+        sink_(std::move(changes));
+    }
+    return commit;
 }
 
-ErrorCode SqliteHaStore::Txn(const KvTxn& kv_txn) {
+ErrorCode SqliteHaStore::Txn(const KvTxn& kv_txn, uint64_t* repl_seq) {
     std::lock_guard<std::mutex> lock(mu_);
     WriteTxn txn(db_);
     if (!txn.begun()) {
@@ -476,7 +616,214 @@ ErrorCode SqliteHaStore::Txn(const KvTxn& kv_txn) {
             return err;
         }
     }
+    replication::ChangeSet changes;
+    if (sink_) {
+        for (const auto& put : kv_txn.puts) {
+            auto row = ReadRowImage(db_, put.key);
+            if (!row) {
+                return row.error();
+            }
+            changes.rows.push_back(std::move(*row));
+        }
+        auto seq = NextReplSeq(db_);
+        if (!seq) {
+            return seq.error();
+        }
+        changes.seq = *seq;
+        changes.revision = *revision;
+    }
+    const ErrorCode commit = txn.Commit();
+    if (commit == ErrorCode::OK && sink_) {
+        if (repl_seq != nullptr) {
+            *repl_seq = changes.seq;
+        }
+        sink_(std::move(changes));
+    }
+    return commit;
+}
+
+void SqliteHaStore::SetChangeSink(ChangeSink sink) {
+    std::lock_guard<std::mutex> lock(mu_);
+    sink_ = std::move(sink);
+}
+
+tl::expected<replication::ReplState, ErrorCode> SqliteHaStore::ReadReplState() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return ReadReplStateLocked(db_);
+}
+
+ErrorCode SqliteHaStore::WriteReplState(const replication::ReplState& state) {
+    std::lock_guard<std::mutex> lock(mu_);
+    return Stmt(db_,
+                "UPDATE repl_meta SET epoch = ?1, copy_id = ?2, is_primary = "
+                "?3 WHERE id = 1")
+        .Blob(1, state.epoch)
+        .Blob(2, state.copy_id)
+        .Int(3, state.primary ? 1 : 0)
+        .Run();
+}
+
+ErrorCode SqliteHaStore::ApplyChangeSet(const replication::ChangeSet& changes) {
+    std::lock_guard<std::mutex> lock(mu_);
+    WriteTxn txn(db_);
+    if (!txn.begun()) {
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    auto state = ReadReplStateLocked(db_);
+    if (!state) {
+        return state.error();
+    }
+    if (state->seq + 1 != changes.seq) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    for (const auto& range : changes.deleted) {
+        if (Stmt(db_, "DELETE FROM kv WHERE key >= ?1 AND key < ?2")
+                .Blob(1, range.begin)
+                .Blob(2, range.end)
+                .Run() != ErrorCode::OK) {
+            return ErrorCode::ETCD_OPERATION_ERROR;
+        }
+    }
+    for (const auto& row : changes.rows) {
+        if (WriteRowImage(db_, row) != ErrorCode::OK) {
+            return ErrorCode::ETCD_OPERATION_ERROR;
+        }
+    }
+    state->seq = changes.seq;
+    if (WriteMetaLocked(db_, changes.revision, *state) != ErrorCode::OK) {
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
     return txn.Commit();
+}
+
+tl::expected<bool, ErrorCode> SqliteHaStore::Empty() {
+    std::lock_guard<std::mutex> lock(mu_);
+    Stmt read(db_, "SELECT 1 FROM kv LIMIT 1");
+    const int rc = read.Step();
+    if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
+        return tl::make_unexpected(ErrorCode::ETCD_OPERATION_ERROR);
+    }
+    return rc == SQLITE_DONE;
+}
+
+ErrorCode SqliteHaStore::WipeAll() {
+    std::lock_guard<std::mutex> lock(mu_);
+    WriteTxn txn(db_);
+    if (!txn.begun() || Exec(db_, "DELETE FROM kv") != ErrorCode::OK ||
+        Exec(db_,
+             "UPDATE repl_meta SET seq = 0, epoch = '', copy_id = '', "
+             "is_primary = 0 WHERE id = 1") != ErrorCode::OK) {
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    return txn.Commit();
+}
+
+SqliteHaStore::FullLoad::~FullLoad() {
+    if (!done_) {
+        (void)Exec(db_, "ROLLBACK");
+    }
+    sqlite3_close_v2(db_);
+}
+
+ErrorCode SqliteHaStore::FullLoad::Add(
+    const std::vector<replication::RowImage>& rows) {
+    for (const auto& row : rows) {
+        if (WriteRowImage(db_, row) != ErrorCode::OK) {
+            return ErrorCode::ETCD_OPERATION_ERROR;
+        }
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode SqliteHaStore::FullLoad::Commit(
+    int64_t revision, const replication::ReplState& state) {
+    if (done_ || WriteMetaLocked(db_, revision, state) != ErrorCode::OK) {
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    done_ = true;
+    if (Exec(db_, "COMMIT") != ErrorCode::OK) {
+        (void)Exec(db_, "ROLLBACK");
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
+tl::expected<std::unique_ptr<SqliteHaStore::FullLoad>, ErrorCode>
+SqliteHaStore::BeginFullLoad() {
+    ::sqlite3* db = OpenConnection(path_);
+    if (db == nullptr) {
+        return tl::make_unexpected(ErrorCode::ETCD_OPERATION_ERROR);
+    }
+    std::unique_ptr<FullLoad> load(new FullLoad(db));
+    if (Exec(db, "BEGIN IMMEDIATE") != ErrorCode::OK) {
+        load->done_ = true;
+        return tl::make_unexpected(ErrorCode::ETCD_OPERATION_ERROR);
+    }
+    if (Exec(db, "DELETE FROM kv") != ErrorCode::OK) {
+        return tl::make_unexpected(ErrorCode::ETCD_OPERATION_ERROR);
+    }
+    return load;
+}
+
+SqliteHaStore::SnapshotReader::~SnapshotReader() {
+    (void)Exec(db_, "COMMIT");
+    sqlite3_close_v2(db_);
+}
+
+ErrorCode SqliteHaStore::SnapshotReader::Next(
+    std::string_view after, bool from_start, size_t max_bytes,
+    std::vector<replication::RowImage>& rows, bool& done) {
+    rows.clear();
+    Stmt read(db_, from_start
+                       ? "SELECT key, value, create_rev, mod_rev, expires_ms "
+                         "FROM kv ORDER BY key"
+                       : "SELECT key, value, create_rev, mod_rev, expires_ms "
+                         "FROM kv WHERE key > ?1 ORDER BY key");
+    if (!from_start) {
+        read.Blob(1, after);
+    }
+    size_t bytes = 0;
+    while (true) {
+        const int rc = read.Step();
+        if (rc == SQLITE_DONE) {
+            done = true;
+            return ErrorCode::OK;
+        }
+        if (rc != SQLITE_ROW) {
+            return ErrorCode::ETCD_OPERATION_ERROR;
+        }
+        rows.push_back({.key = read.ColumnBytes(0),
+                        .value = read.ColumnBytes(1),
+                        .create_rev = read.ColumnInt(2),
+                        .mod_rev = read.ColumnInt(3),
+                        .expires_ms = read.ColumnInt(4)});
+        bytes += rows.back().key.size() + rows.back().value.size();
+        if (bytes >= max_bytes) {
+            done = false;
+            return ErrorCode::OK;
+        }
+    }
+}
+
+tl::expected<std::unique_ptr<SqliteHaStore::SnapshotReader>, ErrorCode>
+SqliteHaStore::OpenSnapshotReader() {
+    ::sqlite3* db = OpenConnection(path_);
+    if (db == nullptr) {
+        return tl::make_unexpected(ErrorCode::ETCD_OPERATION_ERROR);
+    }
+    std::unique_ptr<SnapshotReader> reader(new SnapshotReader(db));
+    // The first read fixes the snapshot every later page reads from.
+    if (Exec(db, "BEGIN") != ErrorCode::OK) {
+        return tl::make_unexpected(ErrorCode::ETCD_OPERATION_ERROR);
+    }
+    auto revision = ReadRevision(db);
+    auto state = ReadReplStateLocked(db);
+    if (!revision || !state) {
+        return tl::make_unexpected(ErrorCode::ETCD_OPERATION_ERROR);
+    }
+    reader->revision_ = *revision;
+    reader->state_ = std::move(*state);
+    return reader;
 }
 
 ErrorCode SqliteHaStore::CreateLeasedKey(std::string_view key,

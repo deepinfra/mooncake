@@ -359,6 +359,109 @@ func K8sLeaseGetHolder(
 	return 0
 }
 
+// getAnnotation reads one annotation of the Lease.
+func getAnnotation(namespace, leaseName, key string) (string, bool, error) {
+	if err := ensureClientInitialized(); err != nil {
+		return "", false, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	lease, err := globalClient.CoordinationV1().Leases(namespace).Get(ctx, leaseName, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	value, ok := lease.Annotations[key]
+	return value, ok, nil
+}
+
+// casAnnotation sets one annotation only while `identity` holds the Lease at
+// `transitions`; the update carries the read's resourceVersion, so a new
+// holder in between makes it fail. Returns false, nil when not the holder.
+func casAnnotation(namespace, leaseName, identity string, transitions int64,
+	key, value string) (bool, error) {
+	if err := ensureClientInitialized(); err != nil {
+		return false, err
+	}
+	leases := globalClient.CoordinationV1().Leases(namespace)
+	for attempt := 0; attempt < 5; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		lease, err := leases.Get(ctx, leaseName, metav1.GetOptions{})
+		if err != nil {
+			cancel()
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		holder := ""
+		if lease.Spec.HolderIdentity != nil {
+			holder = *lease.Spec.HolderIdentity
+		}
+		current := int64(0)
+		if lease.Spec.LeaseTransitions != nil {
+			current = int64(*lease.Spec.LeaseTransitions)
+		}
+		if holder != identity || current != transitions {
+			cancel()
+			return false, nil
+		}
+		if lease.Annotations == nil {
+			lease.Annotations = map[string]string{}
+		}
+		lease.Annotations[key] = value
+		_, err = leases.Update(ctx, lease, metav1.UpdateOptions{})
+		cancel()
+		if err == nil {
+			return true, nil
+		}
+		if !apierrors.IsConflict(err) {
+			return false, err
+		}
+	}
+	return false, fmt.Errorf("lease %s/%s kept changing", namespace, leaseName)
+}
+
+//export K8sLeaseGetAnnotation
+func K8sLeaseGetAnnotation(
+	ns, leaseName, key *C.char,
+	value **C.char,
+	errMsg **C.char,
+) C.int {
+	got, found, err := getAnnotation(C.GoString(ns), C.GoString(leaseName), C.GoString(key))
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	if !found {
+		*value = nil
+		return 1
+	}
+	*value = C.CString(got)
+	return 0
+}
+
+//export K8sLeaseCasAnnotation
+func K8sLeaseCasAnnotation(
+	ns, leaseName, identity *C.char,
+	transitions C.longlong,
+	key, value *C.char,
+	errMsg **C.char,
+) C.int {
+	ok, err := casAnnotation(C.GoString(ns), C.GoString(leaseName), C.GoString(identity),
+		int64(transitions), C.GoString(key), C.GoString(value))
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	if !ok {
+		return 1
+	}
+	return 0
+}
+
 //export K8sLeaseWatchHolder
 func K8sLeaseWatchHolder(
 	ns, leaseName *C.char,

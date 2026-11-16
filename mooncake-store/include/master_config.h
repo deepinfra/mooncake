@@ -132,6 +132,14 @@ struct MasterConfig {
     // The standby applies the OpLog into a follower-mode service, which
     // promotion activates instead of rebuilding an index from a copy.
     bool standby_serving_index = false;
+    // Cross-node HA: leadership through another backend (k8s) while each
+    // pod keeps its own SQLite store, replicated from the leader on
+    // ha_replication_port. 0 keeps the store shared and unreplicated.
+    std::string ha_leader_backend_type;
+    std::string ha_leader_backend_connstring;
+    int ha_replication_port = 0;
+    std::string ha_replication_token_file;
+    uint32_t ha_replication_sync_timeout_ms = 1000;
     uint64_t snapshot_chunk_object_count = 1000000;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
@@ -274,6 +282,14 @@ class MasterServiceSupervisorConfig {
     // The standby applies the OpLog into a follower-mode service, which
     // promotion activates instead of rebuilding an index from a copy.
     bool standby_serving_index = false;
+    // Cross-node HA: leadership through another backend (k8s) while each
+    // pod keeps its own SQLite store, replicated from the leader on
+    // ha_replication_port. 0 keeps the store shared and unreplicated.
+    std::string ha_leader_backend_type;
+    std::string ha_leader_backend_connstring;
+    int ha_replication_port = 0;
+    std::string ha_replication_token_file;
+    uint32_t ha_replication_sync_timeout_ms = 1000;
     uint64_t snapshot_chunk_object_count = 1000000;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
@@ -419,6 +435,11 @@ class MasterServiceSupervisorConfig {
         weight_import_idle_timeout_ms = config.weight_import_idle_timeout_ms;
         enable_oplog_snapshot = config.enable_oplog_snapshot;
         standby_serving_index = config.standby_serving_index;
+        ha_leader_backend_type = config.ha_leader_backend_type;
+        ha_leader_backend_connstring = config.ha_leader_backend_connstring;
+        ha_replication_port = config.ha_replication_port;
+        ha_replication_token_file = config.ha_replication_token_file;
+        ha_replication_sync_timeout_ms = config.ha_replication_sync_timeout_ms;
         snapshot_chunk_object_count = config.snapshot_chunk_object_count;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;

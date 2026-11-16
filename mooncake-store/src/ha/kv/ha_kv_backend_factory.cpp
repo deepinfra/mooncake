@@ -4,6 +4,7 @@
 #include "ha/kv/etcd_ha_kv_backend.h"
 #include "ha/kv/redis_ha_kv_backend.h"
 #include "ha/kv/sqlite_ha_kv_backend.h"
+#include "ha/replication/replicated_kv_backend.h"
 
 namespace mooncake {
 
@@ -43,6 +44,16 @@ tl::expected<std::shared_ptr<HaKvBackend>, ErrorCode> CreateHaKvBackend(
         case ha::HABackendType::SQLITE: {
             if (spec.connstring.empty()) {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            // With replication on, every writer goes through the replicated
+            // store; a direct connection would write unreplicated.
+            if (auto replicated = ha::replication::RegisteredReplicatedBackend()) {
+                if (ha::sqlite::SqliteHaStore::ResolvePath(
+                        replicated->connstring()) !=
+                    ha::sqlite::SqliteHaStore::ResolvePath(spec.connstring)) {
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                }
+                return std::shared_ptr<HaKvBackend>(replicated);
             }
             auto backend = SqliteHaKvBackend::Open(spec.connstring);
             if (!backend) {

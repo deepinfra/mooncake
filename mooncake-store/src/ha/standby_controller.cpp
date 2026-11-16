@@ -16,6 +16,7 @@
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
 #include "ha/snapshot/batch_oplog/metadata.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
+#include "ha/replication/replicated_kv_backend.h"
 #include "ha/snapshot/snapshot_maintenance_lease.h"
 #include "hot_standby_service.h"
 
@@ -136,8 +137,12 @@ class CapabilityDrivenStandbyController final : public StandbyController {
                 BatchOpLogSnapshotCoordinator::LeaseFactory lease_factory;
                 if (spec_.type == HABackendType::SQLITE) {
                     auto backend = CreateHaKvBackend(spec_);
-                    auto lease_store =
-                        sqlite::SqliteHaStore::Open(spec_.connstring);
+                    // A replicated store is written only by its primary; the
+                    // maintenance lock stays on this node.
+                    auto lease_store = sqlite::SqliteHaStore::Open(
+                        replication::RegisteredReplicatedBackend()
+                            ? spec_.connstring + ".local"
+                            : spec_.connstring);
                     if (!backend || !lease_store) {
                         throw std::invalid_argument(
                             "cannot open the sqlite HA store " +

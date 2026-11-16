@@ -1,4 +1,8 @@
 #include "ha/leadership/master_service_supervisor.h"
+#include "ha/replication/replicated_kv_backend.h"
+#ifdef STORE_USE_K8S_LEASE
+#include "ha/leadership/backends/k8s/k8s_leader_coordinator.h"
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -13,6 +17,9 @@
 
 #include <glog/logging.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
+
+#include <unistd.h>
+#include <fstream>
 
 #include "config/rpc_protocol_config.h"
 #include "ha/leadership/leader_coordinator_factory.h"
@@ -457,7 +464,19 @@ struct StandbyStatusProviderScope {
 };
 }  // namespace
 
+// A cross-node master's data belongs to one history at a time: a process
+// that led a term, or whose primary started a new history, restarts so it
+// rejoins from scratch instead of reusing its in-memory index.
+constexpr int kReplicationRestartExitCode = 75;
+
+[[noreturn]] void ExitToRejoin(std::string_view reason) {
+    LOG(WARNING) << "action=replication_restart, reason=" << reason;
+    google::FlushLogFiles(google::GLOG_INFO);
+    _exit(kReplicationRestartExitCode);
+}
+
 int RunSupervisorLoop(const HABackendSpec& spec,
+                      const HABackendSpec& leader_spec,
                       const MasterServiceSupervisorConfig& config,
                       MasterAdminServer& admin_server,
                       std::unique_ptr<StandbyController> standby_controller,
@@ -494,6 +513,10 @@ int RunSupervisorLoop(const HABackendSpec& spec,
     // Result of the ordinary release that ended the previous term, for a
     // request observed before the next standby check.
     std::optional<ErrorCode> released_last_term;
+    const auto replicated = replication::RegisteredReplicatedBackend();
+    // Lives as long as the process: the primary writes it until it exits.
+    std::unique_ptr<replication::ReplicationRecordStore> replication_records;
+    bool replication_promoted = false;
 
     if (ShutdownObserved(shutdown_requested)) {
         return shutdown_exit("starting", ShutdownLease{});
@@ -506,8 +529,11 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             return shutdown_exit(
                 "standby", ShutdownLease{.prior_release = released_last_term});
         }
+        if (replication_promoted) {
+            ExitToRejoin("term ended");
+        }
         released_last_term.reset();
-        auto coordinator = CreateLeaderCoordinator(spec);
+        auto coordinator = CreateLeaderCoordinator(leader_spec);
         if (!coordinator) {
             if (HandleSupervisorError("create leader coordinator",
                                       coordinator.error(), spec.type)) {
@@ -645,6 +671,34 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         LeadershipRenewalGuard renewal(leader_coordinator, *leadership_session);
         term_lease.renewal = &renewal;
 
+        if (replicated) {
+            // Before any write of this term: decide whether this copy keeps
+            // its index, and make it the primary of a new history.
+#ifdef STORE_USE_K8S_LEASE
+            auto* k8s = dynamic_cast<backends::k8s::K8sLeaderCoordinator*>(
+                &leader_coordinator);
+            if (k8s != nullptr) {
+                replication_records =
+                    k8s->MakeReplicationRecordStore(*leadership_session);
+            }
+#endif
+            if (!replication_records) {
+                LOG(ERROR) << "HA replication needs the k8s leader backend";
+                return -1;
+            }
+            const auto decision = replicated->BecomePrimary(
+                *replication_records, leadership_session->view.view_version);
+            if (decision != replication::PromotionDecision::kTrusted &&
+                decision != replication::PromotionDecision::kEmpty) {
+                release_term("replication");
+                ExitToRejoin(decision ==
+                                     replication::PromotionDecision::kRestart
+                                 ? "copy not trusted, wiped"
+                                 : "promotion failed");
+            }
+            replication_promoted = true;
+        }
+
         auto claim_error = ClaimProducerViewForServing(
             spec, config, leadership_session->view.view_version);
         if (ShutdownObserved(shutdown_requested)) {
@@ -682,6 +736,9 @@ int RunSupervisorLoop(const HABackendSpec& spec,
 
         auto return_to_standby =
             [&](const std::optional<MasterView>& leader_view) {
+                if (replication_promoted) {
+                    ExitToRejoin("term ended");
+                }
                 if (ShutdownObserved(shutdown_requested)) {
                     shutdown_exit("standby_reentry",
                                   term_lease);  // Does not return.
@@ -1138,6 +1195,9 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         if (ShutdownObserved(shutdown_requested)) {
             return shutdown_exit("standby_reentry", term_lease);
         }
+        if (replication_promoted) {
+            ExitToRejoin("term ended");
+        }
         // Serving drops the handoff in ActivateServingState. If the listener
         // stopped before that, preserve the still-populated catch-up cursor.
         if (promotion_ctx->metadata_store) {
@@ -1171,6 +1231,70 @@ int MasterServiceSupervisor::Start() {
                    << ", backend_type=" << config_.ha_backend_type;
         return -1;
     }
+    HABackendSpec leader_spec = *spec;
+    if (!config_.ha_leader_backend_type.empty()) {
+        auto type = ParseHABackendType(config_.ha_leader_backend_type);
+        if (!type || ValidateHABackendAvailability(*type) != ErrorCode::OK ||
+            config_.ha_leader_backend_connstring.empty()) {
+            LOG(ERROR) << "Invalid leader backend "
+                       << config_.ha_leader_backend_type;
+            return -1;
+        }
+        leader_spec.type = *type;
+        leader_spec.connstring = config_.ha_leader_backend_connstring;
+    }
+    if (config_.ha_replication_port != 0) {
+        if (spec->type != HABackendType::SQLITE ||
+            leader_spec.type == HABackendType::SQLITE) {
+            LOG(ERROR) << "HA replication replicates a sqlite store under "
+                          "another leader backend";
+            return -1;
+        }
+        std::string token;
+        {
+            std::ifstream in(config_.ha_replication_token_file);
+            std::getline(in, token);
+        }
+        auto replicated = replication::ReplicatedHaKvBackend::Open(
+            replication::ReplicationConfig{
+                .connstring = spec->connstring,
+                .port = static_cast<uint16_t>(config_.ha_replication_port),
+                .token = token,
+                .sync_timeout = std::chrono::milliseconds(
+                    config_.ha_replication_sync_timeout_ms)});
+        if (!replicated) {
+            LOG(ERROR) << "Failed to open the replicated HA store: "
+                       << toString(replicated.error());
+            return -1;
+        }
+        replication::RegisterReplicatedBackend(*replicated);
+        if ((*replicated)->StartServer() != ErrorCode::OK) {
+            return -1;
+        }
+        auto locator_coordinator = CreateLeaderCoordinator(leader_spec);
+        if (!locator_coordinator) {
+            LOG(ERROR) << "Failed to create the leader coordinator: "
+                       << toString(locator_coordinator.error());
+            return -1;
+        }
+        std::shared_ptr<LeaderCoordinator> locator(
+            std::move(locator_coordinator.value()));
+        (*replicated)->StartFollowing(
+            [locator, self = config_.local_hostname,
+             port = config_.ha_replication_port]()
+                -> std::optional<std::string> {
+                auto view = locator->ReadCurrentView();
+                if (!view || !view->has_value() ||
+                    view->value().leader_address == self) {
+                    return std::nullopt;
+                }
+                const auto& address = view->value().leader_address;
+                return address.substr(0, address.rfind(':')) + ":" +
+                       std::to_string(port);
+            },
+            std::chrono::seconds(30),
+            [] { ExitToRejoin("primary started a new history"); });
+    }
 
     std::unique_ptr<StandbyController> standby_controller;
     try {
@@ -1189,7 +1313,7 @@ int MasterServiceSupervisor::Start() {
                    << metrics.port;
         return -1;
     }
-    return RunSupervisorLoop(*spec, config_, admin_server,
+    return RunSupervisorLoop(*spec, leader_spec, config_, admin_server,
                              std::move(standby_controller),
                              shutdown_requested_);
 }
