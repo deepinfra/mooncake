@@ -137,20 +137,23 @@ class CapabilityDrivenStandbyController final : public StandbyController {
                 BatchOpLogSnapshotCoordinator::LeaseFactory lease_factory;
                 if (spec_.type == HABackendType::SQLITE) {
                     auto backend = CreateHaKvBackend(spec_);
-                    // A replicated store is written only by its primary; the
-                    // maintenance lock stays on this node.
-                    auto lease_store = sqlite::SqliteHaStore::Open(
-                        replication::RegisteredReplicatedBackend()
-                            ? spec_.connstring + ".local"
-                            : spec_.connstring);
-                    if (!backend || !lease_store) {
+                    // A replicated store is written only through its primary,
+                    // the maintenance lock too: the snapshot publish compares
+                    // its row there.
+                    std::shared_ptr<LeasedKeyStore> shared_store;
+                    if (auto replicated =
+                            replication::RegisteredReplicatedBackend()) {
+                        shared_store = replicated;
+                    } else if (auto opened =
+                                   sqlite::SqliteHaStore::Open(spec_.connstring)) {
+                        shared_store = std::move(opened.value());
+                    }
+                    if (!backend || !shared_store) {
                         throw std::invalid_argument(
                             "cannot open the sqlite HA store " +
                             spec_.connstring);
                     }
                     batch_backend_ = std::move(backend.value());
-                    std::shared_ptr<sqlite::SqliteHaStore> shared_store =
-                        std::move(lease_store.value());
                     lease_factory = [cluster_id = config_.cluster_id,
                                      shared_store] {
                         return std::make_unique<SnapshotMaintenanceLease>(

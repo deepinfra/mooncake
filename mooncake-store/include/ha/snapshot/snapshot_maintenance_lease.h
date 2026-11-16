@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ha/kv/leased_key_store.h"
+
 #include <memory>
 #include <mutex>
 #include <string>
@@ -20,7 +22,7 @@ class SnapshotMaintenanceLease {
     // Holds the lock as a leased key in the SQLite HA store instead of an
     // etcd session.
     SnapshotMaintenanceLease(std::string cluster_id,
-                             std::shared_ptr<ha::sqlite::SqliteHaStore> store);
+                             std::shared_ptr<ha::LeasedKeyStore> store);
     ~SnapshotMaintenanceLease();
 
     SnapshotMaintenanceLease(const SnapshotMaintenanceLease&) = delete;
@@ -57,7 +59,7 @@ class SnapshotMaintenanceLease {
     mutable std::mutex mutex_;
     bool testing_{false};
     bool lock_created_{false};
-    std::shared_ptr<ha::sqlite::SqliteHaStore> sqlite_store_;
+    std::shared_ptr<ha::LeasedKeyStore> sqlite_store_;
     std::shared_ptr<SqliteKeepalive> sqlite_keepalive_;
 };
 

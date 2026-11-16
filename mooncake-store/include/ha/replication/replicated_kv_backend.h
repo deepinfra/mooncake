@@ -20,6 +20,7 @@
 
 #include "ha/common/sqlite/sqlite_ha_store.h"
 #include "ha/kv/ha_kv_backend.h"
+#include "ha/kv/leased_key_store.h"
 #include "ha/replication/change_set.h"
 #include "ha/replication/replication_record.h"
 #include "rpc_worker_pool.h"
@@ -86,25 +87,37 @@ struct WirePut {
 };
 YLT_REFL(WirePut, key, value);
 
-enum class ForwardKind : int32_t { kPut = 0, kDeleteRange = 1, kTxn = 2 };
+enum class ForwardKind : int32_t {
+    kPut = 0,
+    kDeleteRange = 1,
+    kTxn = 2,
+    kCreateLeased = 3,
+    kRefreshLeased = 4,
+    kDeleteLeased = 5,
+};
 
 struct ForwardRequest {
     std::string token;
     int32_t kind{0};
     std::string key;
-    std::string value;
+    std::string value;  // the owner, for a leased key
     std::string end;
     std::vector<WireCompare> compares;
     std::vector<WirePut> puts;
+    int64_t ttl_ms{0};
+    int64_t create_revision{0};
 };
-YLT_REFL(ForwardRequest, token, kind, key, value, end, compares, puts);
+YLT_REFL(ForwardRequest, token, kind, key, value, end, compares, puts, ttl_ms,
+         create_revision);
 
 struct ForwardResponse {
     int32_t status{0};
     int32_t error{0};
     uint64_t seq{0};
+    int64_t create_revision{0};  // a created leased key's
+    bool refreshed{false};
 };
-YLT_REFL(ForwardResponse, status, error, seq);
+YLT_REFL(ForwardResponse, status, error, seq, create_revision, refreshed);
 
 struct ReplicationConfig {
     std::string connstring;
@@ -134,6 +147,7 @@ enum class PromotionDecision {
 // the primary.
 class ReplicatedHaKvBackend final
     : public HaKvBackend,
+      public LeasedKeyStore,
       public std::enable_shared_from_this<ReplicatedHaKvBackend> {
    public:
     // Locates the primary's replication endpoint ("host:port"), or nullopt.
@@ -156,6 +170,18 @@ class ReplicatedHaKvBackend final
     bool SupportsTxn() const override { return true; }
     bool AcceptsUnboundedRecords() const override { return true; }
     ErrorCode Txn(const KvTxn& txn) override;
+
+    // LeasedKeyStore: the snapshot maintenance lock lives in the replicated
+    // store, where the snapshot publish compares it.
+    ErrorCode CreateLeasedKey(std::string_view key, std::string_view owner,
+                              std::chrono::milliseconds ttl,
+                              EtcdRevisionId& create_revision) override;
+    tl::expected<bool, ErrorCode> RefreshLeasedKey(
+        std::string_view key, std::string_view owner,
+        EtcdRevisionId create_revision,
+        std::chrono::milliseconds ttl) override;
+    ErrorCode DeleteLeasedKey(std::string_view key, std::string_view owner,
+                              EtcdRevisionId create_revision) override;
 
     ErrorCode StartServer();
     // Follows the primary the locator names. Returns once this copy caught
@@ -197,8 +223,9 @@ class ReplicatedHaKvBackend final
     void OnCommitted(ChangeSet&& changes);
     ErrorCode WaitDurable(uint64_t seq);
     ErrorCode WriteRecord(bool in_sync, const std::string& copy);
-    ErrorCode Forward(ForwardRequest request);
-    ErrorCode Execute(const ForwardRequest& request, uint64_t& seq);
+    ErrorCode Forward(ForwardRequest request, ForwardResponse* out = nullptr);
+    ErrorCode Execute(const ForwardRequest& request, uint64_t& seq,
+                      ForwardResponse& result);
     bool TokenOk(const std::string& token) const;
     void FollowLoop();
     ErrorCode FullCopy(const std::string& endpoint);

@@ -334,6 +334,38 @@ TEST_F(ReplicationTest, DISABLED_WriteLatency) {
     measure("alone");
 }
 
+TEST_F(ReplicationTest, AFollowersMaintenanceLockFencesItsPublishOnThePrimary) {
+    StartPair("leased");
+    EtcdRevisionId revision = 0;
+    ASSERT_EQ(follower.backend->CreateLeasedKey("/lock", "owner-1", 30s,
+                                                revision),
+              ErrorCode::OK);
+    ASSERT_GT(revision, 0);
+    EtcdRevisionId other = 0;
+    EXPECT_EQ(follower.backend->CreateLeasedKey("/lock", "owner-2", 30s, other),
+              ErrorCode::ETCD_TRANSACTION_FAIL);
+    // The snapshot publish compares the lock's owner and create revision.
+    const KvTxn publish{
+        .compares = {{.key = "/lock",
+                      .kind = KvCompareKind::kValueEquals,
+                      .expected_value = "owner-1"},
+                     {.key = "/lock",
+                      .kind = KvCompareKind::kCreateRevisionEquals,
+                      .expected_revision = revision}},
+        .puts = {{"/latest", "snap-1"}}};
+    ASSERT_EQ(follower.backend->Txn(publish), ErrorCode::OK);
+    EXPECT_EQ(Value(*primary.backend, "/latest"), "snap-1");
+    auto refreshed =
+        follower.backend->RefreshLeasedKey("/lock", "owner-1", revision, 30s);
+    ASSERT_TRUE(refreshed);
+    EXPECT_TRUE(*refreshed);
+    ASSERT_EQ(follower.backend->DeleteLeasedKey("/lock", "owner-1", revision),
+              ErrorCode::OK);
+    EXPECT_EQ(Value(*primary.backend, "/lock"), "<absent>");
+    EXPECT_EQ(Value(*follower.backend, "/lock"), "<absent>");
+    EXPECT_EQ(follower.backend->Txn(publish), ErrorCode::ETCD_TRANSACTION_FAIL);
+}
+
 TEST_F(ReplicationTest, AFollowerFromAnotherHistoryGetsAFullCopy) {
     primary = OpenNode("copy_primary");
     ASSERT_EQ(primary.backend->BecomePrimary(records, 1),

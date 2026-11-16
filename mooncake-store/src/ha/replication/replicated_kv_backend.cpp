@@ -210,10 +210,78 @@ ErrorCode ReplicatedHaKvBackend::Txn(const KvTxn& txn) {
     return Forward(std::move(request));
 }
 
+ErrorCode ReplicatedHaKvBackend::CreateLeasedKey(
+    std::string_view key, std::string_view owner,
+    std::chrono::milliseconds ttl, EtcdRevisionId& create_revision) {
+    ForwardRequest request;
+    request.kind = static_cast<int32_t>(ForwardKind::kCreateLeased);
+    request.key = std::string(key);
+    request.value = std::string(owner);
+    request.ttl_ms = ttl.count();
+    ForwardResponse result;
+    const ErrorCode err = Forward(std::move(request), &result);
+    if (err == ErrorCode::OK) {
+        create_revision = static_cast<EtcdRevisionId>(result.create_revision);
+    }
+    return err;
+}
+
+tl::expected<bool, ErrorCode> ReplicatedHaKvBackend::RefreshLeasedKey(
+    std::string_view key, std::string_view owner,
+    EtcdRevisionId create_revision, std::chrono::milliseconds ttl) {
+    ForwardRequest request;
+    request.kind = static_cast<int32_t>(ForwardKind::kRefreshLeased);
+    request.key = std::string(key);
+    request.value = std::string(owner);
+    request.ttl_ms = ttl.count();
+    request.create_revision = static_cast<int64_t>(create_revision);
+    ForwardResponse result;
+    const ErrorCode err = Forward(std::move(request), &result);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return result.refreshed;
+}
+
+ErrorCode ReplicatedHaKvBackend::DeleteLeasedKey(
+    std::string_view key, std::string_view owner,
+    EtcdRevisionId create_revision) {
+    ForwardRequest request;
+    request.kind = static_cast<int32_t>(ForwardKind::kDeleteLeased);
+    request.key = std::string(key);
+    request.value = std::string(owner);
+    request.create_revision = static_cast<int64_t>(create_revision);
+    return Forward(std::move(request));
+}
+
 ErrorCode ReplicatedHaKvBackend::Execute(const ForwardRequest& request,
-                                         uint64_t& seq) {
+                                         uint64_t& seq,
+                                         ForwardResponse& result) {
     seq = 0;
     switch (static_cast<ForwardKind>(request.kind)) {
+        case ForwardKind::kCreateLeased: {
+            EtcdRevisionId revision = 0;
+            const ErrorCode err = store_->CreateLeasedKey(
+                request.key, request.value,
+                std::chrono::milliseconds(request.ttl_ms), revision, &seq);
+            result.create_revision = static_cast<int64_t>(revision);
+            return err;
+        }
+        case ForwardKind::kRefreshLeased: {
+            auto refreshed = store_->RefreshLeasedKey(
+                request.key, request.value,
+                static_cast<EtcdRevisionId>(request.create_revision),
+                std::chrono::milliseconds(request.ttl_ms), &seq);
+            if (!refreshed) {
+                return refreshed.error();
+            }
+            result.refreshed = *refreshed;
+            return ErrorCode::OK;
+        }
+        case ForwardKind::kDeleteLeased:
+            return store_->DeleteLeasedKey(
+                request.key, request.value,
+                static_cast<EtcdRevisionId>(request.create_revision), &seq);
         case ForwardKind::kPut:
             return store_->Put(request.key, request.value, &seq);
         case ForwardKind::kDeleteRange:
@@ -240,7 +308,8 @@ ErrorCode ReplicatedHaKvBackend::Execute(const ForwardRequest& request,
 // A write on either role: the primary commits and waits until it is durable
 // on both copies (or the follower is recorded out of sync); a follower asks
 // the primary to do that, then waits until the change reached its own copy.
-ErrorCode ReplicatedHaKvBackend::Forward(ForwardRequest request) {
+ErrorCode ReplicatedHaKvBackend::Forward(ForwardRequest request,
+                                         ForwardResponse* out) {
     bool primary;
     {
         std::lock_guard<std::mutex> lock(mu_);
@@ -248,7 +317,11 @@ ErrorCode ReplicatedHaKvBackend::Forward(ForwardRequest request) {
     }
     if (primary) {
         uint64_t seq = 0;
-        const ErrorCode err = Execute(request, seq);
+        ForwardResponse local;
+        const ErrorCode err = Execute(request, seq, local);
+        if (out != nullptr) {
+            *out = local;
+        }
         if (err != ErrorCode::OK || seq == 0) {
             return err;
         }
@@ -274,6 +347,9 @@ ErrorCode ReplicatedHaKvBackend::Forward(ForwardRequest request) {
     const ForwardResponse& response = result.value();
     if (response.status != static_cast<int32_t>(ReplStatus::kOk)) {
         return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    if (out != nullptr) {
+        *out = response;
     }
     const auto error = static_cast<ErrorCode>(response.error);
     if (error != ErrorCode::OK || response.seq == 0) {
@@ -549,7 +625,7 @@ ForwardResponse ReplicatedHaKvBackend::HandleForward(ForwardRequest request) {
         }
     }
     uint64_t seq = 0;
-    ErrorCode err = Execute(request, seq);
+    ErrorCode err = Execute(request, seq, response);
     if (err == ErrorCode::OK && seq != 0) {
         err = WaitDurable(seq);
     }

@@ -14,6 +14,7 @@
 
 #include "ha/ha_types.h"
 #include "ha/kv/ha_kv_backend.h"
+#include "ha/kv/leased_key_store.h"
 #include "ha/replication/change_set.h"
 #include "types.h"
 
@@ -30,14 +31,14 @@ namespace sqlite {
 // Keys order bytewise like etcd. Every write transaction advances one global
 // revision, so create revisions fence the same way etcd's do. A leased key
 // (expires_ms != 0) reads as absent once its deadline passes.
-class SqliteHaStore {
+class SqliteHaStore : public LeasedKeyStore {
    public:
     // connstring is a file path, optionally prefixed with "sqlite://".
     static tl::expected<std::unique_ptr<SqliteHaStore>, ErrorCode> Open(
         std::string_view connstring);
     static std::string ResolvePath(std::string_view connstring);
 
-    ~SqliteHaStore();
+    ~SqliteHaStore() override;
     SqliteHaStore(const SqliteHaStore&) = delete;
     SqliteHaStore& operator=(const SqliteHaStore&) = delete;
 
@@ -110,15 +111,34 @@ class SqliteHaStore {
     tl::expected<std::unique_ptr<SnapshotReader>, ErrorCode>
     OpenSnapshotReader();
 
-    // ETCD_TRANSACTION_FAIL while another owner holds the key.
+    // ETCD_TRANSACTION_FAIL while another owner holds the key. With a change
+    // sink these replicate too, `repl_seq` as for Put.
     ErrorCode CreateLeasedKey(std::string_view key, std::string_view owner,
                               std::chrono::milliseconds ttl,
-                              EtcdRevisionId& create_revision);
+                              EtcdRevisionId& create_revision) override {
+        return CreateLeasedKey(key, owner, ttl, create_revision, nullptr);
+    }
     tl::expected<bool, ErrorCode> RefreshLeasedKey(
         std::string_view key, std::string_view owner,
-        EtcdRevisionId create_revision, std::chrono::milliseconds ttl);
+        EtcdRevisionId create_revision,
+        std::chrono::milliseconds ttl) override {
+        return RefreshLeasedKey(key, owner, create_revision, ttl, nullptr);
+    }
     ErrorCode DeleteLeasedKey(std::string_view key, std::string_view owner,
-                              EtcdRevisionId create_revision);
+                              EtcdRevisionId create_revision) override {
+        return DeleteLeasedKey(key, owner, create_revision, nullptr);
+    }
+    ErrorCode CreateLeasedKey(std::string_view key, std::string_view owner,
+                              std::chrono::milliseconds ttl,
+                              EtcdRevisionId& create_revision,
+                              uint64_t* repl_seq);
+    tl::expected<bool, ErrorCode> RefreshLeasedKey(
+        std::string_view key, std::string_view owner,
+        EtcdRevisionId create_revision, std::chrono::milliseconds ttl,
+        uint64_t* repl_seq);
+    ErrorCode DeleteLeasedKey(std::string_view key, std::string_view owner,
+                              EtcdRevisionId create_revision,
+                              uint64_t* repl_seq);
 
     tl::expected<std::optional<MasterView>, ErrorCode> ReadLeader(
         std::string_view cluster_namespace);
