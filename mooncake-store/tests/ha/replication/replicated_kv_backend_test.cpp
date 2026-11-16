@@ -9,7 +9,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
+#include <iostream>
 #include <chrono>
 #include <filesystem>
 #include <thread>
@@ -304,6 +306,32 @@ TEST_F(ReplicationTest, ANewCopyJoinsAnIdleLeaderWhoseFollowerWentQuiet) {
         auto record = records.Current();
         return record && record->in_sync && record->replica == second_copy;
     }));
+}
+
+// What waiting for the follower costs a write the size of an OpLog batch
+// record (1024 entries): sync against alone, on loopback.
+TEST_F(ReplicationTest, DISABLED_WriteLatency) {
+    StartPair("latency");
+    const std::string value(100 * 1024, 'x');
+    const auto measure = [&](const char* label) {
+        std::vector<double> us;
+        for (int i = 0; i < 1000; ++i) {
+            const auto start = std::chrono::steady_clock::now();
+            ASSERT_EQ(primary.backend->Put("/lat" + std::to_string(i % 64), value),
+                      ErrorCode::OK);
+            us.push_back(std::chrono::duration<double, std::micro>(
+                             std::chrono::steady_clock::now() - start)
+                             .count());
+        }
+        std::sort(us.begin(), us.end());
+        std::cout << label << ": p50=" << us[us.size() / 2]
+                  << "us p99=" << us[us.size() * 99 / 100] << "us" << std::endl;
+    };
+    measure("in sync");
+    follower.backend.reset();
+    ASSERT_EQ(primary.backend->Put("/goes_alone", "v"), ErrorCode::OK);
+    ASSERT_FALSE(records.Current()->in_sync);
+    measure("alone");
 }
 
 TEST_F(ReplicationTest, AFollowerFromAnotherHistoryGetsAFullCopy) {
