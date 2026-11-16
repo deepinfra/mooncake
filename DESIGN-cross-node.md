@@ -59,11 +59,24 @@ visible actions only expose data early (a lost one is a miss).
    leader alone. The snapshot maintenance lock moves to a node-local file.
 7. **Hand-off**: unchanged. The record is a KV Put, replicated before the
    leader releases the Lease.
-8. **Fencing**: client-go stops the leader at its renew deadline (3 s,
-   Lease 5 s); the replication record CAS fails for a deposed leader; the
-   follower ignores a primary whose term is not the Lease holder's.
+8. **Fencing**: the Lease helper records when each successful renewal was
+   sent (CLOCK_MONOTONIC). Past the renew deadline (3 s) the leader answers
+   no RPC (checked before and after each pooled call; Ping and
+   ServiceReady too), `/ready` fails, and a watchdog stops the server. A
+   candidate gets the Lease only after 5 s without a renewal, so terms do
+   not overlap, even across a pause or an API-server partition. Without
+   this, a resumed zombie served next to the new leader (12,357 wrong
+   values on the harness). The record CAS also fails for a deposed leader.
+9. **Snapshot maintenance lock**: the snapshot publish compares the lock's
+   owner and create revision in the HA store, so the lock is a replicated
+   leased key (create/refresh/delete forwarded to the primary).
 
 ## Known limits of the prototype
+
+- The Kubernetes API server is on the serving path: a leader that cannot
+  renew stops within 3 s; with both pods cut off, no master serves.
+- Each OpLog batch waits a pod-to-pod round trip and the follower's synced
+  commit (loopback p50 1.5 ms / p99 13.5 ms vs 0.36 / 0.6 ms alone).
 
 - Each process restart of the follower is a full copy unless its position
   is still in the leader's buffer.
