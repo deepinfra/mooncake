@@ -28,6 +28,7 @@ namespace mooncake {
 namespace tent {
 
 class CUDAStreamPool;
+struct CudaPointerInfo;
 
 // RAII Wrapper for cudaStream_t.
 // When this handle destructs, the stream is automatically returned to the pool.
@@ -125,6 +126,11 @@ class CudaPlatform : public Platform {
 
     virtual const std::string type() const { return "cuda"; }
 
+    Status validateMemoryRegistration(void* addr, CudaPointerInfo& info);
+    // Use the pointer information validated before transport warm-up.
+    std::vector<RangeLocation> getLocation(void* start, size_t len,
+                                           bool skip_prefault,
+                                           const CudaPointerInfo& info);
     Status synchronizeDevices(const Topology* topology) override;
 
     Status copyBatch(const std::vector<CopyOp>& ops) override;
@@ -133,6 +139,8 @@ class CudaPlatform : public Platform {
                               int& device_out) override;
 
     Status unregisterHostMemory(void* addr, int device) override;
+
+    Status exportDmabuf(void* addr, size_t length, DmabufExport& out) override;
 
     // cudaHostAlloc(cudaHostAllocPortable): pinned for every CUDA context.
     Status allocatePinnedHost(void** pptr, size_t size) override;
@@ -143,8 +151,9 @@ class CudaPlatform : public Platform {
                              int deviceId = CUDAStreamPool::kCurrentDevice);
 
    private:
-    // Device owning `addr`, or kCurrentDevice when `addr` is not device memory.
-    int getPointerDeviceId(void* addr);
+    // Returns the owning device for device or managed memory and
+    // kCurrentDevice for host memory.
+    Status getPointerDeviceId(void* addr, int& device);
 
     // Whether copies to and from mapped host memory may run as one kernel on
     // `device` (see batched_copy.h); copyBatch uses it from kMinKernelCopies.

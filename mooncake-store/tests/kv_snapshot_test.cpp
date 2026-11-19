@@ -279,6 +279,31 @@ size_t Differences(const ObjectMedia& a, const ObjectMedia& b) {
 
 class KvSnapshotTest : public MasterServiceTest {
    protected:
+    // The media the snapshot reports for `key` now: the live tiers of its
+    // metadata, read under the key's read guard.
+    std::optional<std::vector<std::string>> KvMediaForKey(
+        MasterService& service, const std::string& key) {
+        MasterServiceTestPeer peer(service);
+        const auto identity =
+            peer.MakeObjectIdentityForRequest(key, TenantId::Default());
+        auto guard = peer.GetOrCreateNamespace(identity.tenant_id)
+                         .objects.Read(identity.user_key);
+        if (!guard.has_value()) {
+            return std::nullopt;
+        }
+        const uint8_t live =
+            MasterServiceTestPeer::KvMediaMasksForMetadata(guard->metadata())
+                .live;
+        std::vector<std::string> media;
+        if (live & KvEventPublisher::kMediumCpu) {
+            media.emplace_back("cpu");
+        }
+        if (live & KvEventPublisher::kMediumDisk) {
+            media.emplace_back("disk");
+        }
+        return media;
+    }
+
     // What the master holds now, read key by key.
     ObjectMedia Truth(MasterService& service,
                       const std::vector<std::string>& pool) {
@@ -312,6 +337,10 @@ class KvSnapshotTest : public MasterServiceTest {
 
     static MasterServiceConfig EventsConfig(const std::string& endpoint) {
         MasterServiceConfig config = MasterServiceConfig::builder().build();
+        // A put of a held key renews its read lease (#5066), and a leased
+        // object can be neither removed nor evicted, so churning writers
+        // would freeze the store. Leases are not under test here.
+        config.default_kv_lease_ttl = 0;
         config.enable_kv_events = true;
         config.kv_events_bind_endpoint = endpoint;
         config.kv_events_backend_id = "kv-snapshot-test";

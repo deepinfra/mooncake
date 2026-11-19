@@ -28,16 +28,52 @@ patches below. Our `main` mirrors upstream. Upstream is merged into `di-main` we
 | Patch | What | Where it lives now |
 |---|---|---|
 | `4d01e691` TENT SHM | Same-host GPU<->store copies without a NIC (hugetlbfs files or a cuMem pool); see [README](README.md) | `real_client.cpp` segment setup, `transfer_task.cpp`, TENT shm transport and platform |
-| `2f6699c3` | KV removal published when eviction empties an object | `PublishKvRemovedAfterEvict`, called by the Evictor's `KvEventObserver` |
+| `2f6699c3` | KV removal published when eviction empties an object | Dropped at the 2026-11-19 merge: upstream #5455 publishes every object's media transitions from its route state, including teardown |
 | `b7405f12` | SSD restore buffer from a CUDA VMM pool | `aligned_client_buffer.cpp` |
 | `075d7ab5` | Offload admission (`--offload_min_loads`, `--offload_max_bytes_per_sec`) | `MasterService::AdmitOffload`, asked through `eviction::OffloadQueue::Admit` |
-| `de1c056d` | KV event batching during eviction bursts | `kv_event_publisher.cpp` |
+| `de1c056d` | KV event batching during eviction bursts | Dropped at the 2026-11-19 merge for upstream #5467 (removals coalesced into batches of 64); its burst test stays |
 | `ace0b076` | Oldest-first eviction under offload deferrals | Dropped at the 2026-10-28 merge; its tests stay |
-| `66bb2fec` | `GET /kv_events/snapshot` | `GetKvSnapshotPage`, which pages `ObjectRoute` stripes |
-| `65405206` | Unmounted segments retract their KV media | `CleanupStaleHandles` |
+| `66bb2fec` | `GET /kv_events/snapshot` | `GetKvSnapshotPage`, which pages `ObjectRoute` stripes and reports `KvMediaMasksForMetadata(...).live` |
+| `65405206` | Unmounted segments retract their KV media | Dropped at the 2026-11-13 merge for upstream #5413 |
 | `MC_STORE_BATCHED_GET` (part of `4d01e691`) | Group multi-buffer reads per target | `GroupMultiBufferReadsFromEnv` in `real_client.cpp`, which turns on upstream's per-target grouping for `batch_get_into_multi_buffers` |
 
 ## Log
+
+### 2026-11-19: upstream `49c8cde8`
+
+This merge replaces the 2026-11-13 merge of upstream `d605bbc9` (`45f43e59`), so `di-main` does not carry two merges
+in a row: its first parent is the same `2d92e234`, and it takes upstream up to `49c8cde8`. The 2026-11-13 merge had
+dropped `65405206` for upstream #5413. There were 88 upstream commits since `d605bbc9`; five files conflicted, one
+hunk each.
+
+- **TENT `cuda.h`, `cuda_allocator.cpp`, `transfer_engine_impl.cpp`**: additive on both sides (our `copyBatch`,
+  host registration and `copySameHost`; upstream's `exportDmabuf` #5523 and producer events #5543). Both were kept.
+  The store sets no `producer_event`, so our SHM path is unchanged.
+- **#5455 moved KV event publication onto `ObjectRoute` state** (`KvMediaMasksForMetadata`, `OnKvWriteRelease`,
+  `OnKvBeforeTearDown`).
+  - Our `KvMediaBits` is gone; `/kv_events/snapshot` reports `KvMediaMasksForMetadata(...).live` for each object.
+  - `2f6699c3` was dropped: teardown and write release now publish every media transition, eviction included.
+  - `kv_snapshot_test` reads an object's live media through a `MasterServiceTestPeer::KvMediaMasksForMetadata`
+    wrapper, since upstream removed the `KvMediaForKey` fixture helper.
+- **#5467 coalesces removal events into batches of 64.** `de1c056d` (batches of up to 1024 within 2 ms) was dropped:
+  its 1024-event batches kept upstream's batches from filling at 64. A 116k-object eviction pass (15% of a 2 TB
+  store) is about 1.8k messages, under the 10k send queue that `de1c056d` was for. Our burst test now publishes
+  through `PublishTransition` and allows up to 2 batches per 64 events.
+- Possibly relevant to slow SHM saves and loads on DS3.2: #5448 (sharded `LeaseEvictionIndex`, parallel memory
+  eviction), #5536 (sharded bucket index), #5462 (hot memory replicas drained without waiting for leases) and
+  `c52401a2` (coalesced SSD reads). None of them changes our SHM copy path.
+
+Tests (manylinux2_28 cuda13.0 builder with `python3.12-devel`; conda's gtest moved aside, since its headers shadow the
+fetched gtest), the flags above:
+- Passing: `kv_snapshot_test` 6/6, `kv_event_publisher_test` 26/26 (with upstream's batching tests),
+  `offload_on_evict_test` 5/5, `evictor_test` 26/26, `master_service_evict_scenario_test` 79/79,
+  `object_route_test` 37/37, `eviction_index_test` 13/13, `master_service_test` 114/116 (2 skipped: no RDMA HCA).
+- `master_service_test`'s `DfsOnlyLifecyclePathsReleaseTheExtent` failed in one of two full runs (it waits seconds for
+  an abandoned put to be reaped) and passed 5/5 alone.
+- `master_admin_server_test` 65/66: the same `DfsShardCountExpandsAndValidatesRequests` failure as before.
+- `transfer_engine_metrics_test` and `high_availability_test` do not compile with this builder's gtest
+  (`GTEST_FLAG_SET`, `StringFlagDestructor`).
+
 
 ### 2026-10-30: upstream `6c83ea2b`
 

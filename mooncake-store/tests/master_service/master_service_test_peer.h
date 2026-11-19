@@ -2,6 +2,7 @@
 
 #include <utility>
 
+#include "client_session/client_session_registry_test_peer.h"
 #include "master_service.h"
 
 namespace mooncake::test {
@@ -67,6 +68,12 @@ class MasterServiceTestPeer {
 
     void RunDfsEvictionForTesting();
 
+    void ConfigureKvcsCapacityForTesting(
+        std::unique_ptr<KvcsCapacityProvider> provider, bool eviction_enabled,
+        double high_watermark, double low_watermark);
+
+    void RefreshKvcsDfsUsageForTesting();
+
     // Queue one segment through the private HTTP metadata cleanup path, as the
     // client monitor does when a client times out.
     void CleanupHttpMetadataForTesting(const std::string& segment_name);
@@ -130,18 +137,19 @@ class MasterServiceTestPeer {
         return service.batch_oplog_storage_;
     }
 
-    static auto& ClientLivenessRecords(MasterService& service) {
-        return service.client_liveness_records_;
+    static auto& ClientSessions(MasterService& service) {
+        return service.client_sessions_;
     }
-    static const auto& ClientLivenessRecords(const MasterService& service) {
-        return service.client_liveness_records_;
+    static const auto& ClientSessions(const MasterService& service) {
+        return service.client_sessions_;
     }
-
-    static auto& ClientMutex(MasterService& service) {
-        return service.client_mutex_;
+    // Registry membership by client, not a frozen copy of session state.
+    static auto ClientSessionRecords(const MasterService& service) {
+        return ClientSessionRegistryTestPeer::SnapshotRecords(
+            service.client_sessions_);
     }
-    static const auto& ClientMutex(const MasterService& service) {
-        return service.client_mutex_;
+    static auto& ClientOffboarding(MasterService& service) {
+        return service.client_offboarding_worker_;
     }
 
     static auto& DynamicReplicationWindows(MasterService& service) {
@@ -172,6 +180,17 @@ class MasterServiceTestPeer {
     }
     static const auto& EnableDfs(const MasterService& service) {
         return service.enable_dfs_;
+    }
+
+    static auto& DfsAllocator(MasterService& service) {
+        return service.dfs_allocator_;
+    }
+    static const auto& DfsAllocator(const MasterService& service) {
+        return service.dfs_allocator_;
+    }
+
+    static bool UsesKvcs(const MasterService& service) {
+        return service.use_kvcs_;
     }
 
     static auto& EnableOplog(MasterService& service) {
@@ -332,6 +351,20 @@ class MasterServiceTestPeer {
         return service.task_manager_;
     }
 
+    static std::unique_lock<std::mutex> LockDrainJobForTesting(
+        MasterService& service, const UUID& job_id) {
+        std::shared_ptr<MasterService::DrainJob> job;
+        {
+            std::lock_guard<std::mutex> lock(service.job_mutex_);
+            auto it = service.drain_jobs_.find(job_id);
+            if (it == service.drain_jobs_.end()) {
+                return {};
+            }
+            job = it->second;
+        }
+        return std::unique_lock<std::mutex>(job->mutex);
+    }
+
     static auto& TenantQuotaPolicyMutex(MasterService& service) {
         return service.tenant_quota_policy_->manager_.policy_mutex_;
     }
@@ -416,11 +449,6 @@ class MasterServiceTestPeer {
 
     void ClearInvalidHandles() { service_.ClearInvalidHandles(); }
 
-    void ClearInvalidHandles(
-        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients) {
-        service_.ClearInvalidHandles(retaining_clients);
-    }
-
     void DiscardExpiredProcessingReplicas(
         const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now) {
@@ -486,7 +514,8 @@ class MasterServiceTestPeer {
 
     std::shared_ptr<ClientLivenessRecord> FindClientRecord(
         const UUID& client_id) const {
-        return service_.FindClientRecord(client_id);
+        return ClientSessionRegistryTestPeer::Find(service_.client_sessions_,
+                                                   client_id);
     }
 
     // Resolves the namespace, creating it through the table's factory on first
@@ -506,18 +535,13 @@ class MasterServiceTestPeer {
         return service_.IsReplicaReadable(replica);
     }
 
-    static std::vector<std::string> KvMediaForMetadata(
-        const ObjectMetadata& metadata) {
-        return MasterService::KvMediaForMetadata(metadata);
-    }
-
-    static std::vector<std::string> KvMediaForRemoval(
-        const ObjectMetadata& metadata) {
-        return MasterService::KvMediaForRemoval(metadata);
-    }
-
     void LoadTenantQuotaPoliciesFromStoreOrThrow() {
         service_.tenant_quota_policy_->manager_.LoadPoliciesOrThrow();
+    }
+
+    // The KV media of `metadata`, as KV events and /kv_events/snapshot see it.
+    static auto KvMediaMasksForMetadata(const ObjectMetadata& metadata) {
+        return MasterService::KvMediaMasksForMetadata(metadata);
     }
 
     ObjectIdentity MakeObjectIdentityForRequest(
