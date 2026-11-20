@@ -2463,6 +2463,11 @@ class MasterService {
 
     ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
 
+    // True while a restore from a standby has replicas left to repair. Takes
+    // master_state_mutex_ held, shared or exclusive: only the exclusive
+    // holder writes what it reads.
+    bool HasStandbyRestoreStateLocked() const;
+
     // True while the replica sits on an endpoint in
     // invalid_replica_endpoints_. The read path asks only this, never the set.
     bool IsAwaitingRemount(const Replica& replica) const;

@@ -1112,22 +1112,33 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         // every connection until the walk let go.
         //
         // master_state_mutex_ is needed exclusively for the repair of replicas
-        // restored from a standby, which only a master run with HA has.
-        // Without HA nothing below touches what that lock alone guards, and it
-        // is taken shared, as MountSegment takes it: a writer waits for every
-        // reader, and the handlers of the data plane overlap enough to keep
-        // one out for seconds.
+        // restored from a standby: on a master run with HA, or one that still
+        // holds a restored snapshot. Otherwise nothing below touches what that
+        // lock alone guards, and it is taken shared, as MountSegment takes it:
+        // a writer waits for every reader, and the handlers of the data plane
+        // overlap enough to keep one out for seconds.
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_,
                                                         std::defer_lock);
         std::unique_lock<std::shared_mutex> snapshot_lock(master_state_mutex_,
                                                           std::defer_lock);
         std::shared_lock<std::shared_mutex> shared_snapshot_lock(
             master_state_mutex_, std::defer_lock);
-        if (enable_ha_) {
-            WriteIntent intent(state_write_intents_);
-            std::lock(snapshot_lock, client_lock);
-        } else {
+        bool exclusive = enable_ha_;
+        while (true) {
+            if (exclusive) {
+                WriteIntent intent(state_write_intents_);
+                std::lock(snapshot_lock, client_lock);
+                break;
+            }
             std::lock(shared_snapshot_lock, client_lock);
+            if (!HasStandbyRestoreStateLocked()) {
+                break;
+            }
+            // A restored snapshot has replicas left to repair. Start over
+            // exclusively, still never waiting with client_mutex_ held.
+            client_lock.unlock();
+            shared_snapshot_lock.unlock();
+            exclusive = true;
         }
         auto [record_it, record_inserted] =
             client_liveness_records_.try_emplace(
@@ -1433,8 +1444,9 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 (void)restore.replicas[i]->replace_memory_buffer(
                     std::move(restore.buffers[i]));
             }
-            if (enable_ha_) {
-                // Only a restore from a standby fills these.
+            if (exclusive) {
+                // Only a restore from a standby fills these, and only the
+                // exclusive path ever finds them filled.
                 invalid_replica_endpoints_.erase(restore.segment.te_endpoint);
                 invalid_replica_endpoints_.erase(restore.segment.name);
                 standby_allocator_keepalive_.erase(restore.segment.te_endpoint);
@@ -4680,6 +4692,12 @@ auto MasterService::BatchReplicaClear(
     }
 
     return cleared_keys;
+}
+
+bool MasterService::HasStandbyRestoreStateLocked() const {
+    return !invalid_replica_endpoints_.empty() ||
+           !standby_allocator_keepalive_.empty() ||
+           !standby_accounted_memory_bytes_.empty();
 }
 
 bool MasterService::IsAwaitingRemount(const Replica& replica) const {
